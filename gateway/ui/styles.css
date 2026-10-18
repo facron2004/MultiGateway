@@ -185,6 +185,7 @@ a {
   justify-content: center;
   margin-bottom: 10px;
   padding: 0 11px;
+  flex-shrink: 0;
 }
 .sidebar-toggle-btn {
   width: 48px;
@@ -338,6 +339,17 @@ body.sidebar-expanded .sidebar-brand-name {
   gap: 8px;
   width: 100%;
   align-items: center;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.agent-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 .provider {
   position: relative;
@@ -347,6 +359,7 @@ body.sidebar-expanded .sidebar-brand-name {
   height: 48px;
   padding: 10px;
   border-radius: 10px;
+  flex-shrink: 0;
   transition: background 0.15s ease, width 0.15s ease;
 }
 .provider img {
@@ -400,6 +413,9 @@ body.sidebar-expanded .sidebar-brand-name {
 
 body.sidebar-expanded .agent-list {
   align-items: stretch;
+  width: calc(100% + 16px);
+  margin: 0 -8px;
+  padding: 0 8px;
 }
 body.sidebar-expanded .provider {
   width: 100%;
@@ -440,6 +456,7 @@ body.sidebar-expanded .provider .rail-dot {
   align-items: center;
   flex-direction: column;
   gap: 8px;
+  flex-shrink: 0;
 }
 .rail-tool {
   position: relative;
@@ -454,6 +471,7 @@ body.sidebar-expanded .provider .rail-dot {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  flex-shrink: 0;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .rail-tool:hover {

@@ -10,6 +10,7 @@ import wb_proxy
 from .minimax import MiniMax
 from .activity import Activity
 from .control import Control
+from .native import build as build_native
 from .ports import Ports
 from .qoder import Qoder
 from .trae import Trae
@@ -21,6 +22,9 @@ class Runtime:
         self.minimax = MiniMax(self.directory / "minimax")
         self.trae = Trae(self.directory / "trae")
         self.qoder = Qoder(self.directory / "qoder")
+        self.native = build_native(self.directory / "native")
+        for name, provider in self.native.items():
+            setattr(self, name, provider)
         self.errors = {}
         self.catalog = {}
         self.catalog_lock = threading.Lock()
@@ -43,18 +47,29 @@ class Runtime:
                 logging.exception("%s backend failed to start", name)
         for name in ("trae", "qoder"):
             threading.Thread(target=start_one, args=(name, getattr(self, name)), daemon=True).start()
+        for name, provider in self.native.items():
+            try:
+                provider.start()
+            except Exception:
+                logging.exception("%s provider failed to start", name)
 
     def stop(self):
         if self.ports:
             self.ports.stop()
         self.trae.stop()
         self.qoder.stop()
+        for provider in self.native.values():
+            try:
+                provider.stop()
+            except Exception:
+                logging.exception("%s provider failed to stop", provider.name)
 
     def status(self):
         return {
             "workbuddy": {"running": True, "accounts": len(wb_proxy.POOL.accounts) if wb_proxy.POOL else 0},
             "trae": self.trae.status(), "qoder": self.qoder.status(),
             "minimax": self.minimax.status(),
+            **{name: provider.status() for name, provider in self.native.items()},
         }
 
     def provider_models(self, name):
@@ -77,8 +92,10 @@ class Runtime:
                 return [wb_proxy.model_entry(mid, metadata) for mid, metadata in wb_proxy.fetch_models(realm=realm)]
             sources = {"workbuddy": workbuddy_models, "trae": self.trae.models,
                        "qoder": self.qoder.models, "minimax": self.minimax.models}
+            for name, provider in self.native.items():
+                sources[name] = provider.models
             data = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(sources)) as executor:
                 pending = {name: executor.submit(function) for name, function in sources.items()}
                 for name, future in pending.items():
                     try:

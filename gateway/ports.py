@@ -1,4 +1,4 @@
-"""One public API listener exposing four provider groups."""
+"""One public API listener exposing every provider group."""
 import json
 import re
 import threading
@@ -6,9 +6,11 @@ from http.server import ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .minimax import atomic_json
+from .native import NAMES as NATIVE_NAMES
 from .transport import ProviderError
 
-NAMES = ("workbuddy", "trae", "minimax", "qoder")
+NAMES = ("workbuddy", "trae", "minimax", "qoder") + NATIVE_NAMES
+GROUP_ROUTE = r"/(?:" + "|".join(NAMES) + r")(/.*)"
 
 
 class Ports:
@@ -32,13 +34,13 @@ class Ports:
         class GroupHandler(GatewayHandler):
             def _route_group(self, allowed):
                 parsed = urlsplit(self.path)
-                match = re.fullmatch(r"/(workbuddy|trae|minimax|qoder)(/.*)", parsed.path)
-                path = match[2] if match else parsed.path
+                match = re.fullmatch(GROUP_ROUTE, parsed.path)
+                path = match[1] if match else parsed.path
                 if path not in allowed:
                     self._error(404, "use the management port for account operations")
                     return False
                 if match:
-                    self._gateway_group = match[1]
+                    self._gateway_group = parsed.path.lstrip("/").split("/", 1)[0]
                     self.path = path + ("?" + parsed.query if parsed.query else "")
                 return True
 

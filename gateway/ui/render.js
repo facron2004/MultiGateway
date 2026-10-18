@@ -5,6 +5,10 @@ export const names = {
   trae: "Trae",
   minimax: "MiniMax Code",
   qoder: "Qoder",
+  antigravity: "Antigravity",
+  grok: "Grok",
+  copilot: "GitHub Copilot",
+  qwen: "Qwen Code",
 };
 export const regions = { cn: "国内", intl: "国际", global: "国际" };
 export const escape = (value) =>
@@ -71,7 +75,8 @@ export function snapshot(data) {
   rail.parentElement.title = `${names[provider]} · /${provider}/v1 · 统一端口 ${gateway.port}`;
   if (!$("port-input").dataset.dirty) $("port-input").value = gateway.port;
   if (!$("host-input").dataset.dirty) $("host-input").value = gateway.host;
-  $("listen-host").textContent = "四个 Agent 分组共用此地址、端口和访问 Key。";
+  $("listen-host").textContent =
+    `${Object.keys(names).length} 个 Agent 分组共用此地址、端口和访问 Key。`;
   $("import-account").hidden = !capabilities.import;
   $("account-count").textContent = pool.total;
   $("pool-summary").textContent =
@@ -81,6 +86,8 @@ export function snapshot(data) {
   if (data.error || gateway.error) notice(data.error || gateway.error, true);
 }
 export function regionButtons(data, busy = false) {
+  const singleRegion = !data.capabilities.regions;
+  $("region-switch").hidden = singleRegion || $("accounts-panel").hidden;
   document
     .querySelectorAll("#region-switch button")
     .forEach((button, index) => {
@@ -90,11 +97,9 @@ export function regionButtons(data, busy = false) {
       const selected = region === data.region;
       button.classList.toggle("selected", selected);
       button.setAttribute("aria-pressed", String(selected));
-      button.disabled = busy || (index === 1 && !data.capabilities.regions);
+      button.disabled = busy || (index === 1 && singleRegion);
       button.title =
-        index === 1 && !data.capabilities.regions
-          ? "当前 Agent 暂不支持国际版"
-          : "";
+        index === 1 && singleRegion ? "当前 Agent 暂不支持国际版" : "";
     });
 }
 export function accountRows(data, filter, selected, busy = false) {

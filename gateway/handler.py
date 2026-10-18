@@ -12,10 +12,13 @@ import wb_settings
 
 from . import VERSION
 from .activity import ObservedWriter
+from .native import PROVIDERS as NATIVE_PROVIDERS
+from .native.translate import anthropic_aggregate
 from .protocols import chat_to_anthropic, minimax_chat_stream
 from .transport import ProviderError
 
-PROVIDERS = {"workbuddy", "trae", "minimax", "qoder"}
+PROVIDERS = {"workbuddy", "trae", "minimax", "qoder"} | set(NATIVE_PROVIDERS)
+PROVIDER_ROUTE = "(?:" + "|".join(sorted(PROVIDERS)) + ")"
 PATHS = {"chat": "/v1/chat/completions", "responses": "/v1/responses", "messages": "/v1/messages"}
 
 
@@ -125,7 +128,7 @@ class GatewayHandler(wb_proxy.Handler):
         path = urlsplit(self.path).path
         asset = path.removeprefix("/gateway/ui/") if path.startswith("/gateway/ui/") else ""
         if asset in ("styles.css", "api.js", "render.js", "app.js", "accounts.js", "access.js", "icons.js",
-                     "board.js", "icons/workbuddy.ico", "icons/workbuddy.svg", "icons/trae.svg", "icons/minimax.svg", "icons/qoder.svg"):
+                     "board.js") or re.fullmatch(r"icons/[A-Za-z0-9][A-Za-z0-9._-]*\.(svg|ico)", asset or ""):
             body = (Path(__file__).with_name("ui") / asset).read_bytes()
             self.send_response(200)
             kind = ("image/x-icon" if path.endswith(".ico") else "image/svg+xml" if path.endswith(".svg")
@@ -135,7 +138,7 @@ class GatewayHandler(wb_proxy.Handler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return self.wfile.write(body)
-        match = re.fullmatch(r"/gateway/providers/(workbuddy|trae|minimax|qoder)/(snapshot|models)", path)
+        match = re.fullmatch(r"/gateway/providers/(" + PROVIDER_ROUTE + r")/(snapshot|models)", path)
         if match:
             if not self._panel_ok():
                 return self._error(401, "panel password required")
@@ -177,7 +180,7 @@ class GatewayHandler(wb_proxy.Handler):
             if payload is None:
                 return
             try:
-                match = re.fullmatch(r"/gateway/providers/(workbuddy|trae|minimax|qoder)/(gateway|region|login|poll|enable|delete|credits|credentials|import|checkin|batch)", path)
+                match = re.fullmatch(r"/gateway/providers/(" + PROVIDER_ROUTE + r")/(gateway|region|login|poll|enable|delete|credits|credentials|import|checkin|batch)", path)
                 if match:
                     result = self.runtime.control.action(*match.groups(), payload, self._panel_token(),
                                                         wb_proxy.agents_client_allowed(self.client_address))
@@ -334,6 +337,9 @@ class GatewayHandler(wb_proxy.Handler):
 
     def _external(self, provider, body, kind, original):
         session = wb_proxy.extract_session_key(self.headers, original)
+        native = getattr(self.runtime, "native", {})
+        if provider in native:
+            return self._native(provider, native[provider], body, kind, original, session)
         if provider == "minimax" and kind != "messages":
             return self._minimax_chat(body, kind, original, session)
         if provider == "minimax":
@@ -345,6 +351,71 @@ class GatewayHandler(wb_proxy.Handler):
             response = getattr(self.runtime, provider).open(PATHS[kind], json.dumps(body).encode("utf-8"), headers)
         with response:
             return self._relay(response, provider)
+
+    def _native(self, provider, impl, body, kind, original, session):
+        """Serve one request from an in-process OAuth provider."""
+        if kind == "messages":
+            frames = self._attributed(impl, impl.messages(body, session))
+            if not body.get("stream"):
+                return self._json(200, anthropic_aggregate(frames, body.get("model")))
+            self._begin_stream()
+            return self._write_frames(frames, anthropic=True)
+        if kind == "responses" and body.get("previous_response_id"):
+            raise ProviderError("previous_response_id is not supported for %s; send the full input"
+                                % impl.label, 400)
+        try:
+            chat = wb_proxy.responses_to_chat(body) if kind == "responses" else body
+        except (ValueError, TypeError) as exc:
+            raise ProviderError("invalid Responses input", 400) from exc
+        namespace_map = chat.pop("_namespace_map", None)
+        public_model = original["model"]
+        meta = {key: original[key] for key in ("tools", "tool_choice", "parallel_tool_calls") if key in original}
+        custom_names = wb_proxy.custom_tool_names(original.get("tools"))
+        events = self._attributed(impl, impl.chat(chat, session))
+        if not original.get("stream"):
+            result = wb_proxy.aggregate_stream(events, public_model, None)
+            if kind == "responses":
+                result = wb_proxy.chat_to_response(result, public_model, custom_names, meta, namespace_map)
+            return self._json(200, result)
+        holder = {"custom_names": custom_names, "request_meta": meta, "namespace_map": namespace_map}
+        frames = (wb_proxy.stream_responses_events(events, public_model, holder)
+                  if kind == "responses" else events)
+        self._begin_stream()
+        return self._write_frames(frames)
+
+    def _attributed(self, impl, frames):
+        """Tie streamed frames to the account the provider selected on this thread."""
+        for frame in frames:
+            account = impl.current_account()
+            if account:
+                self._gateway_account = account
+            yield frame
+
+    def _begin_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.close_connection = True
+
+    def _write_frames(self, frames, anthropic=False):
+        try:
+            for frame in frames:
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        except ProviderError as exc:
+            prefix = "event: error\n" if anthropic else ""
+            error = ({"type": "error", "error": {"type": exc.code, "message": str(exc)}}
+                     if anthropic else {"error": {"type": exc.code, "message": str(exc)}})
+            try:
+                self.wfile.write((prefix + "data: " + json.dumps(error, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
 
     def _relay(self, response, provider, panel=False):
         if getattr(response, "gateway_account", ""):

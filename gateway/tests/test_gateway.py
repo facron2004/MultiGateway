@@ -454,7 +454,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         restored = Ports(self.server.gateway, "0.0.0.0", self.server.server_port)
         self.assertEqual(restored.config, ports.config)
-        self.assertEqual(len(restored.info()["groups"]), 4)
+        from gateway.ports import NAMES
+        self.assertEqual(tuple(restored.info()["groups"]), NAMES)
 
     def test_group_api_preflight_allows_authorization_and_blocks_management(self):
         origin = "http://127.0.0.1:%s" % self.server.gateway.ports.info()["port"]

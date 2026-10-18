@@ -5,10 +5,11 @@ from urllib.parse import quote
 
 import wb_proxy as wb
 
+from .native import NAMES as NATIVE_NAMES
 from .transport import ProviderError, json_request
 from .operations import batch, checkin_state
 
-BOARD_PROVIDERS = ("workbuddy", "trae", "minimax", "qoder")
+BOARD_PROVIDERS = ("workbuddy", "trae", "minimax", "qoder") + NATIVE_NAMES
 BOARD_LIMIT = 600
 # A backend usage row and the gateway request that produced it are the same call
 # when they finish within this many seconds of each other; the backend writes its
@@ -108,6 +109,14 @@ def estimate_row_cost_usd(row):
 
 
 def account_view(name, row):
+    if name in NATIVE_NAMES:
+        return {"id": row["id"], "name": row.get("name") or row.get("email") or row["id"],
+                "region": row.get("region", "intl"), "enabled": row.get("enabled", True),
+                "ready": row.get("ready", False), "remaining": row.get("remaining"),
+                "expires_at": row.get("expires_at"), "error": row.get("error") or "",
+                "daily_tokens": row.get("daily_tokens"), "weight": row.get("weight", 1),
+                "quota": row.get("quota"),
+                "checkin": {"supported": False, "done": None, "updated_at": None}}
     if name == "minimax":
         return dict(row, checkin=checkin_state(name, row))
     if name == "trae":
@@ -142,11 +151,17 @@ class Control:
         with getattr(self.runtime, name).open(path, body, {"Content-Type": "application/json"}, timeout=60) as response:
             return json.load(response)
 
+    def native(self, name):
+        return getattr(self.runtime, "native", {}).get(name)
+
     def snapshot(self, name):
         error, rows, region = "", [], "cn"
         capabilities = {"login": True, "import": name != "minimax",
                         "credits": name != "minimax", "regions": name != "trae",
                         "checkin": name != "minimax", "credentials": True}
+        provider = self.native(name)
+        if provider is not None:
+            capabilities = dict(provider.capabilities)
         try:
             if name == "workbuddy":
                 wb.apply_daily_guards()
@@ -155,6 +170,8 @@ class Control:
                 with self.runtime.minimax.lock:
                     rows = self.runtime.minimax.pool.public()
                     region = self.runtime.minimax.region
+            elif provider is not None:
+                rows, region = provider.account_views(), provider.region
             elif name == "qoder":
                 native = getattr(self.runtime.qoder, "native", None)
                 if native is None:
@@ -165,7 +182,8 @@ class Control:
                 rows = result.get("accounts") or []
         except ProviderError as exc:
             error = str(exc)
-        accounts = [account_view(name, row) for row in rows]
+        accounts = [dict(row) for row in rows] if provider is not None else [
+            account_view(name, row) for row in rows]
         scoped = [row for row in accounts if row["region"] == region]
         return {"provider": name, "gateway": self.runtime.ports.info(name), "region": region,
                 "accounts": accounts, "capabilities": capabilities, "error": error,
@@ -328,29 +346,38 @@ class Control:
         if cached and cached[0] > time.monotonic():
             return cached[1]
         try:
+            provider = self.native(name)
             if name == "workbuddy":
                 records = wb.account_views()
             elif name == "minimax":
                 with self.runtime.minimax.lock:
                     records = self.runtime.minimax.pool.public()
+            elif provider is not None:
+                records = provider.account_views()
             elif name == "qoder":
                 native = getattr(self.runtime.qoder, "native", None)
                 records = [] if native is None else native.account_views()
             else:
                 records = self.call(name, "/api/accounts").get("accounts") or []
-            mapping = {row["id"]: row["name"] for row in (account_view(name, record) for record in records)}
+            if provider is not None:
+                mapping = {row["id"]: row.get("name") or row["id"] for row in records}
+            else:
+                mapping = {row["id"]: row["name"] for row in (account_view(name, record) for record in records)}
         except (ProviderError, OSError, ValueError, KeyError, TypeError, AttributeError):
             mapping = {}
         self.name_cache[name] = (time.monotonic() + ttl, mapping)
         return mapping
 
     def action(self, name, action, payload, token, local=True):
+        provider = self.native(name)
         if action == "batch":
             return batch(self, name, payload, token)
         if action == "gateway":
             return self.runtime.ports.configure(name, payload.get("port"), payload.get("enabled"), host=payload.get("host"))
         if action == "region":
             region = payload.get("region")
+            if provider is not None:
+                raise ProviderError("%s 没有区域切换" % provider.label, 400)
             if name == "minimax":
                 self.runtime.minimax.set_region(region)
                 return {"ok": True}
@@ -361,6 +388,8 @@ class Control:
                 self.runtime.qoder.catalog = None
             return result
         if action == "login":
+            if provider is not None:
+                return provider.start_login(payload.get("region"))
             if name == "minimax":
                 return self.runtime.minimax.start_login(payload.get("region", "cn"))
             if name == "trae":
@@ -369,6 +398,8 @@ class Control:
                 return self.runtime.trae.start_login(self.runtime.origin + "/trae")
             return self.call(name, "/accounts/login/start", {"realm": payload.get("region", "cn")}, token)
         if action == "poll":
+            if provider is not None:
+                return provider.poll_login(str(payload.get("login_id") or payload.get("state") or ""))
             if name == "minimax":
                 return self.runtime.minimax.poll_login(payload.get("login_id", ""))
             if name == "trae":
@@ -377,6 +408,17 @@ class Control:
         identifier = payload.get("id")
         if action in ("enable", "delete", "credits", "credentials", "checkin") and not isinstance(identifier, str):
             raise ProviderError("账号 id 必填", 400)
+        if provider is not None:
+            if action == "credentials":
+                return provider.refresh_account(identifier)
+            if action in ("enable", "delete"):
+                return provider.mutate(identifier, payload.get("enabled"), action == "delete")
+            if action == "import":
+                data = payload.get("data")
+                if not isinstance(data, (dict, list)):
+                    raise ProviderError("导入内容必须为 JSON 对象或数组", 400)
+                return provider.import_credentials(data)
+            raise ProviderError("%s 不支持该操作" % provider.label, 400)
         if action == "credentials" and name in ("minimax", "trae"):
             return getattr(self.runtime, name).refresh_account(identifier)
         if name == "minimax":
