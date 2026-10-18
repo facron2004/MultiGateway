@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MultiGateway · 账号网关</title>
+    <link rel="stylesheet" href="/gateway/ui/styles.css" />
+    <script type="module" src="/gateway/ui/app.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar" aria-label="Agent 网关">
+      <div class="sidebar-header">
+        <button
+          id="sidebar-toggle"
+          class="sidebar-toggle-btn"
+          title="展开侧边栏 (Ctrl+B)"
+          aria-label="展开侧边栏"
+        >
+          <span class="sidebar-arrow expand-arrow" data-icon="chevrons-right"></span>
+          <div id="rail-brand" class="rail-brand">M<span>G</span></div>
+          <span class="sidebar-brand-name">MultiGateway</span>
+          <span class="sidebar-arrow collapse-arrow" data-icon="chevrons-left"></span>
+        </button>
+      </div>
+      <nav class="agent-list" aria-label="切换 Agent">
+        <button
+          class="provider selected"
+          data-provider="workbuddy"
+          aria-label="WorkBuddy"
+          aria-pressed="true"
+          title="WorkBuddy"
+        >
+          <img src="/gateway/ui/icons/workbuddy.svg" alt="" />
+          <span class="nav-label">WorkBuddy</span>
+          <span
+            class="rail-dot"
+            data-port="workbuddy"
+          ></span>
+        </button>
+        <button
+          class="provider"
+          data-provider="trae"
+          aria-label="Trae"
+          aria-pressed="false"
+          title="Trae"
+        >
+          <img src="/gateway/ui/icons/trae.svg" alt="" />
+          <span class="nav-label">Trae</span>
+          <span
+            class="rail-dot"
+            data-port="trae"
+          ></span>
+        </button>
+        <button
+          class="provider"
+          data-provider="minimax"
+          aria-label="MiniMax Code"
+          aria-pressed="false"
+          title="MiniMax Code"
+        >
+          <img src="/gateway/ui/icons/minimax.svg" alt="" />
+          <span class="nav-label">MiniMax Code</span>
+          <span
+            class="rail-dot"
+            data-port="minimax"
+          ></span>
+        </button>
+        <button
+          class="provider"
+          data-provider="qoder"
+          aria-label="Qoder"
+          aria-pressed="false"
+          title="Qoder"
+        >
+          <img src="/gateway/ui/icons/qoder.svg" alt="" />
+          <span class="nav-label">Qoder</span>
+          <span
+            class="rail-dot"
+            data-port="qoder"
+          ></span>
+        </button>
+      </nav>
+      <div class="rail-bottom">
+        <button
+          class="rail-tool"
+          data-view="logs"
+          aria-label="用量统计"
+          title="用量统计"
+        >
+          <span data-icon="stats"></span>
+          <span class="nav-label">用量统计</span>
+        </button>
+        <button
+          class="rail-tool"
+          data-view="settings"
+          aria-label="网关设置"
+          title="网关设置"
+        >
+          <span data-icon="settings"></span>
+          <span class="nav-label">网关设置</span>
+        </button>
+        <small class="rail-version">v0.4.0</small>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar pywebview-drag-region">
+        <div class="topbar-nav">
+          <button
+            id="topbar-sidebar-toggle"
+            class="sidebar-toggle-btn topbar-toggle"
+            title="打开左边栏 (Ctrl+B)"
+            aria-label="打开左边栏"
+            hidden
+          >
+            <span data-icon="sidebar-open"></span>
+          </button>
+          <button
+            id="back-button"
+            class="back-button"
+            title="返回账号列表"
+            aria-label="返回账号列表"
+            hidden
+          >
+            <span data-icon="back"></span>
+          </button>
+          <button id="account-home" class="agent-title" title="返回账号池">
+            <img
+              id="provider-logo"
+              src="/gateway/ui/icons/workbuddy.svg"
+              alt=""
+            /><strong id="provider-name">WorkBuddy</strong
+            ><span id="view-name">账号与模型</span>
+          </button>
+        </div>
+        <div class="toolbar">
+          <div
+            id="region-switch"
+            class="region-switch"
+            role="group"
+            aria-label="切换国内版或国际版"
+          >
+            <button data-region="cn" aria-pressed="true" disabled>
+              国内版
+            </button>
+            <button data-region="intl" aria-pressed="false" disabled>
+              国际版
+            </button>
+          </div>
+          <button id="add-account" class="primary">
+            <span data-icon="plus"></span>添加账号
+          </button>
+          <div class="menu-container">
+            <button
+              id="more-toggle"
+              class="icon-button"
+              aria-label="更多操作"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              aria-controls="more-menu"
+            >
+              <span data-icon="more"></span>
+            </button>
+            <div id="more-menu" class="dropdown" role="menu" hidden>
+              <button id="refresh" role="menuitem">
+                <span data-icon="refresh"></span>刷新页面</button
+              ><button id="import-account" role="menuitem">
+                <span data-icon="import"></span>导入账号</button
+              ><button id="folder" role="menuitem" hidden>
+                <span data-icon="folder"></span>打开数据文件夹
+              </button>
+              <hr />
+              <button id="logout" role="menuitem">
+                <span data-icon="logout"></span>退出登录
+              </button>
+            </div>
+          </div>
+          <div id="window-controls" class="window-controls">
+            <button id="win-min" class="win-btn" aria-label="最小化" title="最小化">
+              <svg width="10" height="10" viewBox="0 0 10 10"><line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" stroke-width="1.1"/></svg>
+            </button>
+            <button id="win-max" class="win-btn" aria-label="最大化/还原" title="最大化/还原">
+              <svg width="10" height="10" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+            </button>
+            <button id="win-close" class="win-btn win-close" aria-label="关闭" title="关闭">
+              <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5L8.5 8.5M8.5 1.5L1.5 8.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+      </header>
+      <main id="main" data-provider="workbuddy" aria-busy="true">
+        <div
+          id="notice"
+          class="notice"
+          role="status"
+          aria-live="polite"
+          hidden
+        ></div>
+        <section class="gateway-bar" aria-label="统一网关与当前分组" hidden style="display: none !important;">
+          <div class="gateway-context">
+            <span>当前分组：</span><strong id="current-agent">WorkBuddy</strong
+            ><code id="endpoint">正在读取地址…</code>
+            <button
+              id="copy-endpoint"
+              class="icon-button"
+              aria-label="复制分组 API 地址"
+              title="复制分组 API 地址"
+            >
+              <span data-icon="copy"></span>
+            </button>
+          </div>
+          <div class="gateway-status">
+            <span>路由服务</span
+            ><span class="status-dot" id="gateway-dot"></span
+            ><strong id="gateway-state">连接中</strong
+            ><button
+              id="gateway-toggle"
+              class="icon-button"
+              aria-label="启停网关"
+              title="启停网关"
+            >
+              <span data-icon="pause"></span>
+            </button>
+          </div>
+        </section>
+        <section id="accounts-panel" class="list-panel">
+          <div class="section-heading">
+            <div class="section-title">
+              <h1>账号列表 <span id="account-count" class="count">—</span></h1>
+              <span id="pool-summary">正在读取账号</span>
+            </div>
+            <div class="list-tools">
+              <label class="selection-control"
+                ><input
+                  id="select-all"
+                  type="checkbox"
+                  aria-label="选择当前区域所有账号"
+                /><span id="selection-label">全选</span></label
+              ><label class="search-field"
+                ><span data-icon="search"></span
+                ><input
+                  id="account-filter"
+                  type="search"
+                  placeholder="搜索账号"
+                  aria-label="搜索账号"
+              /></label>
+            </div>
+          </div>
+          <div class="account-toolbar">
+            <button data-batch="checkin">
+              <span data-icon="checkin"></span>签到
+            </button>
+            <button data-batch="credits">
+              <span data-icon="refresh"></span>刷新积分
+            </button>
+            <button data-batch="credentials">
+              <span data-icon="refresh"></span>刷新凭证
+            </button>
+            <div class="menu-container">
+              <button
+                id="account-menu-toggle"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                aria-controls="account-menu"
+              >
+                <span data-icon="accounts"></span>启停账号<span
+                  data-icon="chevron"
+                  class="small-icon"
+                ></span>
+              </button>
+              <div id="account-menu" class="dropdown" role="menu" hidden>
+                <button data-batch="enable" role="menuitem">
+                  <span data-icon="play"></span>启用账号
+                </button>
+                <button data-batch="disable" role="menuitem">
+                  <span data-icon="pause"></span>停用账号
+                </button>
+              </div>
+            </div>
+            <span id="operation-scope">当前区域的账号</span>
+          </div>
+          <div class="table-scroll">
+            <table class="account-table">
+              <thead>
+                <tr>
+                  <th aria-label="选择账号"></th>
+                  <th>版本</th>
+                  <th>账号</th>
+                  <th>状态</th>
+                  <th>积分</th>
+                  <th>签到</th>
+                  <th>Token（今日）</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="account-list" aria-live="polite">
+                <tr>
+                  <td colspan="8"><div class="empty">正在读取账号池…</div></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="account-footnote">
+            <span id="updated">等待数据</span
+            ><span
+              >账号 Token 为今日累计，会话日志在左侧「用量统计」查看。</span
+            >
+          </p>
+        </section>
+        <section id="models-panel" class="list-panel model-section">
+          <div class="section-heading">
+            <div class="section-title">
+              <h1>模型目录 <span id="model-count" class="count">—</span></h1>
+              <p>分组接口使用原模型名；统一 /v1 入口使用带分组前缀的模型名。</p>
+            </div>
+            <label class="search-field"
+              ><span data-icon="search"></span
+              ><input
+                id="model-filter"
+                type="search"
+                placeholder="搜索模型名称"
+                aria-label="搜索模型"
+            /></label>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>模型名称</th>
+                  <th>消耗积分系数</th>
+                  <th>聚合入口模型名</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="model-rows">
+                <tr>
+                  <td colspan="4" class="empty">正在读取模型…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <section id="logs-panel" hidden>
+          <div class="section-heading">
+            <div class="section-title">
+              <h1>用量统计</h1>
+              <p>四个 Agent 的请求合并成一张表，用图标、模型和账号筛选查看。</p>
+            </div>
+            <label class="search-field"
+              ><span data-icon="search"></span
+              ><input
+                id="log-filter"
+                type="search"
+                placeholder="搜索会话、模型、账号或错误"
+                aria-label="搜索用量"
+            /></label>
+          </div>
+          <div class="board-filters">
+            <div class="agent-chips" id="agent-chips" role="group" aria-label="按 Agent 筛选用量"></div>
+            <div class="board-selects">
+              <select id="model-select" class="board-select" aria-label="按模型筛选">
+                <option value="">全部模型</option>
+              </select>
+              <select id="account-select" class="board-select" aria-label="按账号筛选">
+                <option value="">全部账号</option>
+              </select>
+              <select id="range-select" class="board-select" aria-label="按时间范围筛选">
+                <option value="today">当天</option>
+                <option value="7">7天内</option>
+                <option value="30">30天内</option>
+                <option value="all">全部</option>
+              </select>
+            </div>
+          </div>
+          <div id="board-active" class="board-active" hidden></div>
+          <div class="kpi-section">
+            <div class="kpi-layout">
+              <div class="kpi-grid" id="kpi-grid"></div>
+              <div class="kpi-sub-grid" id="kpi-sub-grid" hidden></div>
+            </div>
+            <button
+              id="kpi-expand-btn"
+              class="kpi-expand-btn"
+              type="button"
+              aria-expanded="false"
+              title="展开更多用量明细"
+            >
+              <span>更多指标</span>
+              <span data-icon="chevron" class="kpi-chevron"></span>
+            </button>
+          </div>
+          <section class="board-chart" aria-label="用量趋势">
+            <div class="chart-head">
+              <h2 id="chart-title">使用趋势</h2>
+              <div class="chart-toggle" id="chart-toggle" role="group" aria-label="趋势指标">
+                <button class="selected" data-metric="tokens">Tokens</button
+                ><button data-metric="requests">请求</button
+                ><button data-metric="credits">积分</button>
+              </div>
+            </div>
+            <div id="chart-body" class="chart-body"></div>
+            <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+          </section>
+          <div class="board-table-head">
+            <h2>请求日志</h2>
+            <div class="board-table-tools">
+              <select id="status-select" class="board-select" aria-label="按状态筛选">
+                <option value="">全部状态</option>
+                <option value="success">成功</option>
+                <option value="failed">失败</option>
+                <option value="processing">处理中</option>
+              </select>
+            </div>
+          </div>
+          <div class="log-table-drawer">
+            <table class="board-table">
+              <thead>
+                <tr>
+                  <th style="width: 82px;">时间</th>
+                  <th style="width: 82px;">应用</th>
+                  <th style="width: 140px;">模型</th>
+                  <th style="width: 100px;">账号</th>
+                  <th style="width: 52px; text-align: center;">状态</th>
+                  <th style="width: 68px; text-align: right;">新增输入</th>
+                  <th style="width: 68px; text-align: right;">缓存命中</th>
+                  <th style="width: 60px; text-align: right;">输出</th>
+                  <th style="width: 55px; text-align: right;">积分</th>
+                  <th style="width: 64px; text-align: right;">估算 TPS</th>
+                  <th style="width: 55px; text-align: right;">首字</th>
+                  <th style="width: 55px; text-align: right;">用时</th>
+                </tr>
+              </thead>
+              <tbody id="board-rows">
+                <tr>
+                  <td colspan="12" class="empty">正在读取用量…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="board-pagination" id="board-pagination">
+            <span class="pagination-info" id="pagination-info">共 0 条记录</span>
+            <div class="pagination-controls">
+              <button id="page-prev" class="page-btn" type="button" disabled title="上一页">上一页</button>
+              <span id="page-indicator" class="page-indicator">第 1 / 1 页</span>
+              <button id="page-next" class="page-btn" type="button" disabled title="下一页">下一页</button>
+            </div>
+          </div>
+          <p class="log-note">
+            新增输入 = 计费输入 − 缓存命中；估算 TPS 与首字来自后端逐条用量记录，
+            处理中的请求只填网关已知项。会话标识取自客户端请求头并脱敏保存。
+          </p>
+        </section>
+        <section id="settings-panel" class="panel" hidden>
+          <div class="section-heading">
+            <div class="section-title">
+              <h1>网关设置</h1>
+              <p>
+                一个 API 出口，WorkBuddy、Trae、MiniMax Code、Qoder
+                分组同时可用。
+              </p>
+            </div>
+          </div>
+          <div class="settings-grid">
+            <form id="port-form" class="settings-form">
+              <h2>统一出口网关</h2>
+              <div class="settings-inline-row">
+                <div class="form-field">
+                  <label for="host-input">监听地址</label>
+                  <input
+                    id="host-input"
+                    placeholder="127.0.0.1 或 0.0.0.0"
+                    required
+                  />
+                </div>
+                <div class="form-field">
+                  <label for="port-input">监听端口</label>
+                  <input
+                    id="port-input"
+                    type="number"
+                    min="1"
+                    max="65535"
+                    required
+                  />
+                </div>
+                <button class="primary" type="submit">保存网关设置</button>
+              </div>
+              <p class="muted">
+                统一入口：<code id="unified-endpoint">正在读取地址…</code>
+              </p>
+              <p id="listen-host" class="muted"></p>
+            </form>
+            <div id="key-section" class="settings-form">
+              <h2>统一访问设置</h2>
+              <p class="muted">
+                客户端（如 Cursor、Claude Code、Cline 等 Harness）调用统一网关时使用的访问密钥。
+              </p>
+              <div id="api-keys-list" class="api-keys-list">
+                <p id="key-state" class="muted">正在读取 API Key…</p>
+              </div>
+              <form id="key-form" class="key-create-form">
+                <label for="key-name">新增 API Key</label>
+                <div class="key-input-row">
+                  <input
+                    id="key-name"
+                    type="text"
+                    placeholder="输入 Key 名称，如：Cursor、Claude Code"
+                    required
+                  />
+                  <button type="submit" class="primary">
+                    <span data-icon="plus"></span>生成 API Key
+                  </button>
+                </div>
+                <input id="new-key" type="hidden" />
+              </form>
+            </div>
+            <form id="password-form" class="settings-form">
+              <h2>面板密码</h2>
+              <div class="settings-inline-row">
+                <div class="form-field">
+                  <label for="old-password">当前密码</label>
+                  <input
+                    id="old-password"
+                    type="password"
+                    autocomplete="current-password"
+                    required
+                  />
+                </div>
+                <div class="form-field">
+                  <label for="new-password">新密码</label>
+                  <input
+                    id="new-password"
+                    type="password"
+                    minlength="4"
+                    autocomplete="new-password"
+                    required
+                  />
+                </div>
+                <button type="submit">更新密码</button>
+              </div>
+            </form>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="card-menu" class="dropdown card-menu" role="menu" hidden></div>
+    <dialog id="login">
+      <form id="login-form">
+        <h2>登录 MultiGateway</h2>
+        <p>登录后管理你的 Agent 账号网关。</p>
+        <label for="password">面板密码</label
+        ><input
+          id="password"
+          type="password"
+          autocomplete="current-password"
+          required
+        />
+        <p id="login-error" role="alert"></p>
+        <button class="primary" type="submit">登录</button>
+      </form>
+    </dialog>
+    <dialog id="account-dialog">
+      <div class="dialog-heading">
+        <h2 id="account-dialog-title">添加账号</h2>
+        <button
+          class="icon-button"
+          data-close="account-dialog"
+          aria-label="关闭"
+        >
+          <span data-icon="close"></span>
+        </button>
+      </div>
+      <form id="account-form">
+        <label for="login-region">账号区域</label
+        ><select id="login-region">
+          <option value="cn">国内账号</option>
+          <option value="intl">国际账号</option>
+        </select>
+        <p id="login-instructions">
+          在浏览器完成官方授权，账号会自动加入账号池。
+        </p>
+        <button id="begin-login" class="primary" type="submit">开始授权</button>
+      </form>
+      <div id="authorization" hidden>
+        <code id="device-code"></code
+        ><a id="authorize-link" target="_blank" rel="noreferrer"
+          >打开官方授权页面 ↗</a
+        >
+        <p id="authorization-state" role="status">等待授权…</p>
+        <button id="login-complete">已完成授权，刷新账号池</button>
+      </div>
+    </dialog>
+    <dialog id="import-dialog">
+      <div class="dialog-heading">
+        <h2 id="import-title">导入账号</h2>
+        <button
+          class="icon-button"
+          data-close="import-dialog"
+          aria-label="关闭"
+        >
+          <span data-icon="close"></span>
+        </button>
+      </div>
+      <form id="import-form">
+        <label for="import-data">账号凭证 JSON</label
+        ><textarea
+          id="import-data"
+          rows="9"
+          placeholder="粘贴当前 Agent 的账号凭证或导出内容"
+          required
+          spellcheck="false"
+        ></textarea>
+        <p class="muted">凭证保存在本机账号目录。</p>
+        <button class="primary" type="submit">导入账号</button>
+      </form>
+    </dialog>
+    <dialog id="confirm-dialog">
+      <h2>移除账号</h2>
+      <p id="confirm-message"></p>
+      <div class="dialog-actions">
+        <button data-close="confirm-dialog">取消</button
+        ><button id="confirm-delete" class="danger">移除</button>
+      </div>
+    </dialog>
+    <dialog id="operation-results">
+      <div class="dialog-heading">
+        <h2 id="operation-title">账号操作结果</h2>
+        <button
+          class="icon-button"
+          data-close="operation-results"
+          aria-label="关闭"
+        >
+          <span data-icon="close"></span>
+        </button>
+      </div>
+      <p id="operation-summary"></p>
+      <div id="operation-rows" class="operation-rows"></div>
+    </dialog>
+  </body>
+</html>

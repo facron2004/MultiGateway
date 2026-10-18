@@ -1,0 +1,12 @@
+{
+  "package": "@lobehub/icons-static-svg",
+  "version": "1.95.1",
+  "license": "MIT",
+  "source": "https://github.com/lobehub/lobe-icons",
+  "icons": {
+    "workbuddy": "Official WorkBuddy icon",
+    "trae": "trae-color.svg",
+    "minimax": "minimax-color.svg",
+    "qoder": "qoder-color.svg"
+  }
+}
