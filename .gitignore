@@ -11,13 +11,34 @@ build/
 dist/
 gateway-build/
 gateway-dist/
-gateway-data/
+gateway-data*/
 .gateway-deps/
 *.exe
 *.spec.bak
 
-# Virtual environments
+# Local environment and credentials
 .env
+.env.*
+!.env.example
+*.local
+*.local.json
+*.local.yaml
+*.local.yml
+*.info
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+accounts.json
+auth.json
+credentials.json
+credentials-*.json
+tokens.json
+oauth-client.json
+client_secret*.json
+
+# Virtual environments
 .venv
 env/
 venv/
@@ -27,15 +48,32 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+output/
+playwright-report/
+test-results/
 
 # Logs and runtime data
 *.log
+*.jsonl
+*.har
+*.db
+*.sqlite
+*.sqlite3
 accounts/
 usage/
+usage_records.json
+usage_stats.json
+usage-summary.json
 .qoder-credits/
 .playwright-cli/
 integration-state.json
 agent-backups/
+backups/
+package-backups/
+*.bak
+*.old
+*.backup
+*.bundle
 
 # IDE & OS files
 .vscode/
