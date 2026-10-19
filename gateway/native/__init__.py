@@ -10,9 +10,8 @@ from pathlib import Path
 from .antigravity import Antigravity
 from .copilot import Copilot
 from .grok import Grok
-from .qwen import Qwen
 
-BUILDERS = (Antigravity, Grok, Copilot, Qwen)
+BUILDERS = (Antigravity, Grok, Copilot)
 PROVIDERS = {builder.name: builder for builder in BUILDERS}
 NAMES = tuple(PROVIDERS)
 

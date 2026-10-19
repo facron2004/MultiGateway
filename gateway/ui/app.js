@@ -2,6 +2,7 @@ import { api, providerApi, copy } from "./api.js";
 import {
   $,
   names,
+  usageUnit,
   notice,
   placeholder,
   snapshot,
@@ -128,6 +129,10 @@ function resetProvider() {
   $("provider-name").textContent = names[state.provider];
   $("provider-logo").src = logo(state.provider);
   $("current-agent").textContent = names[state.provider];
+  const unit = usageUnit(state.provider);
+  $("account-usage-label").textContent = unit;
+  $("model-usage-label").textContent = `消耗${unit}系数`;
+  $("refresh-usage-label").textContent = `刷新${unit}`;
   $("gateway-state").textContent = "连接中";
   $("gateway-dot").classList.remove("ready");
   $("endpoint").textContent = "正在读取地址…";

@@ -9,6 +9,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -218,6 +219,7 @@ class NativeGatewayTests(unittest.TestCase):
         cls.server.server_close()
         cls.upstream.shutdown()
         cls.upstream.server_close()
+        cls.server.gateway.activity.close()
         WORK.cleanup()
 
     def setUp(self):
@@ -515,6 +517,37 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(snapshot["gateway"]["port"], self.server.gateway.ports.config["port"])
         self.assertNotIn("good-token", body.decode())
         self.assertNotIn("refresh-1", body.decode())
+
+    def test_account_snapshot_reports_tokens_from_all_public_protocols(self):
+        runtime = self.server.gateway
+        with tempfile.TemporaryDirectory() as directory, closing(Activity(Path(directory))) as activity:
+            with mock.patch.object(runtime, "activity", activity):
+                control = Control(runtime)
+                with mock.patch.object(runtime, "control", control):
+                    cookie = self.cookie()
+                    status, body, _ = self.request("/gateway/providers/fake/snapshot", cookie=cookie)
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual(json.loads(body)["accounts"][0]["daily_tokens"], 0)
+                    for index, (path, payload) in enumerate([
+                        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+                        ("/v1/responses", {"input": "hi"}),
+                        ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16}),
+                    ]):
+                        for streamed in (False, True):
+                            with self.subTest(path=path, stream=streamed):
+                                status, body, _ = self.request(path, dict(payload, model="fake/fake-1", stream=streamed))
+                                self.assertEqual(status, 200, body)
+                                expected_requests = index * 2 + int(streamed) + 1
+                                deadline = time.monotonic() + 2
+                                while len(activity.records()) < expected_requests and time.monotonic() < deadline:
+                                    time.sleep(0.01)
+                                status, body, _ = self.request("/gateway/providers/fake/snapshot", cookie=cookie)
+                                account = json.loads(body)["accounts"][0]
+                                self.assertEqual(account["daily_tokens"], 13 * expected_requests)
+                                self.assertTrue(account["daily_tokens_complete"])
+                    with closing(Activity(Path(directory))) as restored, mock.patch.object(runtime, "activity", restored):
+                        snapshot = Control(runtime).snapshot("fake")
+                        self.assertEqual(snapshot["accounts"][0]["daily_tokens"], 78)
 
     def test_management_actions_reach_the_provider(self):
         status, body, _ = self.request("/gateway/providers/fake/login", {"region": "intl"},

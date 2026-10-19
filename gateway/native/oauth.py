@@ -7,7 +7,7 @@ Two login shapes are supported:
   authorization code. This is the flow Google/xAI clients use with PKCE.
 * ``DeviceAuthorization`` — the vendor returns a user code that is typed into
   the consent page, and the gateway polls the token endpoint. This is the flow
-  GitHub Copilot and Qwen use.
+  GitHub Copilot uses.
 
 Nothing here knows about a specific vendor; providers supply endpoints.
 """

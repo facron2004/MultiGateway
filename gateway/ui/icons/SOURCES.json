@@ -7,12 +7,9 @@
     "workbuddy": "Official WorkBuddy icon",
     "trae": "trae-color.svg",
     "minimax": "minimax-color.svg",
-    "qoder": "qoder-color.svg"
-  },
-  "project_icons": {
-    "antigravity": "Original geometric mark authored for MultiGateway (not a vendor trademark)",
-    "grok": "Original geometric mark authored for MultiGateway (not a vendor trademark)",
-    "copilot": "Original geometric mark authored for MultiGateway (not a vendor trademark)",
-    "qwen": "Original geometric mark authored for MultiGateway (not a vendor trademark)"
+    "qoder": "qoder-color.svg",
+    "antigravity": "antigravity.svg (official Google Antigravity mark)",
+    "grok": "grok.svg (official xAI Grok mark)",
+    "copilot": "copilot-color.svg (official GitHub Copilot mark)"
   }
 }

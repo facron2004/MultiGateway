@@ -1,5 +1,5 @@
 import { providerApi, external } from "./api.js";
-import { $, names, escape, notice } from "./render.js";
+import { $, names, escape, notice, usageUnit } from "./render.js";
 import { icon } from "./icons.js";
 
 export function bindAccounts(state, refresh, mutate, closeMenus) {
@@ -48,7 +48,7 @@ export function bindAccounts(state, refresh, mutate, closeMenus) {
     if (!row) return;
     closeMenus();
     const actions = [
-      ["credits", "刷新积分", "refresh"],
+      ["credits", "刷新" + usageUnit(state.provider), "refresh"],
       ["credentials", "刷新凭证", "refresh"],
       ["checkin", "完成签到", "checkin"],
       ["delete", "移除账号", "delete"],

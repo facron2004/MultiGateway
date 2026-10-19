@@ -2,7 +2,7 @@
 
 Every native provider speaks one of:
 
-* OpenAI ``chat.completions`` (Grok, Copilot, Qwen, iFlow, …)
+* OpenAI ``chat.completions`` (Grok, Copilot, iFlow, …)
 * Anthropic ``messages`` (Claude Code, MiniMax)
 
 The gateway's unified surface is OpenAI chat + OpenAI Responses + Anthropic

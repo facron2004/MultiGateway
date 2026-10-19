@@ -1,7 +1,7 @@
-import { $, names, escape, date, statuses } from "./render.js";
+import { $, names, escape, date, statuses, usageUnit } from "./render.js";
 import { logo, icon } from "./icons.js";
 
-const PROVIDERS = ["workbuddy", "trae", "minimax", "qoder"];
+const PROVIDERS = [...Object.keys(names)];
 const MAX_ROWS = 400;
 let notify = () => {};
 
@@ -144,7 +144,7 @@ export function visibleRows() {
   );
 }
 
-function kpis(rows) {
+function kpis(rows, unit) {
   const cached = sum(rows, "cached_tokens");
   const fresh = sum(rows, "new_input_tokens");
   const prompt = sum(rows, "input_tokens");
@@ -188,7 +188,7 @@ function kpis(rows) {
         value: formatTokens(output),
       },
       {
-        label: "积分消耗",
+        label: `${unit}消耗`,
         value: credit(credits),
       },
       {
@@ -241,53 +241,31 @@ export function bucketize(rows) {
   }
 
   // 2. 7天内: 按分日走 (7 calendar days ending today)
-  if (board.range === "7") {
-    const buckets = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(todayStart - i * 86400000);
-      const mStr = String(d.getMonth() + 1).padStart(2, "0");
-      const dStr = String(d.getDate()).padStart(2, "0");
-      const dateStr = `${mStr}/${dStr}`;
-      buckets.push({
-        at: d.getTime() / 1000,
-        dayStart: d.getTime(),
-        dayEnd: d.getTime() + 86400000,
-        rows: [],
-        labelShown: dateStr,
-        tooltip: `${d.getFullYear()}/${mStr}/${dStr}`,
-      });
-    }
-    rows.forEach((row) => {
-      if (!row.timestamp) return;
-      const t = row.timestamp * 1000;
-      const bucket = buckets.find((b) => t >= b.dayStart && t < b.dayEnd);
-      if (bucket) bucket.rows.push(row);
-    });
-    return buckets;
-  }
-
   // 3. 30天内: 按分日走 (30 calendar days ending today)
-  if (board.range === "30") {
+  const rangeDays = { 7: 6, 30: 29 }[board.range];
+  if (rangeDays !== undefined) {
     const buckets = [];
-    for (let i = 29; i >= 0; i--) {
+    for (let i = rangeDays; i >= 0; i--) {
       const d = new Date(todayStart - i * 86400000);
       const mStr = String(d.getMonth() + 1).padStart(2, "0");
       const dStr = String(d.getDate()).padStart(2, "0");
       const dateStr = `${mStr}/${dStr}`;
-      const show = (29 - i) % 5 === 0 || i === 0;
       buckets.push({
         at: d.getTime() / 1000,
         dayStart: d.getTime(),
         dayEnd: d.getTime() + 86400000,
         rows: [],
-        labelShown: show ? dateStr : "",
+        labelShown: rangeDays === 6 ? dateStr : (rangeDays - i) % 5 === 0 || i === 0 ? dateStr : "",
         tooltip: `${d.getFullYear()}/${mStr}/${dStr}`,
       });
     }
+    const firstDayStart = buckets[0].dayStart;
     rows.forEach((row) => {
       if (!row.timestamp) return;
-      const t = row.timestamp * 1000;
-      const bucket = buckets.find((b) => t >= b.dayStart && t < b.dayEnd);
+      const index = Math.floor(
+        (row.timestamp * 1000 - firstDayStart) / 86400000,
+      );
+      const bucket = buckets[index];
       if (bucket) bucket.rows.push(row);
     });
     return buckets;
@@ -323,8 +301,10 @@ export function bucketize(rows) {
   }
   rows.forEach((row) => {
     if (!row.timestamp) return;
-    const t = row.timestamp * 1000;
-    const bucket = buckets.find((b) => t >= b.dayStart && t < b.dayEnd);
+    const index = Math.floor(
+      (row.timestamp * 1000 - startDayTime) / 86400000,
+    );
+    const bucket = buckets[index];
     if (bucket) bucket.rows.push(row);
   });
   return buckets;
@@ -336,10 +316,10 @@ function metricValue(rows) {
   return sum(rows, "input_tokens") + sum(rows, "output_tokens");
 }
 
-function renderChart(rows) {
+function renderChart(rows, unit) {
   const buckets = bucketize(rows);
   const peak = Math.max(...buckets.map((bucket) => metricValue(bucket.rows)), 1);
-  const metricLabel = { tokens: "Tokens", requests: "请求", credits: "积分" }[board.metric];
+  const metricLabel = { tokens: "Tokens", requests: "请求", credits: unit }[board.metric];
   $("chart-title").textContent = `使用趋势 · ${
     { today: "当天", 7: "7天内", 30: "30天内", all: "全部" }[board.range]
   } · ${metricLabel}`;
@@ -383,7 +363,7 @@ function renderChart(rows) {
       const value = metricValue(bucket.rows);
       const formattedVal =
         board.metric === "credits"
-          ? credit(value) + " 积分"
+          ? credit(value) + " " + unit
           : compact(value) + (board.metric === "tokens" ? " Tokens" : " 次");
       const reqCount = bucket.rows.length;
 
@@ -565,7 +545,11 @@ export function renderBoard() {
   renderChips();
   renderSelects();
   renderActive();
-  const data = kpis(rows);
+  const providers = board.agents.size ? [...board.agents] : PROVIDERS;
+  const unit = [...new Set(providers.map(usageUnit))].join(" / ");
+  $("board-usage-label").textContent = unit;
+  document.querySelector('#chart-toggle [data-metric="credits"]').textContent = unit;
+  const data = kpis(rows, unit);
   if ($("kpi-grid")) {
     $("kpi-grid").innerHTML = data.mainCards
       .map(
@@ -599,7 +583,7 @@ export function renderBoard() {
       )
       .join("");
   }
-  renderChart(rows);
+  renderChart(rows, unit);
   renderRows(rows);
   document
     .querySelectorAll("#chart-toggle button")

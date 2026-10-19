@@ -8,9 +8,10 @@ export const names = {
   antigravity: "Antigravity",
   grok: "Grok",
   copilot: "GitHub Copilot",
-  qwen: "Qwen Code",
 };
 export const regions = { cn: "国内", intl: "国际", global: "国际" };
+export const usageUnit = (provider) =>
+  ["antigravity", "grok", "copilot"].includes(provider) ? "额度" : "积分";
 export const escape = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -143,10 +144,10 @@ export function accountRows(data, filter, selected, busy = false) {
       <td><span class="account-state ${active ? "ready" : ""}">${status}</span>${row.error ? `<div class="account-error" title="${escape(row.error)}">${escape(row.error)}</div>` : ""}</td>
       <td><strong class="account-credits ${row.remaining == null ? "muted" : ""}">${row.remaining === "unlimited" ? "无限制" : number(row.remaining)}</strong></td>
       <td><span class="${row.checkin?.done === true ? "checked-in" : "muted"}">${checkin}</span></td>
-      <td class="token-count">${number(row.daily_tokens)}</td>
+      <td class="token-count" title="${row.daily_tokens == null ? "上游未返回 Token 用量" : row.daily_tokens_complete === false ? "部分请求未返回用量，仅汇总上游已返回的实际 Token" : "今日输入与输出 Token 总量"}">${row.daily_tokens == null ? "—" : number(row.daily_tokens)}</td>
       <td><div class="account-actions">
         <button class="action-icon-btn ${row.enabled ? "btn-pause" : "btn-play"}" data-account-action="enable" data-id="${escape(row.id)}" aria-label="${row.enabled ? "停用账号" : "启用账号"}" title="${row.enabled ? "停用账号" : "启用账号"}" ${busy ? "disabled" : ""}>${icon(row.enabled ? "pause" : "play")}</button>
-        <button class="action-icon-btn" data-row-action="credits" data-id="${escape(row.id)}" aria-label="刷新积分" title="${!data.capabilities.credits ? "不支持刷新积分" : "刷新积分"}" ${busy || !data.capabilities.credits ? "disabled" : ""}>${icon("refresh")}</button>
+        <button class="action-icon-btn" data-row-action="credits" data-id="${escape(row.id)}" aria-label="刷新${usageUnit(data.provider)}" title="${!data.capabilities.credits ? "不支持刷新" : "刷新"}${usageUnit(data.provider)}" ${busy || !data.capabilities.credits ? "disabled" : ""}>${icon("refresh")}</button>
         <button class="action-icon-btn" data-row-action="credentials" data-id="${escape(row.id)}" aria-label="刷新凭证" title="${!data.capabilities.credentials ? "不支持刷新凭证" : "刷新凭证"}" ${busy || !data.capabilities.credentials ? "disabled" : ""}>${icon("key")}</button>
         <button class="action-icon-btn" data-row-action="checkin" data-id="${escape(row.id)}" aria-label="完成签到" title="${!data.capabilities.checkin || !row.checkin?.supported ? "不支持签到" : "完成签到"}" ${busy || !data.capabilities.checkin || !row.checkin?.supported ? "disabled" : ""}>${icon("checkin")}</button>
         <button class="action-icon-btn btn-delete" data-row-action="delete" data-id="${escape(row.id)}" aria-label="移除账号" title="移除账号" ${busy ? "disabled" : ""}>${icon("delete")}</button>
@@ -182,7 +183,7 @@ export function scope(data, selected, busy) {
       );
     button.disabled = busy || !rows.length || unsupported || noCheckinTarget;
     button.title = unsupported
-      ? `${names[data.provider]} 未提供${{ checkin: "签到", credits: "积分查询", credentials: "凭证刷新" }[action]}接口`
+      ? `${names[data.provider]} 未提供${{ checkin: "签到", credits: usageUnit(data.provider) + "查询", credentials: "凭证刷新" }[action]}接口`
       : noCheckinTarget
         ? "当前区域没有支持签到的账号"
         : "";
@@ -269,7 +270,7 @@ export function models(provider, rows, filter = "") {
 export function operationResults(provider, operation, result) {
   const labels = {
     checkin: "签到",
-    credits: "刷新积分",
+    credits: "刷新" + usageUnit(provider),
     credentials: "刷新凭证",
     enable: "启用账号",
     disable: "停用账号",

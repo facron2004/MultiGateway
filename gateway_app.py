@@ -32,7 +32,7 @@ class WindowedLog:
 
 
 def arguments():
-    parser = argparse.ArgumentParser(description="WorkBuddy / Trae / MiniMax Code / Qoder / Antigravity / Grok / GitHub Copilot / Qwen Code account gateway")
+    parser = argparse.ArgumentParser(description="WorkBuddy / Trae / MiniMax Code / Qoder / Antigravity / Grok / GitHub Copilot account gateway")
     parser.add_argument("--headless", action="store_true", help="serve the API without opening the desktop window")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8791)
@@ -180,7 +180,7 @@ def main():
                 js_api=api
             )
             api.set_window(window)
-            webview.start()
+            webview.start(icon=str(Path(__file__).with_name("app_icon.ico")))
             server.shutdown()
     except KeyboardInterrupt:
         pass

@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>MultiGateway · 账号网关</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico?v=multigateway" />
     <link rel="stylesheet" href="/gateway/ui/styles.css" />
     <script type="module" src="/gateway/ui/app.js"></script>
   </head>
@@ -17,7 +18,9 @@
           aria-label="展开侧边栏"
         >
           <span class="sidebar-arrow expand-arrow" data-icon="chevrons-right"></span>
-          <div id="rail-brand" class="rail-brand">M<span>G</span></div>
+          <div id="rail-brand" class="rail-brand">
+            <img src="/gateway/ui/icons/multigateway.png" alt="" />
+          </div>
           <span class="sidebar-brand-name">MultiGateway</span>
           <span class="sidebar-arrow collapse-arrow" data-icon="chevrons-left"></span>
         </button>
@@ -119,20 +122,6 @@
           <span
             class="rail-dot"
             data-port="copilot"
-          ></span>
-        </button>
-        <button
-          class="provider"
-          data-provider="qwen"
-          aria-label="Qwen Code"
-          aria-pressed="false"
-          title="Qwen Code"
-        >
-          <img src="/gateway/ui/icons/qwen.svg" alt="" />
-          <span class="nav-label">Qwen Code</span>
-          <span
-            class="rail-dot"
-            data-port="qwen"
           ></span>
         </button>
       </nav>
@@ -306,7 +295,7 @@
               <span data-icon="checkin"></span>签到
             </button>
             <button data-batch="credits">
-              <span data-icon="refresh"></span>刷新积分
+              <span data-icon="refresh"></span><span id="refresh-usage-label">刷新积分</span>
             </button>
             <button data-batch="credentials">
               <span data-icon="refresh"></span>刷新凭证
@@ -342,7 +331,7 @@
                   <th>版本</th>
                   <th>账号</th>
                   <th>状态</th>
-                  <th>积分</th>
+                  <th id="account-usage-label">积分</th>
                   <th>签到</th>
                   <th>Token（今日）</th>
                   <th>操作</th>
@@ -358,7 +347,7 @@
           <p class="account-footnote">
             <span id="updated">等待数据</span
             ><span
-              >账号 Token 为今日累计，会话日志在左侧「用量统计」查看。</span
+              >账号 Token 为本网关今日记录的上游实际用量，会话日志在左侧「用量统计」查看。</span
             >
           </p>
         </section>
@@ -382,7 +371,7 @@
               <thead>
                 <tr>
                   <th>模型名称</th>
-                  <th>消耗积分系数</th>
+                  <th id="model-usage-label">消耗积分系数</th>
                   <th>聚合入口模型名</th>
                   <th>操作</th>
                 </tr>
@@ -399,7 +388,7 @@
           <div class="section-heading">
             <div class="section-title">
               <h1>用量统计</h1>
-              <p>八个 Agent 的请求合并成一张表，用图标、模型和账号筛选查看。</p>
+                <p>七个 Agent 的请求合并成一张表，用图标、模型和账号筛选查看。</p>
             </div>
             <label class="search-field"
               ><span data-icon="search"></span
@@ -479,7 +468,7 @@
                   <th style="width: 68px; text-align: right;">新增输入</th>
                   <th style="width: 68px; text-align: right;">缓存命中</th>
                   <th style="width: 60px; text-align: right;">输出</th>
-                  <th style="width: 55px; text-align: right;">积分</th>
+                  <th id="board-usage-label" style="width: 55px; text-align: right;">积分 / 额度</th>
                   <th style="width: 64px; text-align: right;">估算 TPS</th>
                   <th style="width: 55px; text-align: right;">首字</th>
                   <th style="width: 55px; text-align: right;">用时</th>
@@ -511,7 +500,7 @@
               <h1>网关设置</h1>
               <p>
                 一个 API 出口，WorkBuddy、Trae、MiniMax Code、Qoder、Antigravity、Grok、GitHub
-                Copilot、Qwen Code 分组同时可用。
+                Copilot 分组同时可用。
               </p>
             </div>
           </div>

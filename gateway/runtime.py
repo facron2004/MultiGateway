@@ -63,6 +63,7 @@ class Runtime:
                 provider.stop()
             except Exception:
                 logging.exception("%s provider failed to stop", provider.name)
+        self.activity.close()
 
     def status(self):
         return {

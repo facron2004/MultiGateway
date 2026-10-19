@@ -293,8 +293,8 @@ body.sidebar-expanded .sidebar-toggle-btn .rail-brand {
   letter-spacing: -1.2px;
   font-weight: 700;
   color: #5c5e68;
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -303,9 +303,6 @@ body.sidebar-expanded .sidebar-toggle-btn .rail-brand {
   flex-shrink: 0;
   line-height: 1;
   -webkit-app-region: no-drag;
-}
-body.sidebar-expanded .sidebar-toggle-btn .rail-brand span {
-  color: var(--orange);
 }
 body.sidebar-expanded .sidebar-brand-name {
   display: inline-block;
@@ -330,8 +327,11 @@ body.sidebar-expanded .sidebar-brand-name {
   margin: 0 0 16px 0;
   user-select: none;
 }
-.rail-brand span {
-  color: var(--orange);
+.rail-brand img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 .agent-list {
   display: flex;

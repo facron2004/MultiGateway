@@ -1,5 +1,6 @@
 """One management contract for all four account pools and gateway ports."""
 import json
+import os
 import time
 from urllib.parse import quote
 
@@ -10,7 +11,14 @@ from .transport import ProviderError, json_request
 from .operations import batch, checkin_state
 
 BOARD_PROVIDERS = ("workbuddy", "trae", "minimax", "qoder") + NATIVE_NAMES
-BOARD_LIMIT = 600
+# No cap on how many rows the usage board returns. The panel asks for the
+# history it is allowed to see, so the answer is "all of it": a cap here
+# silently hid every request older than the newest N, and the panel's own
+# page-size selector is the only thing that should govern how much is shown
+# at once. The row count is bounded by the log itself (Activity keeps the
+# newest 2000 in memory and reads the rest from disk on demand), so a caller
+# cannot make the board allocate without bound.
+BOARD_LIMIT = None
 # A backend usage row and the gateway request that produced it are the same call
 # when they finish within this many seconds of each other; the backend writes its
 # row at completion, the gateway logs start time plus elapsed milliseconds.
@@ -49,8 +57,24 @@ MODELSDEV_RATES = {
 }
 
 
-def estimate_row_cost_usd(row):
-    """Estimate API equivalent cost in USD per models.dev / OpenRouter per 1M tokens."""
+def _usd_cny_of(pricing):
+    """The CNY-per-USD rate out of an already-loaded snapshot (7.1 as a floor)."""
+    try:
+        rate = float(((pricing or {}).get("meta") or {}).get("usd_cny") or 0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    return rate if rate > 0 else 7.1
+
+
+def estimate_row_cost_usd(row, _pricing=None):
+    """Estimate API equivalent cost in USD per models.dev / OpenRouter per 1M tokens.
+
+    `_pricing` lets a caller price a whole batch against one snapshot of the
+    price file. Reading it per row costs two stat() calls each, which dominated
+    this function once the board stopped capping its rows (measured: 0.4ms per
+    row, almost all of it filesystem). The result is unchanged: the same
+    snapshot is what load_pricing() would have returned anyway.
+    """
     if not row:
         return 0.0
     prompt = float(row.get("input_tokens") or 0.0)
@@ -69,9 +93,9 @@ def estimate_row_cost_usd(row):
             "cached_tokens": cached,
             "completion_tokens": output,
             "at": row.get("timestamp") or row.get("finished_at")
-        })
+        }, pricing=_pricing)
         if pricing_data.get("known") and pricing_data.get("cny") is not None:
-            usd_rate = wb_pricing.usd_cny() or 7.1
+            usd_rate = _usd_cny_of(_pricing)
             return round(pricing_data["cny"] / usd_rate, 6)
     except Exception:
         pass
@@ -143,6 +167,53 @@ class Control:
     def __init__(self, runtime):
         self.runtime = runtime
         self.name_cache = {}
+        # The board rebuilds the full history (gateway rows + every backend's
+        # usage rows + per-row pricing), which polls every 10 seconds. The
+        # cache keys on the cheap, observable inputs of that computation, so
+        # an idle dashboard costs a handful of stat() calls instead of whole
+        # logs re-read per poll. See _board_signature.
+        self._board_cache = {"key": None, "payload": None}
+        self._daily_account_cache = {}
+
+    def _usage_state(self, name):
+        """(path, size, mtime_ns) of a backend's usage source, for cache keys.
+
+        Sources change only when a request completes (append/replace), so
+        size+mtime is an exact "did anything new land" test at stat() cost.
+        Missing files collapse to one constant so the first row still
+        invalidates.
+        """
+        path = None
+        if name == "workbuddy":
+            path = wb.USAGE_LOG
+        elif name == "qoder":
+            qoder = getattr(self.runtime, "qoder", None)
+            native = None if qoder is None else getattr(qoder, "native", None)
+            path = None if native is None else getattr(native, "USAGE_LOG", None)
+        elif name == "trae":
+            directory = getattr(self.runtime.trae, "directory", None)
+            path = None if directory is None else directory / "usage_records.json"
+        if not path:
+            return ()
+        try:
+            info = os.stat(path)
+        except OSError:
+            return (str(path), "missing")
+        return (str(path), info.st_size, info.st_mtime_ns)
+
+    def _board_signature(self):
+        """Everything the board result can depend on, at stat() cost.
+
+        Activity's revision covers in-flight and finished gateway requests;
+        usage-file states cover the backend detail half; the fixed time
+        bucket lets a changed price table (the pricing fetch runs on its own
+        schedule) show up in the worst case within five minutes instead of
+        never.
+        """
+        activity = self.runtime.activity
+        return (activity.revision,
+                tuple(self._usage_state(name) for name in BOARD_PROVIDERS),
+                int(time.time() // 300))
 
     def call(self, name, path, payload=None, token=None):
         if name == "workbuddy":
@@ -153,6 +224,27 @@ class Control:
 
     def native(self, name):
         return getattr(self.runtime, "native", {}).get(name)
+
+    def daily_account_usage(self, name):
+        """Today's actual usage, attributed to accounts and deduplicated like the board."""
+        day = time.strftime("%Y-%m-%d")
+        key = (day, self.runtime.activity.revision, self._usage_state(name))
+        cached = self._daily_account_cache.get(name)
+        if cached and cached[0] == key:
+            return cached[1]
+        totals = {}
+        for row in self._usage_rows((name,)):
+            if not row["account"] or row["timestamp"] is None or row["status"] == "processing":
+                continue
+            if time.strftime("%Y-%m-%d", time.localtime(row["timestamp"])) != day:
+                continue
+            bucket = totals.setdefault(row["account"], {"tokens": 0, "requests": 0, "metered": 0})
+            bucket["requests"] += 1
+            if row["input_tokens"] is not None or row["output_tokens"] is not None:
+                bucket["tokens"] += (row["input_tokens"] or 0) + (row["output_tokens"] or 0)
+                bucket["metered"] += 1
+        self._daily_account_cache[name] = (key, totals)
+        return totals
 
     def snapshot(self, name):
         error, rows, region = "", [], "cn"
@@ -184,6 +276,11 @@ class Control:
             error = str(exc)
         accounts = [dict(row) for row in rows] if provider is not None else [
             account_view(name, row) for row in rows]
+        usage = self.daily_account_usage(name) if accounts else {}
+        for account in accounts:
+            counts = usage.get(account["id"], {"tokens": 0, "requests": 0, "metered": 0})
+            account["daily_tokens"] = counts["tokens"] if counts["metered"] or not counts["requests"] else None
+            account["daily_tokens_complete"] = counts["requests"] == counts["metered"]
         scoped = [row for row in accounts if row["region"] == region]
         return {"provider": name, "gateway": self.runtime.ports.info(name), "region": region,
                 "accounts": accounts, "capabilities": capabilities, "error": error,
@@ -241,9 +338,6 @@ class Control:
                 "credits": _first(record, "credit", "credits", "credits_consumed"),
                 "cost_usd": _number(record.get("cost_usd")),
                 "account": str(record.get("account") or record.get("account_id") or "")}
-        if row["cost_usd"] is None:
-            row["cost_usd"] = estimate_row_cost_usd(row)
-        return row
 
     def gateway_rows(self, limit):
         """Requests this gateway served; carries the session and in-flight state."""
@@ -256,13 +350,19 @@ class Control:
         return rows
 
     def backend_rows(self, name, limit):
-        """Per-request rows the provider backend writes, including the served account."""
+        """Per-request rows the provider backend writes, including the served account.
+
+        `limit` of None means "no cap"; the readers below take a page size and
+        fall back to their default (100) when they get a non-number, so None
+        has to be spelled out as "everything" rather than passed through.
+        """
         try:
             if name == "workbuddy":
-                raw = wb.recent_usage(limit)
+                raw = wb.recent_usage(limit) if limit is not None else wb.recent_usage(10 ** 9)
             elif name == "qoder":
                 native = getattr(self.runtime.qoder, "native", None)
-                raw = None if native is None else native.recent_usage(limit)
+                raw = None if native is None else (
+                    native.recent_usage(limit) if limit is not None else native.recent_usage(10 ** 9))
             elif name == "trae":
                 raw = self.call(name, "/api/usage/records")
             else:
@@ -271,7 +371,7 @@ class Control:
             return []
         rows = raw if isinstance(raw, list) else (raw or {}).get("rows", (raw or {}).get("records", []))
         result = []
-        for record in list(rows)[:limit]:
+        for record in (rows if limit is None else list(rows)[:limit]):
             if not isinstance(record, dict):
                 continue
             row = self._row(name, record)
@@ -283,25 +383,61 @@ class Control:
             result.append(row)
         return result
 
-    def board(self, limit=BOARD_LIMIT):
-        """Every agent's requests in one table: gateway rows enriched with backend detail."""
-        rows = self.gateway_rows(limit)
-        backend = [row for name in BOARD_PROVIDERS for row in self.backend_rows(name, limit)]
+    def _usage_rows(self, names, limit=None):
+        """Join gateway requests with their provider's actual usage records once."""
+        rows = [row for row in self.gateway_rows(limit) if row["provider"] in names]
+        backend = [row for name in names for row in self.backend_rows(name, limit)]
         buckets = {}
         for row in backend:
             buckets.setdefault((row["provider"], row["model"]), []).append(row)
         matched = set()
+        # Pairing a gateway row with its backend row used to scan every
+        # candidate of the same (provider, model) for each row, which is
+        # O(rows x candidates) and was fine while BOARD_LIMIT capped the board
+        # at 600. With no cap that quadratic term is the whole cost of the
+        # endpoint (measured: 6000 rows x 6000 candidates took ~5.8s, on a
+        # page that polls every 10s).
+        #
+        # The pairing is "same (provider, model) and smallest completion-time
+        # gap, first come first served in row order", so bucket the candidates
+        # by the whole second they finished in: a row then only inspects the
+        # buckets its own window touches instead of the whole list. Each
+        # candidate is still matched at most once, and the winner is identical
+        # to the old scan because both take the smallest gap and both start
+        # from the same initial gap - the bucket range is derived from that
+        # same bound, so it can only ever be wider than the set of rows the old
+        # scan would have accepted.
+        buckets = {key: sorted((row for row in value if row["finished_at"] is not None),
+                               key=lambda row: row["finished_at"])
+                   for key, value in buckets.items()}
+        by_second = {}
+        for key, items in buckets.items():
+            seconds = {}
+            for item in items:
+                seconds.setdefault(int(item["finished_at"] // 1), []).append(item)
+            by_second[key] = seconds
         for row in rows:
             candidates = buckets.get((row["provider"], row["model"])) or []
             if not candidates or row["finished_at"] is None:
                 continue
+            seconds = by_second.get((row["provider"], row["model"]), {})
             best, gap = None, MATCH_WINDOW + 1
-            for item in candidates:
-                if id(item) in matched or item["finished_at"] is None:
-                    continue
-                distance = abs(item["finished_at"] - row["finished_at"])
-                if distance < gap:
-                    best, gap = item, distance
+            # A candidate can only win while |finished_at - f| < gap, i.e. while
+            # its finished_at lies in (f - gap, f + gap), so its whole second is
+            # in [floor(f - gap), floor(f + gap)]. Bucketing on the initial gap
+            # covers every candidate the old scan could have accepted; the
+            # exact distance is still re-checked per candidate below.
+            lo = int((row["finished_at"] - gap) // 1)
+            hi = int((row["finished_at"] + gap) // 1)
+            for second in range(lo, hi + 1):
+                for item in seconds.get(second, ()):
+                    if id(item) in matched:
+                        continue
+                    if row["account"] and item["account"] and row["account"] != item["account"]:
+                        continue
+                    distance = abs(item["finished_at"] - row["finished_at"])
+                    if distance < gap:
+                        best, gap = item, distance
             if best is None:
                 continue
             matched.add(id(best))
@@ -318,7 +454,23 @@ class Control:
                 if window > 0.2:
                     row["tokens_per_sec"] = round(row["output_tokens"] / window, 2)
         rows.sort(key=lambda row: row["timestamp"] or 0, reverse=True)
-        rows = rows[:limit]
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
+    def board(self, limit=BOARD_LIMIT):
+        """Every agent's requests in one table: gateway rows enriched with backend detail.
+
+        `limit` caps the rows returned; None means "no cap" - the whole history
+        the gateway knows about. Every downstream slice has to treat None as
+        "keep everything" rather than as a number. The result is cached on the
+        cheap observable inputs (_board_signature): same inputs, same answer,
+        so the dashboard's 10s poll costs stats instead of a rebuild.
+        """
+        key = (limit, self._board_signature())
+        if self._board_cache["key"] == key and self._board_cache["payload"] is not None:
+            return {**self._board_cache["payload"], "generated_at": time.time()}
+        rows = self._usage_rows(BOARD_PROVIDERS, limit)
         providers = {name: 0 for name in BOARD_PROVIDERS}
         models, accounts = {}, {}
         for row in rows:
@@ -329,17 +481,28 @@ class Control:
                 key = (row["provider"], row["account"])
                 accounts[key] = accounts.get(key, 0) + 1
         names = {name: self._account_names(name) for name in {key[0] for key in accounts}}
+        # One snapshot of the price file for the whole batch: each row's
+        # estimate would otherwise stat() the file twice (see
+        # estimate_row_cost_usd). Failing to load it is fine - the estimator
+        # falls back to its own table.
+        try:
+            from .vendor.workbuddy import wb_pricing
+            pricing = wb_pricing.load_pricing()
+        except Exception:
+            pricing = None
         for row in rows:
             row["account_name"] = names.get(row["provider"], {}).get(row["account"], "")
-            row["cost_usd"] = estimate_row_cost_usd(row)
+            row["cost_usd"] = estimate_row_cost_usd(row, pricing)
         by_count = lambda items: sorted(items.items(), key=lambda item: -item[1])
-        return {"rows": rows, "generated_at": time.time(),
-                "facets": {"providers": [{"id": key, "count": value} for key, value in providers.items()],
-                           "models": [{"provider": key[0], "model": key[1], "count": value}
-                                      for key, value in by_count(models)],
-                           "accounts": [{"provider": key[0], "id": key[1],
-                                         "name": names.get(key[0], {}).get(key[1]) or key[1],
-                                         "count": value} for key, value in by_count(accounts)]}}
+        payload = {"rows": rows, "generated_at": time.time(),
+                   "facets": {"providers": [{"id": key, "count": value} for key, value in providers.items()],
+                              "models": [{"provider": key[0], "model": key[1], "count": value}
+                                         for key, value in by_count(models)],
+                              "accounts": [{"provider": key[0], "id": key[1],
+                                            "name": names.get(key[0], {}).get(key[1]) or key[1],
+                                            "count": value} for key, value in by_count(accounts)]}}
+        self._board_cache = {"key": key, "payload": payload}
+        return payload
 
     def _account_names(self, name, ttl=60):
         cached = self.name_cache.get(name)

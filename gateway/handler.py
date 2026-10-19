@@ -20,6 +20,18 @@ PROVIDERS = {"workbuddy", "trae", "minimax", "qoder"} | set(NATIVE_PROVIDERS)
 PROVIDER_ROUTE = "(?:" + "|".join(sorted(PROVIDERS)) + ")"
 PATHS = {"chat": "/v1/chat/completions", "responses": "/v1/responses", "messages": "/v1/messages"}
 
+_ASSET_ROOT = Path(__file__).with_name("ui")
+_ASSET_KINDS = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                ".svg": "image/svg+xml", ".ico": "image/x-icon", ".png": "image/png",
+                ".html": "text/html; charset=utf-8"}
+_UI_FILES = ("styles.css", "api.js", "render.js", "app.js", "accounts.js",
+             "access.js", "icons.js", "board.js")
+# name -> ((mtime_ns, size), etag, body). Serving the panel re-reads each
+# asset from disk per request today; the cache holds the last-read bytes and
+# the stat() check per request keeps an edited file fresh (and unedited files
+# keep their etag, so a browser can revalidate without re-downloading).
+_SERVED_FILES = {}
+
 
 class GatewayHandler(wb_proxy.Handler):
     server_version = "MultiGateway/" + VERSION
@@ -89,15 +101,41 @@ class GatewayHandler(wb_proxy.Handler):
     def _get_dashboard(self):
         if urlsplit(self.path).path == "/workbuddy":
             return super()._get_dashboard()
-        self._html_page(Path(__file__).with_name("dashboard.html"))
+        self._serve_file(Path(__file__).with_name("dashboard.html"), _ASSET_KINDS[".html"])
 
-    def _html_page(self, path):
-        body = path.read_bytes()
+    def _serve_file(self, source, kind):
+        """One UI file from the in-memory cache, revalidated by stat per request.
+
+        A matching If-None-Match gets a 304, so a repeated dashboard open
+        skips re-downloading the panel; an unchanged file is served from
+        memory instead of disk, and an edited file reloads because the etag
+        is derived from its own mtime/size.
+        """
+        try:
+            info = source.stat()
+        except OSError:
+            return self._error(404, "not found")
+        stamp = (info.st_mtime_ns, info.st_size)
+        cached = _SERVED_FILES.get(str(source))
+        if cached and cached[0] == stamp:
+            _, etag, body = cached
+        else:
+            body = source.read_bytes()
+            etag = '"%x-%x"' % (info.st_mtime_ns & 0xFFFFFFFFFFFF, info.st_size)
+            _SERVED_FILES[str(source)] = (stamp, etag, body)
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("ETag", etag)
+            self.end_headers()
+            self.close_connection = True
+            return
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        if self._panel_ok():
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("ETag", etag)
+        if source.suffix == ".html" and self._panel_ok():
             self._cookie(self._panel_token())
         self.end_headers()
         self.wfile.write(body)
@@ -126,17 +164,12 @@ class GatewayHandler(wb_proxy.Handler):
     def do_GET(self):
         path = urlsplit(self.path).path
         asset = path.removeprefix("/gateway/ui/") if path.startswith("/gateway/ui/") else ""
-        if asset in ("styles.css", "api.js", "render.js", "app.js", "accounts.js", "access.js", "icons.js",
-                     "board.js") or re.fullmatch(r"icons/[A-Za-z0-9][A-Za-z0-9._-]*\.(svg|ico)", asset or ""):
-            body = (Path(__file__).with_name("ui") / asset).read_bytes()
-            self.send_response(200)
-            kind = ("image/x-icon" if path.endswith(".ico") else "image/svg+xml" if path.endswith(".svg")
-                    else "text/css" if path.endswith(".css") else "text/javascript")
-            self.send_header("Content-Type", kind + "; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            return self.wfile.write(body)
+        if asset:
+            suffix = asset[asset.rfind("."):] if "." in asset else ""
+            kind = _ASSET_KINDS.get(suffix)
+            if kind and (asset in _UI_FILES
+                         or re.fullmatch(r"icons/[A-Za-z0-9][A-Za-z0-9._-]*\.(svg|ico|png)", asset)):
+                return self._serve_file(_ASSET_ROOT / asset, kind)
         match = re.fullmatch(r"/gateway/providers/(" + PROVIDER_ROUTE + r")/(snapshot|models)", path)
         if match:
             if not self._panel_ok():
@@ -150,12 +183,8 @@ class GatewayHandler(wb_proxy.Handler):
                 return self._error(401, "panel password required")
             return self._json(200, self.runtime.control.board())
         if path == "/favicon.ico":
-            icon = (Path(__file__).with_name("ui") / "icons" / "workbuddy.ico").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "image/x-icon")
-            self.send_header("Content-Length", str(len(icon)))
-            self.end_headers()
-            return self.wfile.write(icon)
+            return self._serve_file(Path(__file__).resolve().parents[1] / "app_icon.ico",
+                                    _ASSET_KINDS[".ico"])
         if path == "/workbuddy":
             return self._get_dashboard()
         if path == "/gateway/status":
@@ -464,6 +493,7 @@ class GatewayHandler(wb_proxy.Handler):
         meta = {key: original[key] for key in ("tools", "tool_choice", "parallel_tool_calls") if key in original}
         custom_names = wb_proxy.custom_tool_names(original.get("tools"))
         with self.runtime.minimax.open_messages(upstream_payload, session) as response:
+            self._gateway_account = getattr(response, "gateway_account", "")
             events = minimax_chat_stream(response, public_model)
             if not original.get("stream"):
                 result = wb_proxy.aggregate_stream(events, public_model, None)

@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -165,6 +166,7 @@ class GatewayTests(unittest.TestCase):
         cls.server.server_close()
         cls.upstream.shutdown()
         cls.upstream.server_close()
+        cls.server.gateway.activity.close()
         WORK.cleanup()
 
     def setUp(self):
@@ -221,7 +223,13 @@ class GatewayTests(unittest.TestCase):
             status, body, headers = self.request("/favicon.ico", key=None)
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "image/x-icon")
-        self.assertEqual(body, (Path(__file__).resolve().parents[1] / "ui/icons/workbuddy.ico").read_bytes())
+        self.assertEqual(body, (Path(__file__).resolve().parents[2] / "app_icon.ico").read_bytes())
+
+    def test_application_brand_png_is_served_with_png_content_type(self):
+        status, body, headers = self.request("/gateway/ui/icons/multigateway.png", key=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(body, (Path(__file__).resolve().parents[1] / "ui/icons/multigateway.png").read_bytes())
 
     def test_downloadable_agent_cli_is_served_from_embedded_runtime(self):
         status, body, headers = self.request("/agents/cli", key=None)
@@ -588,6 +596,72 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.server.gateway.control.backend_rows("minimax", 100), [])
         self.assertIsNone(account_view("trae", {"id": "unknown", "is_valid": True})["remaining"])
 
+    def test_daily_account_tokens_merge_backend_usage_without_double_counting(self):
+        runtime = self.server.gateway
+        now = time.time()
+        midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+        with tempfile.TemporaryDirectory() as directory, closing(Activity(Path(directory))) as activity:
+            with mock.patch.object(runtime, "activity", activity):
+                control = Control(runtime)
+                backend = {}
+                for provider in ("workbuddy", "trae", "minimax", "qoder", "antigravity", "grok", "copilot"):
+                    for account, stamp, prompt, output in [
+                        ("shared-account", now, 10, 4),
+                        ("other-account", now, 20, 8),
+                        ("shared-account", midnight - 10, 1000, 400),
+                    ]:
+                        row = activity.begin(provider, provider + "/token-test", "chat", 1)
+                        row.update(account=account, timestamp=stamp, input_tokens=prompt, output_tokens=output)
+                        with mock.patch("gateway.activity.time.time", return_value=stamp + 0.1):
+                            activity.finish(row, 200)
+                    backend[provider] = [control._row(provider, {
+                        "model": "token-test", "account": "shared-account", "timestamp": now,
+                        "input_tokens": 10, "output_tokens": 4,
+                    })] if provider in ("workbuddy", "trae", "qoder") else []
+                    for row in backend[provider]:
+                        row["finished_at"] = now
+                with mock.patch.object(control, "backend_rows", side_effect=lambda name, limit: backend[name]):
+                    for provider in backend:
+                        with self.subTest(provider=provider):
+                            totals = control.daily_account_usage(provider)
+                            self.assertEqual(totals["shared-account"]["tokens"], 14)
+                            self.assertEqual(totals["shared-account"]["requests"], 1)
+                            self.assertEqual(totals["other-account"]["tokens"], 28)
+                    row = activity.begin("grok", "next", "chat", 1)
+                    row.update(account="shared-account", input_tokens=1, output_tokens=2)
+                    activity.finish(row, 200)
+                    self.assertEqual(control.daily_account_usage("grok")["shared-account"]["tokens"], 17)
+
+    def test_account_token_totals_distinguish_no_usage_from_reported_zero(self):
+        runtime = self.server.gateway
+        with tempfile.TemporaryDirectory() as directory, closing(Activity(Path(directory))) as activity:
+            with mock.patch.object(runtime, "activity", activity):
+                control = Control(runtime)
+                for account, prompt, output in [("missing", None, None), ("zero", 0, 0), ("partial", 2, 3), ("partial", None, None)]:
+                    row = activity.begin("minimax", "usage", "chat", 1)
+                    row.update(account=account, input_tokens=prompt, output_tokens=output)
+                    activity.finish(row, 200)
+                totals = control.daily_account_usage("minimax")
+                self.assertEqual(totals["missing"]["metered"], 0)
+                self.assertEqual(totals["zero"]["metered"], 1)
+                self.assertEqual(totals["zero"]["tokens"], 0)
+                self.assertEqual(totals["partial"], {"tokens": 5, "requests": 2, "metered": 1})
+
+    def test_minimax_chat_tokens_are_attributed_to_the_serving_account(self):
+        self.minimax.set_region("cn")
+        status, body = self.port_request("minimax", "/v1/chat/completions", {
+            "model": "account-token-test", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200, body)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = [row for row in self.server.gateway.activity.records()
+                    if row["model"] == "account-token-test" and row["status"] != "processing"]
+            if rows:
+                break
+            time.sleep(0.01)
+        self.assertEqual(rows[0]["account"], "cn-primary")
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["output_tokens"]), (10, 4))
+
     def test_board_joins_backend_rows_by_completion_time(self):
         control = self.server.gateway.control
         activity = self.server.gateway.activity
@@ -686,14 +760,26 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("/", model_id)
 
     def test_daily_totals_outlive_recent_request_window(self):
+        activity = restored = None
         with tempfile.TemporaryDirectory() as folder:
-            activity = Activity(Path(folder))
-            for _ in range(2001):
-                activity.finish(activity.begin("qoder", "test", "chat", 1), 200)
-            self.assertEqual(activity.view("qoder")["summary"]["requests"], 2001)
-            restored = Activity(Path(folder))
-            self.assertEqual(restored.view("qoder")["summary"]["requests"], 2001)
-            self.assertEqual(len(restored.view("qoder")["records"]), 200)
+            try:
+                activity = Activity(Path(folder))
+                for _ in range(2001):
+                    row = activity.begin("qoder", "test", "chat", 1)
+                    row.update(account="persisted-account", input_tokens=2, output_tokens=3)
+                    activity.finish(row, 200)
+                self.assertEqual(activity.view("qoder")["summary"]["requests"], 2001)
+                restored = Activity(Path(folder))
+                self.assertEqual(restored.view("qoder")["summary"]["requests"], 2001)
+                self.assertEqual(len(restored.view("qoder")["records"]), 200)
+                for instance in (activity, restored):
+                    with mock.patch.object(self.server.gateway, "activity", instance):
+                        counts = Control(self.server.gateway).daily_account_usage("qoder")
+                        self.assertEqual(counts["persisted-account"]["tokens"], 10005)
+            finally:
+                for instance in (activity, restored):
+                    if instance is not None:
+                        instance.close()
 
     def test_group_model_limits_keep_workbuddy_legacy_names(self):
         wb_settings.set_api_keys(wb.ACCOUNTS_DIR, [{"id": "limited", "name": "legacy", "key": "gateway-test-key", "models": ["workbuddy-test"], "enabled": True}])
@@ -717,18 +803,24 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(row["account"], "cn-primary")
 
     def test_activity_records_span_providers_and_persist(self):
+        activity = restored = None
         with tempfile.TemporaryDirectory() as folder:
-            activity = Activity(Path(folder))
-            for name in ("trae", "qoder"):
-                for _ in range(3):
-                    activity.finish(activity.begin(name, "model", "chat", 1), 200)
-            self.assertEqual({row["provider"] for row in activity.records()}, {"trae", "qoder"})
-            self.assertEqual(len(activity.records(2)), 2)
-            restored = Activity(Path(folder))
-            self.assertEqual(len(restored.records()), 6)
-            in_flight = restored.begin("trae", "model", "chat", 1)
-            self.assertEqual(restored.records()[0]["id"], in_flight["id"])
-            self.assertEqual(restored.records()[0]["status"], "processing")
+            try:
+                activity = Activity(Path(folder))
+                for name in ("trae", "qoder"):
+                    for _ in range(3):
+                        activity.finish(activity.begin(name, "model", "chat", 1), 200)
+                self.assertEqual({row["provider"] for row in activity.records()}, {"trae", "qoder"})
+                self.assertEqual(len(activity.records(2)), 2)
+                restored = Activity(Path(folder))
+                self.assertEqual(len(restored.records()), 6)
+                in_flight = restored.begin("trae", "model", "chat", 1)
+                self.assertEqual(restored.records()[0]["id"], in_flight["id"])
+                self.assertEqual(restored.records()[0]["status"], "processing")
+            finally:
+                for instance in (activity, restored):
+                    if instance is not None:
+                        instance.close()
 
     def test_board_keeps_sessions_of_real_http_calls_and_hides_raw_identifier(self):
         session_id = "private-session-" + str(time.time_ns())
@@ -923,12 +1015,12 @@ class GatewayTests(unittest.TestCase):
 
         self.assertIn("formatTokens", board_js)
         self.assertIn("formatCostUSD", board_js)
-        self.assertIn("积分消耗", board_js)
+        self.assertIn('label: `${unit}消耗`', board_js)
         self.assertIn("kpi-sub-card", board_js)
         self.assertIn("export function bucketize", board_js)
         self.assertIn('board.range === "today"', board_js)
-        self.assertIn('board.range === "7"', board_js)
-        self.assertIn('board.range === "30"', board_js)
+        self.assertIn('rangeDays = { 7: 6, 30: 29 }[board.range]', board_js)
+        self.assertIn('board.range === "all"', board_js)
         self.assertIn(".kpi-section", styles_css)
         self.assertIn(".kpi-sub-card", styles_css)
         self.assertIn("info:", icons_js)

@@ -2,12 +2,17 @@
 import collections
 import hashlib
 import json
+import os
 import threading
 import time
 import uuid
 
 CACHED_KEYS = ("cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_tokens")
 CACHE_GROUPS = ("prompt_tokens_details", "input_tokens_details")
+# How many finished rows stay in memory. The log on disk is the record of
+# truth and holds everything, so this is a memory guard, not a visibility cap:
+# records() reads the tail back from disk when a caller asks for more.
+MEMORY_ROWS = 2000
 
 
 def _number(value):
@@ -35,18 +40,46 @@ class Activity:
     def __init__(self, directory):
         self.path = directory / "requests.jsonl"
         self.lock = threading.RLock()
-        self.rows = collections.deque(maxlen=2000)
+        self.rows = collections.deque(maxlen=MEMORY_ROWS)
         self.active = {}
         self.daily = {}
+        # How many rows the log has ever held, kept in step with every append
+        # instead of re-counting the file per read: the usage board asks for
+        # the full history every poll, and a line-by-line walk of a long log
+        # on each 10s poll is the cost that grows forever.
+        self.written = 0
+        # Bumped whenever the observable request set changes (one starts or
+        # one finishes); the board cache keys on it so an idle dashboard
+        # stops rebuilding the whole board on every poll.
+        self.revision = 0
+        self._handle = None
         if self.path.exists():
             with self.path.open(encoding="utf-8") as handle:
                 for line in handle:
                     try:
                         row = json.loads(line)
-                        self.rows.append(row)
-                        self._count(row)
                     except ValueError:
                         continue
+                    self.rows.append(row)
+                    self._count(row)
+                    self.written += 1
+
+    def close(self):
+        """Release the kept-open log handle.
+
+        The handle is cheap to reopen (the next `_write` opens it again), so
+        closing is about lifecycle, not speed: on Windows an open handle
+        blocks the data directory from ever being removed, which kept test
+        workspaces and uninstalled installs from cleaning up after themselves.
+        """
+        with self.lock:
+            if self._handle is None:
+                return
+            handle, self._handle = self._handle, None
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     def begin(self, provider, model, protocol, port, session=None):
         row = {"id": uuid.uuid4().hex, "provider": provider, "model": model,
@@ -59,6 +92,7 @@ class Activity:
         row["session_source"] = "client" if session else "request"
         with self.lock:
             self.active[row["id"]] = row
+            self.revision += 1
         return row
 
     def finish(self, row, status, disconnected=False):
@@ -69,8 +103,45 @@ class Activity:
             self.active.pop(row["id"], None)
             self.rows.append(row)
             self._count(row)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            self._append(row)
+            self.written += 1
+            self.revision += 1
+
+    def _append(self, row):
+        """One row to the log, through a handle kept open between requests.
+
+        Opening and closing per row was the per-request price of durability;
+        the same guarantee (every write leaves the Python buffer) holds with
+        a flush, minus the open/close syscalls. A vanished or recreated
+        data directory reopens instead of failing the request.
+        """
+        text = json.dumps(row, ensure_ascii=False) + "\n"
+        try:
+            self._write(text)
+            return
+        except OSError:
+            pass
+        handle, self._handle = self._handle, None
+        try:
+            handle.close()
+        except Exception:
+            pass
+        try:
+            self._write(text)
+            return
+        except OSError:
+            pass
+        self.written = max(self.written - 1, 0)
+
+    def _write(self, text):
+        if self._handle is None:
+            self._handle = self.path.open("a", encoding="utf-8")
+        handle = self._handle
+        try:
+            handle.write(text)
+            handle.flush()
+        except ValueError:
+            raise OSError("activity log closed")
 
     def _count(self, row):
         day = time.strftime("%Y-%m-%d", time.localtime(row["timestamp"]))
@@ -90,12 +161,97 @@ class Activity:
         return {"records": list(reversed(active)) + list(reversed(rows))[:200],
                 "summary": {**bucket, "in_flight": len(active)}}
 
-    def records(self, limit=600):
-        """Every provider's requests, newest first, with in-flight calls on top."""
+    def records(self, limit=None):
+        """Every provider's requests, newest first, with in-flight calls on top.
+
+        `limit` of None means no cap. What is held in memory is bounded by the
+        deque (see MEMORY_ROWS), so an uncapped caller - or one asking for more
+        than the deque still holds - gets the difference read back from the
+        log, which is the record of truth. The in-memory half exists so the
+        common case never touches the disk.
+        """
         with self.lock:
             rows = [dict(row) for row in self.rows]
             active = [dict(row) for row in self.active.values()]
-        return list(reversed(active)) + list(reversed(rows))[:limit]
+        merged = list(reversed(active)) + list(reversed(rows))
+        # "No cap" means every row the log still holds, so it counts the log; a
+        # finite limit is answered from memory when that is enough, and only
+        # reaches for the disk when the memory half cannot cover it.
+        wanted = self._log_total() if limit is None else limit
+        if len(merged) >= wanted:
+            return merged if limit is None else merged[:wanted]
+        known = {row["id"] for row in merged if row.get("id")}
+        return merged + self._older_rows(wanted - len(merged), known)
+
+    def _log_total(self):
+        """How many rows the log holds, from the append counter; 0 when empty.
+
+        The old answer re-read the whole file line by line, which the board
+        (uncapped, polled every 10s) paid forever as the log grew. The
+        counter is bumped by every `finish`, and `finish` is the only writer.
+        """
+        return self.written
+
+    def _older_rows(self, count, known):
+        """The `count` rows just older than the ones already in `known`.
+
+        Returned newest-first like the caller's own rows, so the result can be
+        appended straight after them. The log is append-only and the memory
+        half is its tail, so walking it backwards and dropping every id
+        already collected reproduces the rows the deque has evicted - with no
+        risk of repeating one because the file was rotated or trimmed
+        underneath us.
+        """
+        if count <= 0 or not self.path.exists():
+            return []
+        found = []
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                position = handle.tell()
+                buffer = b""
+                while position > 0 and len(found) < count:
+                    step = min(64 * 1024, position)
+                    position -= step
+                    handle.seek(position)
+                    buffer = handle.read(step) + buffer
+                    parts = buffer.split(b"\n")
+                    buffer = parts[0]
+                    for raw in reversed(parts[1:]):
+                        row = self._decode(raw)
+                        if row is None or row.get("id") in known:
+                            continue
+                        # Only a row that carries an id can be recognised as a
+                        # duplicate later; a row without one is always kept,
+                        # exactly as the old slice kept whatever it read.
+                        if row.get("id"):
+                            known.add(row["id"])
+                        found.append(row)
+                        if len(found) >= count:
+                            break
+                if position == 0 and buffer.strip() and len(found) < count:
+                    row = self._decode(buffer)
+                    if row is not None and row.get("id") not in known:
+                        if row.get("id"):
+                            known.add(row["id"])
+                        found.append(row)
+        except OSError:
+            return []
+        # `found` was collected newest-first; the caller's list is newest-first
+        # too, so it is already in the right order.
+        return found
+
+    @staticmethod
+    def _decode(raw):
+        """One log line as a dict; None when it is blank or not valid JSON."""
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            row = json.loads(text.decode("utf-8", "replace"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return row if isinstance(row, dict) else None
 
 
 class ObservedWriter:
