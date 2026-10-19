@@ -24,8 +24,7 @@ import os
 os.environ["WB_ACCOUNTS_DIR"] = str(ACCOUNTS)
 os.environ["WB_PROXY_USAGE_DIR"] = str(USAGE)
 
-import wb_proxy as wb
-import wb_settings
+from gateway.vendor.workbuddy import wb_proxy as wb, wb_settings
 from gateway import handler as handler_module
 from gateway import ports as ports_module
 from gateway.activity import Activity

@@ -5,10 +5,14 @@ test fixtures from upstream repositories are never included in the executable.
 
 | Integration | Source | Commit | License |
 | --- | --- | --- | --- |
-| WorkBuddy | Existing local WorkBuddy2API-Hub installation | Local installation retained | Root LICENSE (MIT) |
+| WorkBuddy | Existing local WorkBuddy2API-Hub installation, embedded in vendor/workbuddy/ | Local installation retained | Root LICENSE (MIT) |
 | Trae | https://github.com/autumnsentiment/Trae2api-cn | 5283c94290b8503ad8af3658107a64b73eeb032f | vendor/trae/LICENSE (MIT) |
 | MiniMax Code | https://github.com/MiniMax-AI/minimax-code | cee079138600224e9ad4d8b954c4a4ed549e15b6 | licenses/MINIMAX-LICENSE (MIT) |
 | Qoder | https://github.com/shuishuipingan/qoder2api-hub | ae31046ba387392ff6dcc4170a978081c409fdfb | vendor/qoder/LICENSE (MIT) |
+
+WorkBuddy's modules and legacy dashboard live in `vendor/workbuddy/`. Sibling
+imports are package-relative; runtime module lookups and bundled resource paths
+follow that package. Credentials, usage paths and provider logic are preserved.
 
 Trae's runtime modules retain their logic; auth_helper's web_login import is
 changed to a relative import. The integration wrapper redirects its

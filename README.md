@@ -97,6 +97,25 @@ This will produce `MultiGateway.exe` using PyInstaller.
 
 ---
 
+## Repository Layout
+
+```text
+gateway_app.py          Desktop and headless entry point
+gateway/               Gateway routing, management and provider adapters
+  native/              In-process OAuth providers
+  ui/                  Shared dashboard assets
+  vendor/              Embedded WorkBuddy, Trae and Qoder runtimes
+  tests/               Local protocol and HTTP integration tests
+scripts/               Maintenance tools (fetch_pricing.py)
+pricing/               Bundled price snapshot
+docs/                  Architecture notes and protocol research
+```
+
+See [the structure guide](docs/architecture.md) for module responsibilities and
+the boundary between gateway code, embedded integrations and runtime data.
+
+---
+
 ## Running Tests
 
 Run the gateway test suite:

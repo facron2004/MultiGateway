@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-import wb_proxy
+from .vendor.workbuddy import wb_proxy
 
 from .minimax import MiniMax
 from .activity import Activity

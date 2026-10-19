@@ -4,18 +4,18 @@
 本脚本只做两件 wb_pricing 自己不适合做的事：
 
   1. 把快照写成 pricing/pricing.json（本地运行时优先读它）；
-  2. --embed：把同一份快照回写进 wb_pricing.py 的内嵌副本，让 Docker 镜像
-     （只 COPY wb_*.py，不带 pricing/ 目录）自带一份价格。
+  2. --embed：把同一份快照回写进 gateway/vendor/workbuddy/wb_pricing.py 的内嵌副本，
+     让不带 pricing/ 目录的安装也自带一份价格。
 
 网关运行时**不依赖本脚本**：它按面板上配置的间隔自己抓取，并把每一版追加
 进 pricing-history.jsonl（见 wb_pricing.PriceRefresher）；每条请求按它发生
 时生效的那一版计价。本脚本用于首次内置快照、以及离线生成/更新内置价。
 
 用法：
-    python _fetch_pricing.py            # 抓取并写入 pricing/pricing.json
-    python _fetch_pricing.py --dry-run  # 只打印，不写文件
-    python _fetch_pricing.py --embed    # 同时回写 wb_pricing.py 的内嵌副本
-    python _fetch_pricing.py --extra-ids-file ids.txt
+    python scripts/fetch_pricing.py            # 抓取并写入 pricing/pricing.json
+    python scripts/fetch_pricing.py --dry-run  # 只打印，不写文件
+    python scripts/fetch_pricing.py --embed    # 同时回写 wb_pricing.py 的内嵌副本
+    python scripts/fetch_pricing.py --extra-ids-file ids.txt
                                         # 额外覆盖文件里的模型（每行一个），
                                         # 网关运行时用 live 目录做同样的事
 
@@ -27,13 +27,13 @@ import json
 import os
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
-import wb_pricing
+from gateway.vendor.workbuddy import wb_pricing
 
 OUT = os.path.join(HERE, "pricing", "pricing.json")
-EMBED_TARGET = os.path.join(HERE, "wb_pricing.py")
+EMBED_TARGET = wb_pricing.__file__
 
 
 def extra_ids_from_file(path):

@@ -21,8 +21,7 @@ os.environ["WB_PROXY_USAGE_DIR"] = str(Path(WORK.name) / "usage")
 Path(os.environ["WB_ACCOUNTS_DIR"]).mkdir()
 Path(os.environ["WB_PROXY_USAGE_DIR"]).mkdir()
 
-import wb_proxy as wb
-import wb_settings
+from gateway.vendor.workbuddy import wb_proxy as wb, wb_settings
 from gateway.handler import GatewayHandler
 from gateway.activity import Activity
 from gateway.control import Control, account_view
@@ -216,6 +215,19 @@ class GatewayTests(unittest.TestCase):
             self.assertTrue(json.load(response)["authenticated"])
             self.assertIn("gateway_session=", response.headers["Set-Cookie"])
         self.assertEqual(self.request("/gateway/status?token=" + token, key=None)[0], 401)
+
+    def test_favicon_is_independent_of_legacy_dashboard_location(self):
+        with mock.patch.object(wb, "DASHBOARD_HTML", "/missing/legacy/dashboard.html"):
+            status, body, headers = self.request("/favicon.ico", key=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/x-icon")
+        self.assertEqual(body, (Path(__file__).resolve().parents[1] / "ui/icons/workbuddy.ico").read_bytes())
+
+    def test_downloadable_agent_cli_is_served_from_embedded_runtime(self):
+        status, body, headers = self.request("/agents/cli", key=None)
+        self.assertEqual(status, 200)
+        self.assertIn('filename="wb_agents.py"', headers["Content-Disposition"])
+        self.assertEqual(body, Path(wb.agents_module().__file__).read_bytes())
 
     def test_panel_rewrites_routes_not_slash_delimiters(self):
         token = wb.PANEL.create()

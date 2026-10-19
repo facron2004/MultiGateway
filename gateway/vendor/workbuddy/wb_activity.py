@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 
+from . import PROJECT_ROOT
+
 HISTORY_NAME = "activity_history.jsonl"
 
 TASK_CHECKIN = "checkin"
@@ -83,7 +85,7 @@ def data_dir():
     if _data_dir_override:
         return _data_dir_override
     env = os.environ.get("WB_PROXY_USAGE_DIR")
-    return env or os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage")
+    return env or str(PROJECT_ROOT / "usage")
 
 
 def history_path():
@@ -91,11 +93,11 @@ def history_path():
 
 
 def _gateway():
-    """真正在跑的那个网关模块（容器里是 `python wb_proxy.py`，即 __main__）。"""
+    """真正在跑的网关模块；通过 python -m 启动时为 __main__。"""
     main = sys.modules.get("__main__")
     if main is not None and hasattr(main, "log"):
         return main
-    return sys.modules.get("wb_proxy")
+    return sys.modules.get(__package__ + ".wb_proxy")
 
 
 def _log(message):

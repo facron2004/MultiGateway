@@ -10,13 +10,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from wb_fingerprint import derive_id, generate_request_id
-import wb_activity
-import wb_atrest
-import wb_identity
-import wb_settings
-import wb_upstream_pool
-import wb_webagent
+from .wb_fingerprint import derive_id, generate_request_id
+from . import wb_activity
+from . import wb_atrest
+from . import wb_identity
+from . import wb_settings
+from . import wb_upstream_pool
+from . import wb_webagent
 
 # ---------------------------------------------------------------------------
 # 网页版通道（issue #75 / #59 / #90）
@@ -1436,7 +1436,7 @@ class Account(object):
 
     def _daily_chat_upstream(self, web=None):
         """每日活跃对话的实际流程；返回形状见 daily_chat。"""
-        import wb_proxy
+        from . import wb_proxy
         url = self.chat_base_url() + wb_proxy.CHAT_PATH
         headers = self.headers("chat")
         body = {
@@ -1552,7 +1552,7 @@ class Account(object):
             return {"ok": False, "error": "activity report is only for CN realm accounts"}
         if self.is_enterprise():
             return {"ok": False, "error": "enterprise accounts do not support activity report"}
-        import wb_tasks
+        from . import wb_tasks
         event = wb_tasks.build_event(self, "chat")
         if not wb_tasks.report_events(self, [event]):
             return {"ok": False, "error": "活跃上报被上游拒绝（未返回 code=0）"}
@@ -2310,7 +2310,7 @@ class CreditsRefresher(threading.Thread):
     def ttl_seconds(self):
         """The current TTL in seconds - the one place the unit is applied."""
         try:
-            import wb_settings
+            from . import wb_settings
             hours = wb_settings.credits_refresh_hours(self.pool.dir)
         except Exception:
             return 0.0
@@ -2632,7 +2632,7 @@ class AccountPool(object):
         `proxy_slot` is the persisted source of truth; `proxy` is a derived
         runtime value so the many outbound call sites need no change.
         """
-        import wb_settings
+        from . import wb_settings
 
         if slots is None:
             slots = wb_settings.proxy_slots(self.dir)
@@ -2655,7 +2655,7 @@ class AccountPool(object):
         own realm, so a per-realm override lands only on that realm's accounts
         while the global default keeps covering both.
         """
-        import wb_settings
+        from . import wb_settings
 
         if values is None:
             values = wb_settings.limit_values(self.dir, "reserve_credits")
@@ -2673,7 +2673,7 @@ class AccountPool(object):
         preference, not a guard: it never makes an account unavailable, it
         only decides who is handed out first.
         """
-        import wb_settings
+        from . import wb_settings
 
         if values is None:
             values = wb_settings.limit_values(self.dir, "expiring_window_days")
@@ -2713,7 +2713,7 @@ class AccountPool(object):
         the last known counts, so a settings change never turns them into
         "unknown".
         """
-        import wb_settings
+        from . import wb_settings
 
         if values is None:
             values = wb_settings.limit_values(self.dir, "daily_token_limit")
@@ -2749,7 +2749,7 @@ class AccountPool(object):
         keeps the last known values, so a settings change never turns them
         into "unknown".
         """
-        import wb_settings
+        from . import wb_settings
 
         if values is None:
             values = wb_settings.limit_values(self.dir, "daily_credit_limit")
@@ -2787,7 +2787,7 @@ class AccountPool(object):
         with it - ready(model) refuses exactly the models that are out of
         budget, and only their state changes are logged.
         """
-        import wb_settings
+        from . import wb_settings
 
         if values is None:
             values = wb_settings.limit_values(self.dir, "model_daily_token_limit")

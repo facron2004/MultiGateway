@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-import wb_settings
+from . import wb_settings
 
 # 官方仓库的 releases 接口——主路径。走 API 不抓 HTML：页面结构变了不该让检查失效。
 RELEASES_URL = "https://api.github.com/repos/ardeyouxipianyi/workbuddy2api-hub/releases"

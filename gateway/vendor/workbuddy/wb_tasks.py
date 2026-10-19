@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 
-import wb_accounts as _accounts
+from . import wb_accounts as _accounts
 
 CHAT_BASE = "https://copilot.tencent.com"
 BILL_BASE = "https://www.codebuddy.cn"

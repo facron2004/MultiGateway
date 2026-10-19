@@ -2,7 +2,9 @@
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 datas = [
-    ('dashboard.html', '.'), ('app_icon.ico', '.'), ('pricing', 'pricing'),
+    ('gateway/vendor/workbuddy/dashboard.html', 'gateway/vendor/workbuddy'),
+    ('gateway/vendor/workbuddy/wb_agents.py', 'gateway/vendor/workbuddy'),
+    ('app_icon.ico', '.'), ('pricing', 'pricing'),
     ('gateway/dashboard.html', 'gateway'), ('gateway/ui', 'gateway/ui'), ('gateway/licenses', 'gateway/licenses'),
     ('LICENSE', 'gateway/licenses'),
     ('gateway/SOURCES.md', 'gateway'),

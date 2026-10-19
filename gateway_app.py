@@ -57,7 +57,8 @@ def prepare_paths(args):
     os.environ["WB_ACCOUNTS_DIR"] = str(accounts)
     os.environ["WB_PROXY_USAGE_DIR"] = str(usage)
     dashboard = base / "dashboard.html"
-    os.environ["WB_DASHBOARD_HTML"] = str(dashboard if dashboard.exists() else resources / "dashboard.html")
+    bundled_dashboard = resources / "gateway" / "vendor" / "workbuddy" / "dashboard.html"
+    os.environ["WB_DASHBOARD_HTML"] = str(dashboard if dashboard.exists() else bundled_dashboard)
     pricing = base / "pricing" / "pricing.json"
     os.environ["WB_PRICING_FILE"] = str(pricing if pricing.exists() else resources / "pricing" / "pricing.json")
     if getattr(sys, "frozen", False) or sys.stdout is None or sys.stderr is None:
@@ -132,7 +133,7 @@ class DesktopAPI:
 def main():
     args = arguments()
     directory, accounts, usage = prepare_paths(args)
-    import wb_proxy
+    from gateway.vendor.workbuddy import wb_proxy
     from gateway.handler import GatewayHandler
     from gateway.runtime import Runtime
 

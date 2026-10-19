@@ -9,8 +9,8 @@
 """
 import threading
 import time
-import wb_tasks
-from wb_tasks import do_cat_travel
+from . import wb_tasks
+from .wb_tasks import do_cat_travel
 
 
 class Scheduler:
@@ -43,7 +43,7 @@ class Scheduler:
         if len(self.logs) > 60:
             self.logs = self.logs[-60:]
         try:
-            import wb_proxy
+            from . import wb_proxy
             # 任务/打卡/旅行类条目同时进入 tasks 模块日志，方便分类查看
             effective_tag = tag
             if not effective_tag:

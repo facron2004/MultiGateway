@@ -7,9 +7,9 @@ login is needed. Exposes:
     POST /v1/chat/completions     (stream=true and stream=false)
     GET  /health
 Only the Python standard library is required.
-    python3 wb_proxy.py                    # bind 127.0.0.1:8788
-    python3 wb_proxy.py --port 9000
-    python3 wb_proxy.py --api-key sk-local # require a bearer token
+    python3 -m gateway.vendor.workbuddy.wb_proxy                    # bind 127.0.0.1:8788
+    python3 -m gateway.vendor.workbuddy.wb_proxy --port 9000
+    python3 -m gateway.vendor.workbuddy.wb_proxy --api-key sk-local # require a bearer token
 Launchers: start-wb-proxy.bat / start-wb-proxy-lan.bat on Windows,
 start-wb-proxy.command (or ./start-wb-proxy.sh) on macOS/Linux.
 """
@@ -57,21 +57,22 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-import wb_accounts
-import wb_activity
-import wb_atrest
-import wb_catalog
-import wb_egress
-import wb_ipintel
-import wb_pricing
-import wb_settings
-import wb_upstream_pool
-import wb_webtools
-import wb_identity
-import wb_prompt
-import wb_modelsdev
-import wb_probes
-import wb_updates
+from . import PROJECT_ROOT
+from . import wb_accounts
+from . import wb_activity
+from . import wb_atrest
+from . import wb_catalog
+from . import wb_egress
+from . import wb_ipintel
+from . import wb_pricing
+from . import wb_settings
+from . import wb_upstream_pool
+from . import wb_webtools
+from . import wb_identity
+from . import wb_prompt
+from . import wb_modelsdev
+from . import wb_probes
+from . import wb_updates
 IS_WINDOWS = os.name == "nt"
 
 # ---- 一键配置客户端（wb_agents）的可用性判定（issue #246）----
@@ -87,7 +88,7 @@ def agents_module():
     """按需 import wb_agents；用不到它的部署连模块都不载入。"""
     global _AGENTS_MODULE
     if _AGENTS_MODULE is None:
-        import wb_agents
+        from . import wb_agents
         _AGENTS_MODULE = wb_agents
     return _AGENTS_MODULE
 
@@ -397,10 +398,10 @@ def login_rate_limit_key(peer_ip, headers):
     return peer_ip
 _models_cache = {"intl": {"at": 0.0, "data": None}, "cn": {"at": 0.0, "data": None}}
 # Usage accounting: every upstream response carries a usage block, and the
-# proxy also records one JSONL line per request. Defaults to a folder next to
-# this script; override with --usage-dir or WB_PROXY_USAGE_DIR.
+# proxy also records one JSONL line per request. Defaults to the root usage
+# folder; override with --usage-dir or WB_PROXY_USAGE_DIR.
 USAGE_DIR = os.environ.get("WB_PROXY_USAGE_DIR") \
-    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage")
+    or str(PROJECT_ROOT / "usage")
 USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
 DASHBOARD_HTML = os.environ.get("WB_DASHBOARD_HTML") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
@@ -5649,7 +5650,7 @@ PRICING = None
 CREDITS_REFRESHER = None
 # Release discovery only - the checker never downloads or installs anything.
 UPDATES = None
-ACCOUNTS_DIR = os.environ.get("WB_ACCOUNTS_DIR") or os.environ.get("ACCOUNTS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
+ACCOUNTS_DIR = os.environ.get("WB_ACCOUNTS_DIR") or os.environ.get("ACCOUNTS_DIR") or str(PROJECT_ROOT / "accounts")
 def realm_state_file():
     """Path of the persisted realm switch.
 
@@ -5879,14 +5880,14 @@ def growth_snapshot(account):
     从"两条串起来等"变成一个来回，实测约 2 秒降到 1.5 秒以内。
     """
     if TASKS_CACHE_TTL <= 0:
-        from wb_tasks import fetch_growth_tasks, fetch_growth_summary
+        from .wb_tasks import fetch_growth_tasks, fetch_growth_summary
         return _both(fetch_growth_tasks, fetch_growth_summary, account)
     now = time.time()
     with _tasks_cache_lock:
         hit = _tasks_cache.get(account.uid)
         if hit and hit[0] > now:
             return hit[1]
-    from wb_tasks import fetch_growth_tasks, fetch_growth_summary
+    from .wb_tasks import fetch_growth_tasks, fetch_growth_summary
     data = _both(fetch_growth_tasks, fetch_growth_summary, account)
     with _tasks_cache_lock:
         _tasks_cache[account.uid] = (time.time() + TASKS_CACHE_TTL, data)
@@ -17423,7 +17424,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [a for a in POOL.accounts if a.realm == "cn" and a.enabled]
         if not targets:
             return self._json(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
-        from wb_tasks import run_growth_tasks
+        from .wb_tasks import run_growth_tasks
         combined_logs = []
         total_credit = 0
         for i, acc in enumerate(targets):
@@ -17462,7 +17463,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [a for a in POOL.accounts if a.realm == "cn" and a.enabled]
         if not targets:
             return self._json(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
-        from wb_tasks import run_streak_bonus
+        from .wb_tasks import run_streak_bonus
         results = []
         for i, acc in enumerate(targets):
             uid_str = acc.uid[:8] if acc.uid else "?"
@@ -17488,7 +17489,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [a for a in POOL.accounts if a.realm == "cn" and a.enabled]
         if not targets:
             return self._json(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
-        from wb_tasks import do_cat_travel
+        from .wb_tasks import do_cat_travel
         results = []
         for i, acc in enumerate(targets):
             uid_str = acc.uid[:8] if acc.uid else "?"
@@ -17517,7 +17518,7 @@ class Handler(BaseHTTPRequestHandler):
     def _route_updates_release_info(self):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         info = wb_repack.check_upstream_release()
         with wb_repack._LOCK:
             info["job"] = dict(wb_repack.UPGRADE_JOB)
@@ -17526,7 +17527,7 @@ class Handler(BaseHTTPRequestHandler):
     def _route_updates_repack_progress(self):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         with wb_repack._LOCK:
             job = dict(wb_repack.UPGRADE_JOB)
         return self._json(200, {"ok": True, "job": job})
@@ -17534,7 +17535,7 @@ class Handler(BaseHTTPRequestHandler):
     def _route_updates_repack(self, payload):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         auto_restart = bool(payload.get("auto_restart", False))
         force = bool(payload.get("force", False))
         target_tag = payload.get("target_tag")
@@ -17544,7 +17545,7 @@ class Handler(BaseHTTPRequestHandler):
     def _route_updates_restart(self):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         wb_repack.restart_exe()
         return self._json(200, {"ok": True, "msg": "正在重启应用..."})
 
@@ -18832,7 +18833,7 @@ def _probe_running_instance(args):
             print()
             print("  Fix: start wb-proxy on a different port, e.g.")
             print("          %s" % launcher_hint(args.port + 1))
-            print(f"          python3 wb_proxy.py --port {args.port + 1}")
+            print(f"          python3 -m gateway.vendor.workbuddy.wb_proxy --port {args.port + 1}")
             print()
             print("  Check who owns the port:  %s" % port_owner_hint(args.port))
             print()
@@ -18887,7 +18888,7 @@ def _bootstrap_runtime(args):
     apply_daily_guards()
     load_persisted_realm()
     global SCHEDULER
-    from wb_scheduler import Scheduler
+    from .wb_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
     global PRICING

@@ -3,7 +3,7 @@ import json
 import time
 from urllib.parse import quote
 
-import wb_proxy as wb
+from .vendor.workbuddy import wb_proxy as wb
 
 from .native import NAMES as NATIVE_NAMES
 from .transport import ProviderError, json_request
@@ -62,7 +62,7 @@ def estimate_row_cost_usd(row):
 
     model = str(row.get("model") or "").strip()
     try:
-        import wb_pricing
+        from .vendor.workbuddy import wb_pricing
         pricing_data = wb_pricing.compute_row({
             "model": model,
             "prompt_tokens": prompt,

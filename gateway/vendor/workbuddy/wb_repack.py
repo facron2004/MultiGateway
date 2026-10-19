@@ -19,7 +19,7 @@ import subprocess
 import urllib.request
 import urllib.error
 
-import wb_updates
+from . import wb_updates
 
 # 上游仓库常量
 UPSTREAM_REPO = "ardeyouxipianyi/workbuddy2api-hub"
@@ -77,7 +77,7 @@ def _set_step(step, name, progress):
 def get_current_version():
     """获取当前正在运行的网关版本号，如 '1.6.18'。"""
     try:
-        import wb_proxy
+        from . import wb_proxy
         if hasattr(wb_proxy, "running_version"):
             return wb_proxy.running_version()
     except Exception:
@@ -410,7 +410,7 @@ def apply_desktop_patches():
         route_methods = """    def _route_updates_release_info(self):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         info = wb_repack.check_upstream_release()
         with wb_repack._LOCK:
             info["job"] = dict(wb_repack.UPGRADE_JOB)
@@ -419,7 +419,7 @@ def apply_desktop_patches():
     def _route_updates_repack_progress(self):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         with wb_repack._LOCK:
             job = dict(wb_repack.UPGRADE_JOB)
         return self._json(200, {"ok": True, "job": job})
@@ -427,7 +427,7 @@ def apply_desktop_patches():
     def _route_updates_repack(self, payload):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         auto_restart = bool(payload.get("auto_restart", False))
         force = bool(payload.get("force", False))
         target_tag = payload.get("target_tag")
@@ -437,7 +437,7 @@ def apply_desktop_patches():
     def _route_updates_restart(self):
         if not self._authorized():
             return
-        import wb_repack
+        from . import wb_repack
         wb_repack.restart_exe()
         return self._json(200, {"ok": True, "msg": "正在重启应用..."})
 

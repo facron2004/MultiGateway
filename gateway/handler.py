@@ -7,8 +7,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import wb_proxy
-import wb_settings
+from .vendor.workbuddy import wb_proxy, wb_settings
 
 from . import VERSION
 from .activity import ObservedWriter
@@ -151,7 +150,7 @@ class GatewayHandler(wb_proxy.Handler):
                 return self._error(401, "panel password required")
             return self._json(200, self.runtime.control.board())
         if path == "/favicon.ico":
-            icon = Path(wb_proxy.DASHBOARD_HTML).with_name("app_icon.ico").read_bytes()
+            icon = (Path(__file__).with_name("ui") / "icons" / "workbuddy.ico").read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "image/x-icon")
             self.send_header("Content-Length", str(len(icon)))
