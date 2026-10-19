@@ -1,10 +1,34 @@
-# MultiGateway
+<p align="center">
+  <img src="gateway/ui/icons/multigateway.png" width="112" height="112" alt="MultiGateway logo" />
+</p>
+
+<h1 align="center">MultiGateway</h1>
+
+<p align="center">
+  One gateway for multiple AI account pools.
+</p>
+
+<p align="center">
+  <a href="#requirements"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.11+" /></a>
+  <a href="gateway/__init__.py"><img src="https://img.shields.io/badge/Version-0.5.0-2563EB" alt="Version 0.5.0" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT License" /></a>
+  <a href="#4-build-windows-executable"><img src="https://img.shields.io/badge/Desktop-Windows-0078D4" alt="Windows desktop" /></a>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#providers">Providers</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#repository-layout">Structure</a> ·
+  <a href="#running-tests">Tests</a> ·
+  <a href="#license">License</a>
+</p>
 
 Multi-Account Reverse Proxy Gateway for **WorkBuddy**, **Trae**, **MiniMax Code**,
-**Qoder**, **Antigravity**, **Grok**, **GitHub Copilot**, and **Qwen Code**.
+**Qoder**, **Antigravity**, **Grok**, and **GitHub Copilot**.
 
-Current release: **0.5.0** — adds four in-process "native OAuth" providers
-(Antigravity, Grok, GitHub Copilot, Qwen Code) next to the existing vendored
+Current release: **0.5.0** — adds three in-process "native OAuth" providers
+(Antigravity, Grok, GitHub Copilot) next to the existing vendored
 WorkBuddy/Trae/MiniMax/Qoder integrations. Single-region providers hide the
 国内版/国际版 switch in the dashboard.
 
@@ -12,7 +36,7 @@ WorkBuddy/Trae/MiniMax/Qoder integrations. Single-region providers hide the
 
 ## Features
 
-- **Multi-Account Aggregation**: One gateway in front of eight providers — WorkBuddy, Trae, MiniMax Code, Qoder, Antigravity, Grok, GitHub Copilot, Qwen Code — with account pools, session stickiness, and load balancing.
+- **Multi-Account Aggregation**: One gateway in front of seven providers — WorkBuddy, Trae, MiniMax Code, Qoder, Antigravity, Grok, GitHub Copilot — with account pools, session stickiness, and load balancing.
 - **OAuth Account Pool**: In-process device-code and loopback authorization-code flows, credential import, silent token refresh, per-account health and region tracking.
 - **Protocol Compatibility**: Full OpenAI (`/v1/chat/completions`, `/v1/models`, `/v1/responses`) and Anthropic (`/v1/messages`) compatibility layer, including SSE translation for providers that only speak Gemini or Responses-style APIs.
 - **Reasoning Controls**: Native support for extended reasoning effort levels, including custom effort tiers and real-time reasoning token tracking.
@@ -33,9 +57,8 @@ WorkBuddy/Trae/MiniMax/Qoder integrations. Single-region providers hide the
 | **Antigravity** | Google Antigravity IDE account | Google OAuth authorization code + PKCE over a loopback callback | Needs a Google account with Cloud Code Assist access; quota is per Google account/tier, endpoints are undocumented and churn |
 | **Grok** | xAI Grok CLI / Grok Build account | xAI OAuth authorization code + PKCE over a loopback callback | Responses API only (Chat Completions is not offered to OAuth tokens); free tier is gated by account tier and can return 402/403 at inference time |
 | **GitHub Copilot** | GitHub Copilot seat | GitHub device flow, then exchange the GitHub token for a short-lived Copilot token | Requires an active Copilot seat; per-request editor/header fingerprinting and the ~20-minute token refresh are mandatory |
-| **Qwen Code** | Qwen Code / Alibaba Cloud account | Qwen device code + PKCE, portal token | Free daily quota (unofficially ~2,000 requests/day per account); credentials are single-session, do not share an account with a live Qwen Code CLI |
 
-Single-region providers (Trae, Antigravity, Grok, GitHub Copilot, Qwen Code) have
+Single-region providers (Trae, Antigravity, Grok, GitHub Copilot) have
 no region choice and hide the region switch; WorkBuddy, MiniMax Code and Qoder keep
 the 国内/国际 switch.
 
@@ -49,10 +72,8 @@ Provider-specific notes:
   the CLI transport and a single free model, so entitlement errors must be surfaced, not hidden.
 - **GitHub Copilot** requires a Copilot seat. GitHub's terms restrict automated or
   shared use, so keep one seat per user and cap concurrency per account.
-- **Qwen Code** has the most generous free quota of the set, but it is per-account and
-  can change without notice; import the credential or run the flow here, never both.
 
-OAuth grants for the four native providers are stored under the gateway data
+OAuth grants for the three native providers are stored under the gateway data
 directory (`native/<provider>/accounts/`); only the user's own accounts and quota
 are used.
 
@@ -60,7 +81,7 @@ are used.
 
 ## Requirements
 
-- Python 3.11+ (Python 3.13 recommended)
+- Python 3.11+ (Python 3.13 recommended; required by the Windows build script)
 - Dependencies listed in `requirements-gateway.txt`
 
 ---
@@ -70,7 +91,9 @@ are used.
 ### 1. Install Dependencies
 
 ```bash
-pip install -r requirements-gateway.txt
+git clone https://github.com/facron2004/MultiGateway.git
+cd MultiGateway
+python -m pip install -r requirements-gateway.txt
 ```
 
 ### 2. Run Headless Mode
@@ -133,5 +156,5 @@ vendor protocol locally, so no real account or network access is needed.
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 Embedded integrations and their licenses are documented in [gateway/SOURCES.md](gateway/SOURCES.md).
-The four 0.5.0 OAuth integrations are independent implementations; reference projects
+The three 0.5.0 OAuth integrations are independent implementations; reference projects
 that were consulted for behaviour only are listed there.
