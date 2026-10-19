@@ -161,6 +161,8 @@ class AntigravityTests(unittest.TestCase):
         MockCloudCode.models_status = 200
         MockCloudCode.stream_frames = []
         self.patches = [
+            mock.patch.object(antigravity, "CLIENT_ID", "test-antigravity-client"),
+            mock.patch.object(antigravity, "CLIENT_SECRET", "test-antigravity-secret"),
             mock.patch.object(antigravity, "HOST_PROD", self.origin),
             mock.patch.object(antigravity, "HOST_DAILY", self.origin),
             mock.patch.object(antigravity, "HOST_SANDBOX", self.origin),
@@ -210,6 +212,19 @@ class AntigravityTests(unittest.TestCase):
         return port, self.provider.start_login()
 
     # -------------------------------------------------------------------- login
+    def test_missing_oauth_settings_does_not_open_callback_or_call_upstream(self):
+        for key in ("CLIENT_ID", "CLIENT_SECRET"):
+            with self.subTest(key=key), mock.patch.object(antigravity, key, ""), \
+                    mock.patch.object(self.provider, "loopback_start") as callback, \
+                    mock.patch.object(antigravity.oauth, "refresh_request") as upstream:
+                with self.assertRaises(ProviderError) as login_error:
+                    self.provider.start_login()
+                self.assertEqual(login_error.exception.status, 503)
+                callback.assert_not_called()
+                with self.assertRaises(ProviderError):
+                    self.provider.refresh_grant({"refresh_token": "test-refresh-token"})
+                upstream.assert_not_called()
+
     def test_login_start_and_poll_stores_account(self):
         port, start = self.start_login()
         self.assertEqual(set(start), {"login_id", "url", "interval", "expires_at"})

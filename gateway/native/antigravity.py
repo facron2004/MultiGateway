@@ -42,22 +42,27 @@ Two choices worth knowing about while reading this module:
 """
 import hashlib
 import json
+import os
 import platform
 import secrets
+import sys
 import threading
 import time
 import uuid
+from pathlib import Path
+
+from dotenv import dotenv_values
 
 from ..transport import ProviderError, json_request, sse_events
 from . import gemini, oauth
 from .base import NativeProvider
 
 # --------------------------------------------------------------------------- OAuth
-# Public "installed application" client embedded in the distributed Antigravity
-# IDE. Google tolerates this pattern for native clients: the flow is protected
-# by the loopback redirect and the user's browser session, not by the secret.
-CLIENT_ID = "<GOOGLE_OAUTH_CLIENT_ID>"
-CLIENT_SECRET = "<GOOGLE_OAUTH_CLIENT_SECRET>"
+# Read local OAuth settings beside the source launcher or installed executable.
+_CLIENT_BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
+_CLIENT_CONFIG = dotenv_values(_CLIENT_BASE / ".env")
+CLIENT_ID = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_ID") or _CLIENT_CONFIG.get("ANTIGRAVITY_OAUTH_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET") or _CLIENT_CONFIG.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET", "")
 
 AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -134,6 +139,11 @@ DEFAULT_MODELS = (
 )
 
 
+def require_oauth_client():
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise ProviderError("请在 .env 或环境变量中设置 ANTIGRAVITY_OAUTH_CLIENT_ID 和 ANTIGRAVITY_OAUTH_CLIENT_SECRET", 503)
+
+
 def user_agent():
     """Return the ``antigravity/<hub version>`` User-Agent the upstream expects."""
     system = platform.system().lower() or "windows"
@@ -181,6 +191,7 @@ class Antigravity(NativeProvider):
     # -------------------------------------------------------------------- login
     def start_login(self, region=None):
         """Open the loopback listener and return the Google consent URL."""
+        require_oauth_client()
         # A second click must not fail on the busy callback port: drop the
         # previous attempt first.
         self.stop()
@@ -291,6 +302,7 @@ class Antigravity(NativeProvider):
 
     def _token_request(self, payload):
         """POST a form-encoded grant to Google's token endpoint."""
+        require_oauth_client()
         try:
             grant = oauth.refresh_request(TOKEN_URL, payload, form=True, timeout=30,
                                           headers={"User-Agent": TOKEN_USER_AGENT})

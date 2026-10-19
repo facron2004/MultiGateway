@@ -54,7 +54,7 @@ WorkBuddy/Trae/MiniMax/Qoder integrations. Single-region providers hide the
 | **Trae** | Trae coding agent (vendored backend) | Browser web login forwarded to a loopback helper (port 8765) | Single region (国内); no 国际版 switch |
 | **MiniMax Code** | MiniMax Code agent (MIT client protocol adapter) | OAuth device code + PKCE (国内/国际 endpoints) | 国内/国际 realms; no account import |
 | **Qoder** | Qoder coding agent (vendored backend) | Browser login handled by the bundled Qoder backend | 国内/国际 realms |
-| **Antigravity** | Google Antigravity IDE account | Google OAuth authorization code + PKCE over a loopback callback | Needs a Google account with Cloud Code Assist access; quota is per Google account/tier, endpoints are undocumented and churn |
+| **Antigravity** | Google Antigravity IDE account | Google OAuth authorization code over a loopback callback | Needs local OAuth client settings and a Google account with Cloud Code Assist access; quota is per Google account/tier, endpoints are undocumented and churn |
 | **Grok** | xAI Grok CLI / Grok Build account | xAI OAuth authorization code + PKCE over a loopback callback | Responses API only (Chat Completions is not offered to OAuth tokens); free tier is gated by account tier and can return 402/403 at inference time |
 | **GitHub Copilot** | GitHub Copilot seat | GitHub device flow, then exchange the GitHub token for a short-lived Copilot token | Requires an active Copilot seat; per-request editor/header fingerprinting and the ~20-minute token refresh are mandatory |
 
@@ -103,6 +103,12 @@ python gateway_app.py --headless --host 127.0.0.1 --port 8791
 ```
 
 Access dashboard at `http://127.0.0.1:8791/` (token will be printed in console output).
+
+For Antigravity OAuth, copy [`.env.example`](.env.example) to `.env` beside the
+launcher or executable, then fill in the OAuth client ID and secret used by your
+Antigravity installation. Environment variables with the same names take
+precedence. `.env` stays local and is excluded from Git; the other providers do
+not require this configuration.
 
 ### 3. Run Desktop Application
 
