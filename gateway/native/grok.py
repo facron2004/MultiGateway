@@ -53,6 +53,7 @@ from ..transport import ProviderError, json_request, open_request, sse_events
 from .base import NativeProvider
 from .grok_responses import chat_to_responses, responses_frames
 from .oauth import add_query, random_state
+from .quota import quota_number, quota_summary
 
 ISSUER = "https://auth.x.ai"
 AUTHORIZE_URL = ISSUER + "/oauth2/authorize"
@@ -169,7 +170,7 @@ class Grok(NativeProvider):
     label = "Grok"
     region = "intl"
     login_kind = "loopback"
-    capabilities = {"login": True, "import": True, "credits": False, "regions": False,
+    capabilities = {"login": True, "import": True, "credits": True, "regions": False,
                     "checkin": False, "credentials": True}
 
     # --------------------------------------------------------------------- login
@@ -222,6 +223,39 @@ class Grok(NativeProvider):
         return self._credentials_from_grant(grant)
 
     # ------------------------------------------------------------------- refresh
+    def fetch_quota(self, account_id):
+        row = self._access(account_id)
+        if row.get("kind") == "api_key" or row.get("using_api"):
+            raise ProviderError("Grok API Key 不提供订阅额度，请使用 Grok OAuth 账号查询", 400)
+        headers = {"Authorization": "Bearer " + row["access_token"], "Accept": "application/json"}
+        headers.update(self.extra_headers(row["access_token"], row, CLI_BASE))
+        data = json_request((self._base_override(row) or CLI_BASE) + "/billing?format=credits",
+                            headers=headers, timeout=20)
+        config = data.get("config") if isinstance(data, dict) else None
+        if not isinstance(config, dict):
+            raise ProviderError("Grok 额度响应格式无效", 502)
+        period = config.get("currentPeriod") or {}
+        if not isinstance(period, dict):
+            raise ProviderError("Grok 额度周期格式无效", 502)
+        period_type = period.get("type")
+        usage = quota_number(config.get("creditUsagePercent"))
+        if "creditUsagePercent" not in config and period_type in (
+                "USAGE_PERIOD_TYPE_WEEKLY", "USAGE_PERIOD_TYPE_MONTHLY"):
+            usage = 0  # Protobuf JSON omits the scalar when usage is zero.
+        if usage is None:
+            limit = config.get("monthlyLimit")
+            used = config.get("used") or {}
+            total = quota_number(limit.get("val", 0)) if isinstance(limit, dict) else None
+            spent = quota_number(used.get("val", 0)) if isinstance(used, dict) else None
+            if total is not None and total > 0 and spent is not None:
+                usage = spent / total * 100
+        if usage is None:
+            raise ProviderError("Grok 上游未返回订阅额度数据", 502)
+        label = "本周额度" if period_type == "USAGE_PERIOD_TYPE_WEEKLY" else "本月额度"
+        return quota_summary([{"label": label, "remaining": max(0, min(100, 100 - usage)),
+                               "unit": "%", "reset_at": period.get("end")
+                               or config.get("billingPeriodEnd")}])
+
     def refresh_grant(self, row):
         refresh = str(row.get("refresh_token") or "")
         if not refresh:

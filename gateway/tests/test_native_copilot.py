@@ -250,6 +250,7 @@ class CopilotTests(unittest.TestCase):
             DEVICE_CODE_URL=self.origin + "/login/device/code",
             ACCESS_TOKEN_URL=self.origin + "/login/oauth/access_token",
             COPILOT_TOKEN_URL=self.origin + "/copilot_internal/v2/token",
+            COPILOT_USER_URL=self.origin + "/copilot_internal/user",
             GITHUB_USER_URL=self.origin + "/user",
             API_BASE=self.origin,
             BUSINESS_API_BASE=self.origin + "/business",

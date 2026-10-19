@@ -103,6 +103,34 @@ export function regionButtons(data, busy = false) {
         index === 1 && singleRegion ? "当前 Agent 暂不支持国际版" : "";
     });
 }
+function quotaAmount(value, unit) {
+  if (value === "unlimited") return "无限制";
+  if (value == null) return "—";
+  return number(value) + (unit === "%" ? "%" : unit ? " " + unit : "");
+}
+function accountQuota(row, provider) {
+  if (usageUnit(provider) !== "额度") {
+    return `<strong class="account-credits ${row.remaining == null ? "muted" : ""}">${row.remaining === "unlimited" ? "无限制" : number(row.remaining)}</strong>`;
+  }
+  const quota = row.quota || {};
+  const buckets = quota.buckets || [];
+  const tooltip = buckets.map((bucket) =>
+    `${bucket.label}：${quotaAmount(bucket.remaining, bucket.unit)}${bucket.limit != null ? " / " + number(bucket.limit) : ""}${bucket.reset_at ? "，重置 " + date(bucket.reset_at) : ""}`,
+  );
+  if (quota.updated_at) tooltip.push("更新于 " + date(quota.updated_at));
+  if (quota.error) tooltip.push("刷新失败：" + quota.error);
+  const detail = [];
+  if (quota.label) detail.push(quota.label);
+  if (buckets.length > 3) detail.push(`${buckets.length} 个模型，悬停查看`);
+  else for (const bucket of buckets.slice(1)) {
+    detail.push(`${bucket.label}：${quotaAmount(bucket.remaining, bucket.unit)}`);
+  }
+  if (quota.reset_at) detail.push("重置 " + date(quota.reset_at));
+  if (quota.updated_at) detail.push("更新 " + date(quota.updated_at));
+  if (quota.error) detail.push(row.remaining == null ? "额度查询失败" : "刷新失败，显示上次结果");
+  else if (row.remaining == null) detail.push("尚未查询额度");
+  return `<strong class="account-credits ${row.remaining == null ? "muted" : ""}" title="${escape(tooltip.join("\n"))}">${escape(quotaAmount(row.remaining, quota.unit))}</strong><div class="cell-detail" title="${escape(tooltip.join("\n"))}">${detail.map(escape).join("<br>")}</div>`;
+}
 export function accountRows(data, filter, selected, busy = false) {
   const rows = data.accounts.filter((row) =>
     `${row.name} ${row.id} ${regions[row.region] || ""}`
@@ -142,7 +170,7 @@ export function accountRows(data, filter, selected, busy = false) {
       <td><span class="region-label ${row.region === "cn" ? "china" : "global"}">${escape(regions[row.region] || row.region)}版</span></td>
       <td class="account-name"><strong>${escape(row.name)}</strong><div class="cell-detail"><code title="${escape(row.id)}">${escape(row.id.slice(0, 22))}</code><br>会话有效期 ${escape(date(row.expires_at))}</div></td>
       <td><span class="account-state ${active ? "ready" : ""}">${status}</span>${row.error ? `<div class="account-error" title="${escape(row.error)}">${escape(row.error)}</div>` : ""}</td>
-      <td><strong class="account-credits ${row.remaining == null ? "muted" : ""}">${row.remaining === "unlimited" ? "无限制" : number(row.remaining)}</strong></td>
+      <td>${accountQuota(row, data.provider)}</td>
       <td><span class="${row.checkin?.done === true ? "checked-in" : "muted"}">${checkin}</span></td>
       <td class="token-count" title="${row.daily_tokens == null ? "上游未返回 Token 用量" : row.daily_tokens_complete === false ? "部分请求未返回用量，仅汇总上游已返回的实际 Token" : "今日输入与输出 Token 总量"}">${row.daily_tokens == null ? "—" : number(row.daily_tokens)}</td>
       <td><div class="account-actions">

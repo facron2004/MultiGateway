@@ -33,6 +33,7 @@ class NativeProvider:
     capabilities = {"login": True, "import": True, "credits": False, "regions": False,
                     "checkin": False, "credentials": True}
     model_ttl = 300
+    quota_ttl = 300
     max_attempts = 3
 
     def __init__(self, directory):
@@ -43,6 +44,7 @@ class NativeProvider:
         self.lock = threading.RLock()
         self.pending = {}
         self.error = ""
+        self._quota_locks = {}
         #: Account that served the request on this thread; the handler lifts it
         #: into the activity row so the usage board can name the account.
         self._local = threading.local()
@@ -68,6 +70,12 @@ class NativeProvider:
         rows = []
         for _, row in self.pool.records():
             enabled = row.get("enabled", True)
+            if enabled and self.capabilities.get("credits"):
+                try:
+                    self.refresh_quota(row["id"], force=False)
+                except ProviderError:
+                    pass  # Keep the account and last good quota visible on failure.
+                _, row = self.pool.find(row["id"])
             usable = bool(row.get("refresh_token")) or float(row.get("expires_at") or 0) > now
             rows.append({
                 "id": row["id"], "name": row.get("label") or row.get("email") or row["id"],
@@ -90,6 +98,30 @@ class NativeProvider:
             _, row = self.pool.find(account_id)
             self._refresh(row)
         return {"ok": True, "message": "凭证已刷新"}
+
+    def refresh_quota(self, account_id, force=True):
+        if not self.capabilities.get("credits"):
+            raise ProviderError("%s 不支持额度查询" % self.label, 400)
+        with self.lock:
+            lock = self._quota_locks.setdefault(account_id, threading.Lock())
+        with lock:
+            _, row = self.pool.find(account_id)
+            previous = row.get("quota") or {}
+            now = time.time()
+            if not force and now - (previous.get("checked_at") or 0) < self.quota_ttl:
+                return {"ok": True, "quota": previous}
+            try:
+                quota = self.fetch_quota(account_id)
+            except ProviderError as exc:
+                self.pool.save({"quota": dict(previous, checked_at=now, error=str(exc)[:200])},
+                               account_id=account_id)
+                raise
+            quota.update(updated_at=time.time(), checked_at=time.time(), error="")
+            self.pool.save({"remaining": quota["remaining"], "quota": quota}, account_id=account_id)
+        return {"ok": True, "message": "额度已刷新", "quota": quota}
+
+    def fetch_quota(self, account_id):
+        raise ProviderError("%s 不支持额度查询" % self.label, 400)
 
     def import_credentials(self, data):
         rows = data if isinstance(data, list) else data.get("accounts", [data])

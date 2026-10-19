@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#requirements"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.11+" /></a>
-  <a href="gateway/__init__.py"><img src="https://img.shields.io/badge/Version-0.5.0-2563EB" alt="Version 0.5.0" /></a>
+  <a href="gateway/__init__.py"><img src="https://img.shields.io/badge/Version-0.10.0-2563EB" alt="Version 0.10.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT License" /></a>
   <a href="#download"><img src="https://img.shields.io/badge/Desktop-Windows-0078D4" alt="Windows desktop" /></a>
 </p>
@@ -32,9 +32,9 @@
 Multi-Account Reverse Proxy Gateway for **WorkBuddy**, **Trae**, **MiniMax Code**,
 **Qoder**, **Antigravity**, **Grok**, and **GitHub Copilot**.
 
-Current release: **0.5.0** — adds three in-process "native OAuth" providers
-(Antigravity, Grok, GitHub Copilot) next to the existing vendored
-WorkBuddy/Trae/MiniMax/Qoder integrations. Single-region providers hide the
+Current release: **0.10.0** — adds live quota queries for GitHub Copilot, Grok,
+and Antigravity, with automatic/manual refresh, quota details and reset times.
+Single-region providers hide the
 国内版/国际版 switch in the dashboard.
 
 ---
@@ -95,7 +95,7 @@ are used.
 ## Download
 
 Open [GitHub Releases](https://github.com/facron2004/MultiGateway/releases/latest)
-and download `MultiGateway-v0.5.0-windows-x64.zip`. Extract the entire archive to a
+and download `MultiGateway-v0.10.0-windows-x64.zip`. Extract the entire archive to a
 writable folder, then double-click `MultiGateway.exe`.
 
 Accounts, settings and usage are stored in `gateway-data/` beside the executable.

@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#环境要求"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.11+" /></a>
-  <a href="gateway/__init__.py"><img src="https://img.shields.io/badge/Version-0.5.0-2563EB" alt="版本 0.5.0" /></a>
+  <a href="gateway/__init__.py"><img src="https://img.shields.io/badge/Version-0.10.0-2563EB" alt="版本 0.10.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT 协议" /></a>
   <a href="#下载使用"><img src="https://img.shields.io/badge/Desktop-Windows-0078D4" alt="Windows 桌面版" /></a>
 </p>
@@ -33,8 +33,8 @@ MultiGateway 是一个多账号反向代理网关，支持 **WorkBuddy**、**Tra
 **MiniMax Code**、**Qoder**、**Antigravity**、**Grok** 和 **GitHub Copilot**，
 通过统一接口调用不同服务，并在同一面板中管理账号与用量。
 
-当前版本 **0.5.0**：在内嵌 WorkBuddy、Trae、MiniMax Code、Qoder 集成的基础上，
-新增 Antigravity、Grok、GitHub Copilot 三个原生 OAuth 集成。
+当前版本 **0.10.0**：完善 GitHub Copilot、Grok、Antigravity 的真实额度查询，
+支持自动 / 手动刷新、分项额度与重置时间展示。
 仅支持单一区域的服务会自动隐藏国内版 / 国际版切换。
 
 ---
@@ -88,7 +88,7 @@ WorkBuddy、MiniMax Code 和 Qoder 保留国内版 / 国际版切换。
 ## 下载使用
 
 前往 [GitHub Releases](https://github.com/facron2004/MultiGateway/releases/latest)，
-下载 `MultiGateway-v0.5.0-windows-x64.zip`，完整解压到有写入权限的目录，
+下载 `MultiGateway-v0.10.0-windows-x64.zip`，完整解压到有写入权限的目录，
 双击 `MultiGateway.exe` 即可启动。
 
 程序会在可执行文件旁的 `gateway-data/` 中保存账号、配置和用量数据。

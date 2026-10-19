@@ -518,6 +518,27 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertNotIn("good-token", body.decode())
         self.assertNotIn("refresh-1", body.decode())
 
+    def test_quota_refresh_route_batch_and_snapshot_keep_account_scope(self):
+        quota = {"remaining": 42, "unit": "%", "label": "本周额度", "buckets": [
+            {"label": "本周额度", "remaining": 42, "unit": "%"}]}
+        with mock.patch.object(self.provider, "capabilities", dict(self.provider.capabilities, credits=True)), \
+                mock.patch.object(self.provider, "fetch_quota", return_value=quota):
+            cookie = self.cookie()
+            status, body, _ = self.request("/gateway/providers/fake/credits", {"id": "acct-1"},
+                                           cookie=cookie)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["quota"]["remaining"], 42)
+            status, body, _ = self.request("/gateway/providers/fake/batch",
+                                           {"operation": "credits", "ids": ["acct-1"]}, cookie=cookie)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["succeeded"], 1)
+            status, body, _ = self.request("/gateway/providers/fake/snapshot", cookie=cookie)
+            self.assertEqual(status, 200, body)
+            account = json.loads(body)["accounts"][0]
+            self.assertEqual(account["remaining"], 42)
+            self.assertEqual(account["quota"]["unit"], "%")
+            self.assertNotIn("good-token", body.decode())
+
     def test_account_snapshot_reports_tokens_from_all_public_protocols(self):
         runtime = self.server.gateway
         with tempfile.TemporaryDirectory() as directory, closing(Activity(Path(directory))) as activity:

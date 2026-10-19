@@ -289,6 +289,7 @@ def run_runtime_info(realm, account_id=""):
             [exe, "prod", "--account-stdin"],
             input=json.dumps({"account": account_id or ""}).encode("utf-8") + b" ",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             cwd=os.path.dirname(exe))
         out = proc.stdout.decode("utf-8", "replace").strip()
         if out:

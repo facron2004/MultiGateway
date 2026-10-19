@@ -56,6 +56,7 @@ from dotenv import dotenv_values
 from ..transport import ProviderError, json_request, sse_events
 from . import gemini, oauth
 from .base import NativeProvider
+from .quota import quota_number, quota_summary
 
 # --------------------------------------------------------------------------- OAuth
 # Read local OAuth settings beside the source launcher or installed executable.
@@ -168,7 +169,7 @@ class Antigravity(NativeProvider):
     label = "Antigravity"
     region = "intl"
     login_kind = "loopback"
-    capabilities = {"login": True, "import": True, "credits": False, "regions": False,
+    capabilities = {"login": True, "import": True, "credits": True, "regions": False,
                     "checkin": False, "credentials": True}
     model_ttl = 300
 
@@ -352,7 +353,7 @@ class Antigravity(NativeProvider):
             cached = str((current.get("extra") or {}).get("project_id") or "")
             if cached:
                 return cached
-            project = self._discover_project()
+            project = self._discover_project(row["id"])
             if project:
                 self._store_project(row["id"], project)
             return project
@@ -361,30 +362,31 @@ class Antigravity(NativeProvider):
         with self.lock:
             return self._project_locks.setdefault(account_id, threading.Lock())
 
-    def _discover_project(self):
+    def _discover_project(self, account_id=None):
         """``loadCodeAssist`` then ``onboardUser``; empty when unknown."""
         try:
-            info = self._post(LOAD_CODE_ASSIST, {"metadata": IDE_METADATA})
+            info = self._post(LOAD_CODE_ASSIST, {"metadata": IDE_METADATA}, account_id=account_id)
             project = project_of(info)
             if project:
                 return project
             tier = tier_of(info)
             if not tier:
                 return ""
-            return self._onboard(tier)
+            return self._onboard(tier, account_id=account_id)
         except ProviderError:
             # A missing project is valid (the envelope omits it), so a discovery
             # failure must not fail a request that could still succeed.
             return ""
 
-    def _onboard(self, tier):
+    def _onboard(self, tier, account_id=None):
         """Poll ``onboardUser`` until the long-running operation completes."""
         payload = {"tierId": tier, "metadata": IDE_METADATA}
         headers = {"X-Goog-Api-Client": API_CLIENT}
         for attempt in range(ONBOARD_ATTEMPTS):
             if attempt and ONBOARD_INTERVAL:
                 time.sleep(ONBOARD_INTERVAL)
-            result = self._post(ONBOARD_USER, payload, headers=headers, timeout=60)
+            result = self._post(ONBOARD_USER, payload, headers=headers, timeout=60,
+                                account_id=account_id)
             if result.get("done"):
                 return project_of(result.get("response") or {})
         return ""
@@ -408,6 +410,25 @@ class Antigravity(NativeProvider):
             pass
 
     # ------------------------------------------------------------------- models
+    def fetch_quota(self, account_id):
+        row = self._access(account_id)
+        project = self.project_id(row)
+        data = self._post(FETCH_MODELS, {"project": project} if project else {}, account_id=account_id)
+        if isinstance(data, dict) and isinstance(data.get("response"), dict):
+            data = data["response"]
+        catalog = data.get("models") if isinstance(data, dict) else None
+        buckets = []
+        for identifier, info in (catalog.items() if isinstance(catalog, dict) else ()):
+            quota = info.get("quotaInfo") if isinstance(info, dict) else None
+            fraction = quota_number(quota.get("remainingFraction")) if isinstance(quota, dict) else None
+            if fraction is None:
+                continue
+            buckets.append({"label": info.get("displayName") or identifier,
+                            "remaining": max(0, min(100, fraction * 100)), "unit": "%",
+                            "reset_at": quota.get("resetTime")})
+        buckets.sort(key=lambda bucket: bucket["remaining"])
+        return quota_summary(buckets, label="最低模型剩余")
+
     def fetch_models(self):
         """Return the server catalog, falling back to :data:`DEFAULT_MODELS`."""
         try:
@@ -521,21 +542,22 @@ class Antigravity(NativeProvider):
         yield b"data: [DONE]\n\n"
 
     # ----------------------------------------------------------------- transport
-    def _open(self, path, payload, headers=None, timeout=600):
+    def _open(self, path, payload, headers=None, timeout=600, account_id=None):
         """POST one ``v1internal`` method, falling back across unhealthy hosts."""
         last = None
         for host in endpoint_hosts(path):
             try:
-                return self.request(host + path, payload, headers=headers, timeout=timeout)
+                return self.request(host + path, payload, headers=headers, timeout=timeout,
+                                    account_id=account_id)
             except ProviderError as exc:
                 last = exc
                 if not retry_other_endpoint(exc, host):
                     raise
         raise last or ProviderError("Antigravity 上游不可用", 503)
 
-    def _post(self, path, payload, headers=None, timeout=60):
+    def _post(self, path, payload, headers=None, timeout=60, account_id=None):
         """Like :meth:`_open` but reads and decodes the JSON body."""
-        response = self._open(path, payload, headers=headers, timeout=timeout)
+        response = self._open(path, payload, headers=headers, timeout=timeout, account_id=account_id)
         with response:
             try:
                 return json.load(response)

@@ -39,6 +39,7 @@ import uuid
 from ..transport import ProviderError, json_request, open_request
 from .base import OpenAIProvider
 from .oauth import new_login_id
+from .quota import quota_number, quota_summary
 
 GITHUB_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 GITHUB_SCOPE = "read:user"
@@ -46,6 +47,7 @@ DEVICE_CODE_URL = "https://github.com/login/device/code"
 ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
 DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
+COPILOT_USER_URL = "https://api.github.com/copilot_internal/user"
 GITHUB_USER_URL = "https://api.github.com/user"
 
 #: Seat-specific inference hosts. Individual seats use :data:`API_BASE`; the JWT
@@ -108,7 +110,7 @@ class Copilot(OpenAIProvider):
     label = "GitHub Copilot"
     region = "intl"
     login_kind = "device"
-    capabilities = {"login": True, "import": True, "credits": False,
+    capabilities = {"login": True, "import": True, "credits": True,
                     "regions": False, "checkin": False, "credentials": True}
 
     # Copilot's OpenAI surface is not versioned under /v1.
@@ -132,6 +134,47 @@ class Copilot(OpenAIProvider):
         """Default upstream URL (individual seat); business/enterprise use a host
         derived from the JWT in :meth:`_api_base`."""
         return API_BASE + path
+
+    def fetch_quota(self, account_id):
+        _, row = self.pool.find(account_id)
+        data = json_request(COPILOT_USER_URL, headers=self._github_headers(row["access_token"]),
+                            timeout=20)
+        if not isinstance(data, dict):
+            raise ProviderError("GitHub Copilot 额度响应格式无效", 502)
+        snapshots = data.get("quota_snapshots") or {}
+        legacy = data.get("limited_user_quotas") or {}
+        totals = data.get("monthly_quotas") or {}
+        if not all(isinstance(value, dict) for value in (snapshots, legacy, totals)):
+            raise ProviderError("GitHub Copilot 额度响应格式无效", 502)
+        reset = data.get("quota_reset_date_utc") or data.get("quota_reset_date")
+        buckets = []
+        for key, label in (("premium_interactions", "高级请求"), ("chat", "对话"),
+                           ("completions", "代码补全")):
+            info = snapshots.get(key) or (snapshots.get("premium_models")
+                                          if key == "premium_interactions" else None)
+            if not isinstance(info, dict):
+                info = {"remaining": legacy[key], "entitlement": totals.get(key)} if key in legacy else {}
+            limit = quota_number(info.get("entitlement"))
+            if info.get("has_quota") is False and limit == 0 and not info.get("unlimited"):
+                continue  # Free seats report a premium bucket they are not entitled to.
+            unit = "额度" if info.get("token_based_billing") and key != "completions" else "次"
+            remaining = quota_number(info.get("quota_remaining"))
+            if remaining is None:
+                remaining = quota_number(info.get("remaining"))
+            percent = quota_number(info.get("percent_remaining"))
+            if info.get("unlimited"):
+                remaining = "unlimited"
+            elif remaining is None and percent is not None:
+                remaining = limit * percent / 100 if limit is not None else percent
+                if limit is None:
+                    unit = "%"
+            if remaining is None:
+                continue
+            if remaining != "unlimited":
+                remaining = max(0, remaining)
+            buckets.append({"label": label, "remaining": remaining, "limit": limit, "unit": unit,
+                            "reset_at": info.get("quota_reset_at") or reset})
+        return quota_summary(buckets)
 
     # ----------------------------------------------------------------------- login
     def start_login(self, region=None):

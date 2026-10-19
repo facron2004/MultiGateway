@@ -572,6 +572,8 @@ class Control:
         if action in ("enable", "delete", "credits", "credentials", "checkin") and not isinstance(identifier, str):
             raise ProviderError("账号 id 必填", 400)
         if provider is not None:
+            if action == "credits":
+                return provider.refresh_quota(identifier)
             if action == "credentials":
                 return provider.refresh_account(identifier)
             if action in ("enable", "delete"):
