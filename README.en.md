@@ -1,18 +1,18 @@
 <p align="center">
-  <img src="gateway/ui/icons/multigateway.png" width="112" height="112" alt="MultiGateway logo" />
+  <img src="crates/mg-server/ui/icons/multigateway.png" width="112" height="112" alt="MultiGateway logo" />
 </p>
 
 <h1 align="center">MultiGateway</h1>
 
 <p align="center">
-  One gateway for multiple AI account pools.
+  One gateway for every AI account pool.
 </p>
 
 <p align="center">
-  <a href="#requirements"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.11+" /></a>
-  <a href="gateway/__init__.py"><img src="https://img.shields.io/badge/Version-0.10.0-2563EB" alt="Version 0.10.0" /></a>
+  <a href="#requirements"><img src="https://img.shields.io/badge/Rust-1.90%2B-000000?logo=rust&amp;logoColor=white" alt="Rust 1.90+" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.1-2563EB" alt="Version 0.11.1" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT License" /></a>
-  <a href="#download"><img src="https://img.shields.io/badge/Desktop-Windows-0078D4" alt="Windows desktop" /></a>
+  <a href="#build-and-run"><img src="https://img.shields.io/badge/Desktop-Windows-0078D4?logo=windows&amp;logoColor=white" alt="Windows desktop" /></a>
 </p>
 
 <p align="center">
@@ -22,173 +22,127 @@
 <p align="center">
   <a href="#features">Features</a> ·
   <a href="#providers">Providers</a> ·
-  <a href="#download">Download</a> ·
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#repository-layout">Structure</a> ·
-  <a href="#running-tests">Tests</a> ·
+  <a href="#requirements">Requirements</a> ·
+  <a href="#build-and-run">Build and run</a> ·
+  <a href="#api">API</a> ·
+  <a href="#layout">Layout</a> ·
+  <a href="#tests">Tests</a> ·
   <a href="#license">License</a>
 </p>
 
-Multi-Account Reverse Proxy Gateway for **WorkBuddy**, **Trae**, **MiniMax Code**,
-**Qoder**, **Antigravity**, **Grok**, and **GitHub Copilot**.
+MultiGateway is a Rust reverse proxy for several AI account pools. WorkBuddy, Trae, MiniMax, Qoder, Antigravity, Grok, and GitHub Copilot share one desktop app and one set of OpenAI, Anthropic, and Responses endpoints.
 
-Current release: **0.10.0** — adds live quota queries for GitHub Copilot, Grok,
-and Antigravity, with automatic/manual refresh, quota details and reset times.
-Single-region providers hide the
-国内版/国际版 switch in the dashboard.
+Version **0.11.1** is the Rust gateway. The desktop window, tray, and web dashboard are compiled into `MultiGateway.exe`.
 
 ---
 
 ## Features
 
-- **Multi-Account Aggregation**: One gateway in front of seven providers — WorkBuddy, Trae, MiniMax Code, Qoder, Antigravity, Grok, GitHub Copilot — with account pools, session stickiness, and load balancing.
-- **OAuth Account Pool**: In-process device-code and loopback authorization-code flows, credential import, silent token refresh, per-account health and region tracking.
-- **Protocol Compatibility**: Full OpenAI (`/v1/chat/completions`, `/v1/models`, `/v1/responses`) and Anthropic (`/v1/messages`) compatibility layer, including SSE translation for providers that only speak Gemini or Responses-style APIs.
-- **Reasoning Controls**: Native support for extended reasoning effort levels, including custom effort tiers and real-time reasoning token tracking.
-- **Desktop & Headless Modes**: Run with an embedded frameless WebView2 desktop UI or in headless mode as a background service/daemon.
-- **Unified Usage Board**: Requests from every provider land in one dashboard with per-provider, per-model, per-account usage, tokens, credits, and cost estimates.
-- **One-Click Local Agent Integration**: Integrated configurator for AI clients (Codex CLI, OpenCode, DSH, Crush, ZCode, Claude Code).
+- **Shared account pools** for seven providers, with session stickiness and a short cooldown after an account-level upstream failure.
+- **China and international regions** for WorkBuddy, Trae, MiniMax, and Qoder. Catalogs, credit queries, and check-in follow the selected region.
+- **Model catalogs** show the upstream name, context window, and credit factor. When the live catalog omits a factor, a known official snapshot fills it in, including peak and off-peak windows.
+- **Check-in** for WorkBuddy personal accounts in China, for Trae, and for Qoder regions that expose the daily check-in API.
+- **Compatible APIs**: `/v1/chat/completions`, `/v1/models`, `/v1/responses`, and `/v1/messages`. Streams are forwarded chunk by chunk, including tool calls and reasoning.
+- **Usage board** by provider, model, and account.
+- **Desktop shell** with WebView2, optional launch at login, silent start, and close-to-tray. A headless HTTP process is also available.
 
 ---
 
 ## Providers
 
-| Provider | What it is | OAuth flow | Requirements & caveats |
+| Provider | Regions | Check-in | Notes |
 | --- | --- | --- | --- |
-| **WorkBuddy** | WorkBuddy desktop agent account pool | Browser account login, polled by the local WorkBuddy backend | Uses the embedded WorkBuddy backend; 国内/国际 realms |
-| **Trae** | Trae coding agent (vendored backend) | Browser web login forwarded to a loopback helper (port 8765) | Single region (国内); no 国际版 switch |
-| **MiniMax Code** | MiniMax Code agent (MIT client protocol adapter) | OAuth device code + PKCE (国内/国际 endpoints) | 国内/国际 realms; no account import |
-| **Qoder** | Qoder coding agent (vendored backend) | Browser login handled by the bundled Qoder backend | 国内/国际 realms |
-| **Antigravity** | Google Antigravity IDE account | Google OAuth authorization code over a loopback callback | Needs local OAuth client settings and a Google account with Cloud Code Assist access; quota is per Google account/tier, endpoints are undocumented and churn |
-| **Grok** | xAI Grok CLI / Grok Build account | xAI OAuth authorization code + PKCE over a loopback callback | Responses API only (Chat Completions is not offered to OAuth tokens); free tier is gated by account tier and can return 402/403 at inference time |
-| **GitHub Copilot** | GitHub Copilot seat | GitHub device flow, then exchange the GitHub token for a short-lived Copilot token | Requires an active Copilot seat; per-request editor/header fingerprinting and the ~20-minute token refresh are mandatory |
+| **WorkBuddy** | China / International | China personal accounts | Quota query and credential refresh |
+| **Trae** | China / International | Yes | International catalog, credits, and check-in use the international hosts |
+| **MiniMax** | China / International | No | Credential refresh; Token Plan quota needs a Subscription Key |
+| **Qoder** | China / International | When the region exposes it | Catalog includes credit factors; credentials can be refreshed |
+| **Antigravity** | Single region | No | Account import and credential refresh |
+| **Grok** | Single region | No | Account import, quota query, and credential refresh |
+| **GitHub Copilot** | Single region | No | GitHub device-code login, then a short-lived Copilot token |
 
-Single-region providers (Trae, Antigravity, Grok, GitHub Copilot) have
-no region choice and hide the region switch; WorkBuddy, MiniMax Code and Qoder keep
-the 国内/国际 switch.
-
-Provider-specific notes:
-
-- **Antigravity** requires the Google account to have Code Assist access (a Pro/Ultra
-  subscription or eligible free tier). Its quota is fractional per model, and the
-  upstream endpoints are observed behaviour, not a published API.
-- **Grok** OAuth can only call the Responses API; the gateway translates OpenAI Chat
-  and Anthropic Messages requests internally. Standard/free accounts may be limited to
-  the CLI transport and a single free model, so entitlement errors must be surfaced, not hidden.
-- **GitHub Copilot** requires a Copilot seat. GitHub's terms restrict automated or
-  shared use, so keep one seat per user and cap concurrency per account.
-
-OAuth grants for the three native providers are stored under the gateway data
-directory (`native/<provider>/accounts/`); only the user's own accounts and quota
-are used.
+Request a model with its provider prefix, for example `trae/glm-5.3`, `qoder/Qwen3.8-Max`, or `copilot/gpt-4.1`. A grouped endpoint such as `/trae/v1/models` keeps the upstream model id.
 
 ---
 
 ## Requirements
 
-- Python 3.11+ for running from source (Python 3.13 recommended; required by the Windows build script)
-- Dependencies listed in `requirements-gateway.txt`
-- The Windows x64 portable release does not require Python; desktop mode uses WebView2.
+- Windows 10/11 x64
+- Rust **1.90+** and the MSVC C++ build tools to build from source
+- WebView2 for the desktop window
 
 ---
 
-## Download
-
-Open [GitHub Releases](https://github.com/facron2004/MultiGateway/releases/latest)
-and download `MultiGateway-v0.10.0-windows-x64.zip`. Extract the entire archive to a
-writable folder, then double-click `MultiGateway.exe`.
-
-Accounts, settings and usage are stored in `gateway-data/` beside the executable.
-When upgrading, close the application, replace the executable and keep
-`gateway-data/` and your local `.env`. When moving the application, move that data
-directory too, or select its location with `--data-dir`.
-The release archive contains no preconfigured accounts or credentials.
-
----
-
-## Quick Start
-
-### 1. Install Dependencies
+## Build and run
 
 ```bash
 git clone https://github.com/facron2004/MultiGateway.git
 cd MultiGateway
-python -m pip install -r requirements-gateway.txt
+cargo run -p mg-server -- --host 127.0.0.1 --port 8791
 ```
 
-### 2. Run Headless Mode
+Release build:
 
 ```bash
-python gateway_app.py --headless --host 127.0.0.1 --port 8791
+cargo build --release -p mg-server
 ```
 
-Access dashboard at `http://127.0.0.1:8791/` (token will be printed in console output).
-The portable executable accepts the same options, for example:
+The binary is `target/release/MultiGateway.exe`. Run it from a writable directory. Accounts, API keys, and usage default to `gateway-data/` beside the executable. Point it at an existing directory with:
 
 ```cmd
-MultiGateway.exe --headless --host 127.0.0.1 --port 8791 --data-dir "D:\MultiGateway-data"
+MultiGateway.exe --host 127.0.0.1 --port 8791 --data-dir "D:\MultiGateway-data"
 ```
 
-In the portable executable's headless mode, the dashboard URL is written to
-`gateway.log` in the data directory.
+`--silent` starts the gateway without showing the window. `--headless` runs only the HTTP service. Quit from the tray menu to stop the process.
 
-For Antigravity OAuth, copy [`.env.example`](.env.example) to `.env` beside the
-launcher or executable, then fill in the OAuth client ID and secret used by your
-Antigravity installation. Environment variables with the same names take
-precedence. `.env` stays local and is excluded from Git; the other providers do
-not require this configuration.
+The dashboard is `http://127.0.0.1:8791/`. API keys are stored in `api_keys.json` inside the data directory, and the previous file is kept as `api_keys.json.bak`.
 
-### 3. Run Desktop Application
-
-```bash
-python gateway_app.py
-```
-
-### 4. Build Windows Executable
-
-```cmd
-build_gateway.bat
-```
-
-This will produce `MultiGateway.exe` using PyInstaller.
+Exit the app before replacing the executable, and keep the existing `gateway-data/` directory.
 
 ---
 
-## Repository Layout
+## API
+
+| Use | URL |
+| --- | --- |
+| Dashboard | `http://127.0.0.1:8791/` |
+| OpenAI Chat | `http://127.0.0.1:8791/v1/chat/completions` |
+| OpenAI Responses | `http://127.0.0.1:8791/v1/responses` |
+| Anthropic Messages | `http://127.0.0.1:8791/v1/messages` |
+| Model list | `http://127.0.0.1:8791/v1/models` |
+
+The combined `/v1/models` list returns provider-prefixed ids only. Each model carries the capabilities the upstream actually reported:
+
+- `supports_reasoning` and `capabilities.reasoning`
+- `reasoning_efforts` and `reasoning_default_effort`
+- `supports_vision` and `input_modalities`
+
+Missing capabilities stay `null`. The gateway does not infer them from the model name.
+
+---
+
+## Layout
 
 ```text
-gateway_app.py          Desktop and headless entry point
-gateway/               Gateway routing, management and provider adapters
-  native/              In-process OAuth providers
-  ui/                  Shared dashboard assets
-  vendor/              Embedded WorkBuddy, Trae and Qoder runtimes
-  tests/               Local protocol and HTTP integration tests
-scripts/               Maintenance tools (fetch_pricing.py)
-pricing/               Bundled price snapshot
-docs/                  Architecture notes and protocol research
+crates/
+  mg-core/        Account pools, API keys, usage, and configuration
+  mg-protocols/   OpenAI, Anthropic, Gemini, and Responses conversion
+  mg-providers/   Catalogs, chat, quotas, and check-in for seven providers
+  mg-server/      HTTP service, desktop window, and embedded dashboard
 ```
-
-See [the structure guide](docs/architecture.md) for module responsibilities and
-the boundary between gateway code, embedded integrations and runtime data.
 
 ---
 
-## Running Tests
-
-Run the gateway test suite:
+## Tests
 
 ```bash
-python -m unittest discover -s gateway/tests
+cargo test --workspace
 ```
 
-Native provider tests live in `gateway/tests/test_native_<provider>.py`; they mock the
-vendor protocol locally, so no real account or network access is needed.
+The tests use local fixtures. They do not need real accounts or upstream network access.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-Embedded integrations and their licenses are documented in [gateway/SOURCES.md](gateway/SOURCES.md).
-The three 0.5.0 OAuth integrations are independent implementations; reference projects
-that were consulted for behaviour only are listed there.
+[MIT](LICENSE).
+Icon sources are listed in [`crates/mg-server/ui/icons/SOURCES.json`](crates/mg-server/ui/icons/SOURCES.json).

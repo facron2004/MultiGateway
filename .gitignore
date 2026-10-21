@@ -1,20 +1,15 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-build/
-dist/
-gateway-build/
-gateway-dist/
-gateway-data*/
-.gateway-deps/
+# Build output
+/target/
+/dist/
 *.exe
-*.spec.bak
+*.pdb
+*.dll
+
+# Desktop runtime profile and local backups
+MultiGateway.exe.WebView2/
+*.bak
+*.old
+*.backup
 
 # Local environment and credentials
 .env
@@ -22,14 +17,6 @@ gateway-data*/
 !.env.example
 *.local
 *.local.json
-*.local.yaml
-*.local.yml
-*.info
-*.pem
-*.key
-*.p12
-*.pfx
-*.keystore
 accounts.json
 auth.json
 credentials.json
@@ -37,45 +24,20 @@ credentials-*.json
 tokens.json
 oauth-client.json
 client_secret*.json
+*.pem
+*.key
+*.p12
+*.pfx
 
-# Virtual environments
-.venv
-env/
-venv/
-ENV/
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-output/
-playwright-report/
-test-results/
-
-# Logs and runtime data
+# Runtime data
+gateway-data*/
 *.log
 *.jsonl
-*.har
 *.db
 *.sqlite
 *.sqlite3
-accounts/
-usage/
-usage_records.json
-usage_stats.json
-usage-summary.json
-.qoder-credits/
-.playwright-cli/
-integration-state.json
-agent-backups/
-backups/
-package-backups/
-*.bak
-*.old
-*.backup
-*.bundle
 
-# IDE & OS files
+# IDE and OS
 .vscode/
 .idea/
 .DS_Store
