@@ -171,7 +171,9 @@ fn open_folder(path: &std::path::Path) {
 
 #[cfg(windows)]
 fn load_tray_icon() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
-    tray_icon::Icon::from_resource(1, Some((32, 32)))
+    tray_icon::Icon::from_resource(1, Some((32, 32))).or_else(|_| {
+        tray_icon::Icon::from_rgba(include_bytes!("../assets/tray-64.rgba").to_vec(), 64, 64)
+    })
 }
 
 #[cfg(target_os = "macos")]

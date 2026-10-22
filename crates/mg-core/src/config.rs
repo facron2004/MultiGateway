@@ -47,10 +47,15 @@ impl Config {
         let base_data_dir = data_dir.unwrap_or_else(|| {
             if let Ok(dir) = std::env::var("MG_DATA_DIR") {
                 PathBuf::from(dir)
-            } else if PathBuf::from(r"E:\Program\MultiGateway\gateway-data").exists() {
-                PathBuf::from(r"E:\Program\MultiGateway\gateway-data")
-            } else if PathBuf::from(r"..\MultiGateway\gateway-data").exists() {
-                PathBuf::from(r"..\MultiGateway\gateway-data")
+            } else if let Ok(exe_path) = std::env::current_exe() {
+                let beside_exe = exe_path.parent().map(|p| p.join("gateway-data"));
+                if let Some(dir) = beside_exe.filter(|p| p.exists()) {
+                    dir
+                } else if let Some(dir) = macos_bundle_data_dir() {
+                    dir
+                } else {
+                    PathBuf::from("gateway-data")
+                }
             } else if let Some(dir) = macos_bundle_data_dir() {
                 dir
             } else {

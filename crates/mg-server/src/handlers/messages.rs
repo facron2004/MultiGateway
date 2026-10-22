@@ -567,6 +567,18 @@ async fn aggregate(
     .into_response()
 }
 
+pub async fn provider_messages(
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut req): Json<MessagesRequest>,
+) -> Response {
+    if !req.model.contains('/') {
+        req.model = format!("{}/{}", provider, req.model);
+    }
+    messages(State(state), headers, Json(req)).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -924,6 +936,35 @@ mod tests {
         let row = &board["rows"][0];
         assert_eq!(row["status"], "failed", "{row}");
         assert_eq!(row["http_status"], 502, "{row}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn provider_messages_prefixes_model() {
+        let dir = temp_dir();
+        let chunks = vec![chunk(
+            ChunkDelta {
+                content: Some("plain answer".to_string()),
+                ..ChunkDelta::default()
+            },
+            Some(usage()),
+        )];
+
+        let mut req = request(false);
+        req.model = "model-a".to_string();
+
+        let response = super::provider_messages(
+            axum::extract::Path("test".to_string()),
+            State(state(&dir, chunks)),
+            headers(),
+            axum::Json(req),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["model"], "test/model-a");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

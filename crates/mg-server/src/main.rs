@@ -192,8 +192,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }))
         }))
         // Grouped provider prefix routes
-        .route("/:provider/v1/chat/completions", post(handlers::chat_completions))
-        .route("/:provider/v1/messages", post(handlers::messages))
+        .route("/:provider/v1/chat/completions", post(handlers::provider_chat_completions))
+        .route("/:provider/v1/messages", post(handlers::provider_messages))
+        .route("/:provider/v1/responses", post(handlers::provider_responses))
         .route("/:provider/v1/models", get(handlers::list_provider_models))
         // Agent contexts and base64 image inputs routinely exceed Axum's 2MB default.
         .layer(DefaultBodyLimit::max(MAX_INFERENCE_BODY_BYTES))

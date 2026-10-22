@@ -170,6 +170,7 @@ fn set_auto_start(_: &Config, enabled: bool) -> io::Result<()> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -184,6 +185,7 @@ fn xml_escape(text: &str) -> String {
     escaped
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn launch_agent_plist(arguments: &[String]) -> String {
     let mut body = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
