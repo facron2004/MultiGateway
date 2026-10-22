@@ -1,0 +1,31 @@
+[package]
+name = "mg-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mg-core.workspace = true
+mg-protocols.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+eventsource-stream.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+base64.workspace = true
+rand.workspace = true
+aes.workspace = true
+md-5.workspace = true
+rsa.workspace = true
+url.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true
