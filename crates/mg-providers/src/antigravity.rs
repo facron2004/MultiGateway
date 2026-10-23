@@ -640,22 +640,68 @@ impl AntigravityProvider {
         }
     }
 
-    async fn ensure_fresh_token(&self, account: &mut Account) -> Result<String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        fn token_needs_refresh(account: &Account) -> bool {
+        account.access_token.is_empty()
+            || account.expires_at
+                <= SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    + 300.0
+    }
 
-        if account.expires_at > now + 300.0 && !account.access_token.is_empty() {
+    async fn ensure_fresh_token(&self, account: &mut Account) -> Result<String> {
+        if !Self::token_needs_refresh(account) {
             return Ok(account.access_token.clone());
         }
-
+        // Refresh tokens can rotate; serialize per account and re-read after
+        // waiting so two requests never exchange the same token at once.
+        let lock = self.pool.refresh_lock(&account.id);
+        let _guard = lock.lock().await;
+        if let Some(current) = self.pool.get(&account.id) {
+            *account = current;
+        }
+        if !Self::token_needs_refresh(account) {
+            return Ok(account.access_token.clone());
+        }
         if account.refresh_token.is_empty() {
             if !account.access_token.is_empty() {
                 return Ok(account.access_token.clone());
             }
             return Err(MgError::unauthorized("Account has no refresh token"));
         }
+        match self.exchange_fresh_token(account).await {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                if matches!(error.status_code(), 401 | 403) {
+                    self.pool.set_credential_invalid(
+                        &account.id,
+                        "凭证已失效，请重新登录 Antigravity 账号",
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn refresh_after_401(&self, account: &mut Account, failed_token: &str) -> Result<()> {
+        let lock = self.pool.refresh_lock(&account.id);
+        let _guard = lock.lock().await;
+        if let Some(current) = self.pool.get(&account.id) {
+            *account = current;
+            if account.access_token != failed_token && !Self::token_needs_refresh(account) {
+                return Ok(());
+            }
+        }
+        self.exchange_fresh_token(account).await?;
+        Ok(())
+    }
+
+    async fn exchange_fresh_token(&self, account: &mut Account) -> Result<String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
 
         let params = [
             ("grant_type", "refresh_token"),
@@ -913,7 +959,7 @@ impl Provider for AntigravityProvider {
         session_id: Option<&str>,
     ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
         let mut account = self.pool.choose(session_id, None)?;
-        let token = self.ensure_fresh_token(&mut account).await?;
+        let mut token = self.ensure_fresh_token(&mut account).await?;
         let project_id = self
             .discover_project_id(&token, &mut account)
             .await
@@ -949,87 +995,128 @@ impl Provider for AntigravityProvider {
         // when the re-probe interval has elapsed, so an unreachable dev host
         // costs at most one bounded connect attempt per interval instead of
         // stalling every single request.
-        let now = unix_now_secs();
-        let probe_daily = DAILY_HOST_BROKEN.load(Ordering::Relaxed) == 0
-            || now >= DAILY_HOST_RETRY_AT.load(Ordering::Relaxed);
+        let mut refreshed = false;
+        let response = loop {
+            let now = unix_now_secs();
+            let probe_daily = DAILY_HOST_BROKEN.load(Ordering::Relaxed) == 0
+                || now >= DAILY_HOST_RETRY_AT.load(Ordering::Relaxed);
 
-        let mut daily_res: Option<reqwest::Result<reqwest::Response>> = None;
-        if probe_daily {
-            let primary_url = format!("{}{}", HOST_DAILY, STREAM_GENERATE);
-            let attempt = self
-                .stream_client
-                .post(&primary_url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("User-Agent", USER_AGENT)
-                .header("Accept", "text/event-stream")
-                .json(&envelope)
-                .send()
-                .await;
-
-            // Only transport/connect errors and 5xx justify a second host; a 4xx
-            // means the request itself was rejected and must not be double-sent.
-            let retryable = match &attempt {
-                Ok(response) => response.status().is_server_error(),
-                Err(_) => true,
-            };
-            if retryable {
-                DAILY_HOST_BROKEN.store(1, Ordering::Relaxed);
-                DAILY_HOST_RETRY_AT.store(
-                    now.saturating_add(DAILY_PROBE_INTERVAL_SECS),
-                    Ordering::Relaxed,
-                );
-            } else {
-                DAILY_HOST_BROKEN.store(0, Ordering::Relaxed);
-                daily_res = Some(attempt);
-            }
-        }
-
-        // Fallback to prod host if daily failed with a retryable error
-        // (or was skipped because it is known-broken).
-        let res = match daily_res {
-            Some(res) => res,
-            None => {
-                let prod_url = format!("{}{}", HOST_PROD, STREAM_GENERATE);
-                self.stream_client
-                    .post(&prod_url)
+            let mut daily_res: Option<reqwest::Result<reqwest::Response>> = None;
+            if probe_daily {
+                let primary_url = format!("{}{}", HOST_DAILY, STREAM_GENERATE);
+                let attempt = self
+                    .stream_client
+                    .post(&primary_url)
                     .header("Authorization", format!("Bearer {}", token))
                     .header("User-Agent", USER_AGENT)
                     .header("Accept", "text/event-stream")
                     .json(&envelope)
                     .send()
-                    .await
+                    .await;
+
+                // Only transport/connect errors and 5xx justify a second host; a 4xx
+                // means the request itself was rejected and must not be double-sent.
+                let retryable = match &attempt {
+                    Ok(response) => response.status().is_server_error(),
+                    Err(_) => true,
+                };
+                if retryable {
+                    DAILY_HOST_BROKEN.store(1, Ordering::Relaxed);
+                    DAILY_HOST_RETRY_AT.store(
+                        now.saturating_add(DAILY_PROBE_INTERVAL_SECS),
+                        Ordering::Relaxed,
+                    );
+                } else {
+                    DAILY_HOST_BROKEN.store(0, Ordering::Relaxed);
+                    daily_res = Some(attempt);
+                }
             }
+
+            // Fallback to prod host if daily failed with a retryable error
+            // (or was skipped because it is known-broken).
+            let res = match daily_res {
+                Some(res) => res,
+                None => {
+                    let prod_url = format!("{}{}", HOST_PROD, STREAM_GENERATE);
+                    self.stream_client
+                        .post(&prod_url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("User-Agent", USER_AGENT)
+                        .header("Accept", "text/event-stream")
+                        .json(&envelope)
+                        .send()
+                        .await
+                }
+            };
+
+            let response = res.map_err(|e| {
+                MgError::provider(
+                    502,
+                    format!("Antigravity upstream error: {}", e),
+                    "network_error",
+                )
+            })?;
+
+            if matches!(response.status().as_u16(), 401 | 403)
+                && !refreshed
+                && !account.refresh_token.is_empty()
+            {
+                refreshed = true;
+                let failed_token = account.access_token.clone();
+                match self.refresh_after_401(&mut account, &failed_token).await {
+                    Ok(_) => {
+                        token = account.access_token.clone();
+                        continue;
+                    }
+                    Err(error) => {
+                        if matches!(error.status_code(), 401 | 403) {
+                            self.pool.set_credential_invalid(
+                                &account.id,
+                                "凭证已失效，请重新登录 Antigravity 账号",
+                            );
+                        } else {
+                            self.pool.set_error(&account.id, &error.message());
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if matches!(status, 401 | 403) {
+                    self.pool.set_credential_invalid(
+                        &account.id,
+                        "凭证已失效，请重新登录 Antigravity 账号",
+                    );
+                    return Err(MgError::provider(
+                        401,
+                        "Antigravity 账号凭证已失效，请重新登录后再试",
+                        "credential_invalid",
+                    ));
+                }
+                // This is the FINAL attempt for the account (the intermediate daily-host
+                // probe only sets a flag and falls through to prod, so it never reaches
+                // here). Only an account-level status should bench the account.
+                if crate::is_account_level_failure(status) {
+                    self.pool
+                        .mark_cooldown(&account.id, crate::ACCOUNT_COOLDOWN_SECS);
+                    self.pool
+                        .set_error(&account.id, &format!("upstream HTTP {}", status));
+                }
+                return Err(MgError::provider(
+                    status,
+                    format!(
+                        "Antigravity rejected request: {}",
+                        crate::upstream_error_body(status, &body)
+                    ),
+                    "upstream_error",
+                ));
+            }
+
+            break response;
         };
-
-        let response = res.map_err(|e| {
-            MgError::provider(
-                502,
-                format!("Antigravity upstream error: {}", e),
-                "network_error",
-            )
-        })?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            // This is the FINAL attempt for the account (the intermediate daily-host
-            // probe only sets a flag and falls through to prod, so it never reaches
-            // here). Only an account-level status should bench the account.
-            if crate::is_account_level_failure(status) {
-                self.pool
-                    .mark_cooldown(&account.id, crate::ACCOUNT_COOLDOWN_SECS);
-                self.pool
-                    .set_error(&account.id, &format!("upstream HTTP {}", status));
-            }
-            return Err(MgError::provider(
-                status,
-                format!(
-                    "Antigravity rejected request: {}",
-                    crate::upstream_error_body(status, &body)
-                ),
-                "upstream_error",
-            ));
-        }
 
         let chunk_id: Arc<str> = Arc::from(format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
         let model_name: Arc<str> = Arc::from(model_name);
@@ -1069,25 +1156,64 @@ impl Provider for AntigravityProvider {
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
 
-        let token = self.ensure_fresh_token(&mut account).await?;
+        let mut token = self.ensure_fresh_token(&mut account).await?;
         let project = self.discover_project_id(&token, &mut account).await?;
         let url = format!("{}{}", HOST_PROD, FETCH_MODELS);
-        let res = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("User-Agent", USER_AGENT)
-            .json(&if project.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::json!({"project": project})
-            })
-            .send()
-            .await
-            .map_err(|e| MgError::provider(502, e.to_string(), "network_error"))?;
+        let mut refreshed = false;
+        let res = loop {
+            let res = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("User-Agent", USER_AGENT)
+                .json(&if project.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({"project": project})
+                })
+                .send()
+                .await
+                .map_err(|e| MgError::provider(502, e.to_string(), "network_error"))?;
+            if matches!(res.status().as_u16(), 401 | 403)
+                && !refreshed
+                && !account.refresh_token.is_empty()
+            {
+                refreshed = true;
+                let failed_token = account.access_token.clone();
+                match self.refresh_after_401(&mut account, &failed_token).await {
+                    Ok(_) => {
+                        token = account.access_token.clone();
+                        continue;
+                    }
+                    Err(error) => {
+                        if matches!(error.status_code(), 401 | 403) {
+                            self.pool.set_credential_invalid(
+                                account_id,
+                                "凭证已失效，请重新登录 Antigravity 账号",
+                            );
+                        } else {
+                            self.pool.set_error(account_id, &error.message());
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            break res;
+        };
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 401 | 403) {
+                self.pool.set_credential_invalid(
+                    account_id,
+                    "凭证已失效，请重新登录 Antigravity 账号",
+                );
+                return Err(MgError::provider(
+                    401,
+                    "Antigravity 账号凭证已失效，请重新登录后再试",
+                    "credential_invalid",
+                ));
+            }
             if crate::is_account_level_failure(status.as_u16()) {
                 self.pool
                     .mark_cooldown(account_id, crate::ACCOUNT_COOLDOWN_SECS);
@@ -1156,9 +1282,24 @@ impl Provider for AntigravityProvider {
 mod tests {
     use super::{
         consolidate_models, enrich_antigravity_model, family_key, is_internal_antigravity_model,
-        parse_antigravity_quota, resolve_upstream_model, ModelEntry,
+        parse_antigravity_quota, resolve_upstream_model, AntigravityProvider, ModelEntry,
     };
     use serde_json::json;
+
+    #[test]
+    fn refreshes_oauth_tokens_before_they_expire() {
+        let mut account: mg_core::Account = serde_json::from_value(json!({
+            "id": "antigravity-test",
+            "access_token": "a",
+            "expires_at": mg_core::now_secs() + 3600.0
+        }))
+        .unwrap();
+        assert!(!AntigravityProvider::token_needs_refresh(&account));
+        account.expires_at = mg_core::now_secs() + 60.0;
+        assert!(AntigravityProvider::token_needs_refresh(&account));
+        account.access_token.clear();
+        assert!(AntigravityProvider::token_needs_refresh(&account));
+    }
 
     #[test]
     fn parses_model_remaining_fractions_and_rejects_missing_quota() {

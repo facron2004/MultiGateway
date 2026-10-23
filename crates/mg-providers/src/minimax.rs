@@ -157,16 +157,30 @@ impl MiniMaxProvider {
         }
     }
 
-    async fn ensure_fresh_token(&self, account: &mut Account) -> Result<String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+    fn token_needs_refresh(account: &Account) -> bool {
+        account.access_token.is_empty()
+            || account.expires_at
+                <= SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    + 300.0
+    }
 
-        if account.expires_at > now + 300.0 && !account.access_token.is_empty() {
+    async fn ensure_fresh_token(&self, account: &mut Account) -> Result<String> {
+        if !Self::token_needs_refresh(account) {
             return Ok(account.access_token.clone());
         }
-
+        // Refresh tokens can rotate; serialize per account and re-read after
+        // waiting so two requests never exchange the same token at once.
+        let lock = self.pool.refresh_lock(&account.id);
+        let _guard = lock.lock().await;
+        if let Some(current) = self.pool.get(&account.id) {
+            *account = current;
+        }
+        if !Self::token_needs_refresh(account) {
+            return Ok(account.access_token.clone());
+        }
         if account.refresh_token.is_empty() {
             if !account.access_token.is_empty() {
                 return Ok(account.access_token.clone());
@@ -175,6 +189,36 @@ impl MiniMaxProvider {
                 "MiniMax account has no refresh token",
             ));
         }
+        match self.exchange_fresh_token(account).await {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                if matches!(error.status_code(), 401 | 403) {
+                    self.pool
+                        .set_credential_invalid(&account.id, "凭证已失效，请重新登录 MiniMax 账号");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn refresh_after_401(&self, account: &mut Account, failed_token: &str) -> Result<()> {
+        let lock = self.pool.refresh_lock(&account.id);
+        let _guard = lock.lock().await;
+        if let Some(current) = self.pool.get(&account.id) {
+            *account = current;
+            if account.access_token != failed_token && !Self::token_needs_refresh(account) {
+                return Ok(());
+            }
+        }
+        self.exchange_fresh_token(account).await?;
+        Ok(())
+    }
+
+    async fn exchange_fresh_token(&self, account: &mut Account) -> Result<String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
 
         let auth_base = self.auth_url(&account.region);
         let url = format!("{}/oauth2/token", auth_base);
@@ -353,7 +397,7 @@ impl Provider for MiniMaxProvider {
         let mut account = self
             .pool
             .choose_in_region(session_id, None, Some(&region))?;
-        let token = self.ensure_fresh_token(&mut account).await?;
+        self.ensure_fresh_token(&mut account).await?;
         let agent_base = self.agent_url(&account.region);
 
         let url = format!("{}/mavis/api/v1/llm/v1/messages", agent_base);
@@ -399,30 +443,70 @@ impl Provider for MiniMaxProvider {
             "top_p": req.top_p,
         });
 
-        let res = self
-            .stream_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("x-api-key", "sk-xxx")
-            .header("anthropic-version", "2023-06-01")
-            .header("User-Agent", "MiniMaxAgent")
-            .header("X-Mavis-Agent-Id", "main")
-            .header("X-Mavis-Session-Id", session_str)
-            .header("Accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                MgError::provider(
-                    502,
-                    format!("MiniMax upstream error: {}", e),
-                    "network_error",
+        let mut refreshed = false;
+        let res = loop {
+            let res = self
+                .stream_client
+                .post(&url)
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", account.access_token),
                 )
-            })?;
+                .header("x-api-key", "sk-xxx")
+                .header("anthropic-version", "2023-06-01")
+                .header("User-Agent", "MiniMaxAgent")
+                .header("X-Mavis-Agent-Id", "main")
+                .header("X-Mavis-Session-Id", session_str)
+                .header("Accept", "text/event-stream")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    MgError::provider(
+                        502,
+                        format!("MiniMax upstream error: {}", e),
+                        "network_error",
+                    )
+                })?;
+
+            if matches!(res.status().as_u16(), 401 | 403)
+                && !refreshed
+                && !account.refresh_token.is_empty()
+            {
+                refreshed = true;
+                let failed_token = account.access_token.clone();
+                match self.refresh_after_401(&mut account, &failed_token).await {
+                    Ok(_) => continue,
+                    Err(error) => {
+                        if matches!(error.status_code(), 401 | 403) {
+                            self.pool.set_credential_invalid(
+                                &account.id,
+                                "凭证已失效，请重新登录 MiniMax 账号",
+                            );
+                        } else {
+                            self.pool.set_error(&account.id, &error.message());
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            break res;
+        };
 
         if !res.status().is_success() {
             let status = res.status().as_u16();
             let body_text = res.text().await.unwrap_or_default();
+            if matches!(status, 401 | 403) {
+                self.pool.set_credential_invalid(
+                    &account.id,
+                    "凭证已失效，请重新登录 MiniMax 账号",
+                );
+                return Err(MgError::provider(
+                    401,
+                    "MiniMax 账号凭证已失效，请重新登录后再试",
+                    "credential_invalid",
+                ));
+            }
             if crate::is_account_level_failure(status) {
                 self.pool
                     .mark_cooldown(&account.id, crate::ACCOUNT_COOLDOWN_SECS);
@@ -573,8 +657,23 @@ impl Provider for MiniMaxProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::minimax_model_entries;
+    use super::{minimax_model_entries, MiniMaxProvider};
     use serde_json::json;
+
+    #[test]
+    fn refreshes_oauth_tokens_before_they_expire() {
+        let mut account: mg_core::Account = serde_json::from_value(json!({
+            "id": "minimax-test",
+            "access_token": "a",
+            "expires_at": mg_core::now_secs() + 3600.0
+        }))
+        .unwrap();
+        assert!(!MiniMaxProvider::token_needs_refresh(&account));
+        account.expires_at = mg_core::now_secs() + 60.0;
+        assert!(MiniMaxProvider::token_needs_refresh(&account));
+        account.access_token.clear();
+        assert!(MiniMaxProvider::token_needs_refresh(&account));
+    }
 
     #[test]
     fn reads_minimax_catalog_in_upstream_order_then_sorts_remaining_models() {
