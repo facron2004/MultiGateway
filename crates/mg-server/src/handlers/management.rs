@@ -343,12 +343,20 @@ pub async fn provider_enable_account(
         )))
     });
 
-    if let Some(mut acc) = pool.get(&payload.id) {
-        if let Some(en) = payload.enabled {
-            acc.enabled = en;
-            let _ = pool.save(acc);
-            return Json(serde_json::json!({ "ok": true })).into_response();
-        }
+    if let Some(en) = payload.enabled {
+        return match pool.update(&payload.id, |acc| acc.enabled = en) {
+            Ok(Some(_)) => Json(serde_json::json!({ "ok": true })).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(MgError::not_found("Account not found").to_openai_json()),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error.to_openai_json()),
+            )
+                .into_response(),
+        };
     }
 
     (
@@ -518,45 +526,65 @@ pub async fn provider_batch(
 
         match payload.operation.as_str() {
             "enable" => {
-                let mut updated = acc.clone();
-                updated.enabled = true;
-                if pool.save(updated).is_ok() {
-                    succeeded += 1;
-                    results.push(serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "ok": true,
-                        "message": "账号已启用"
-                    }));
-                } else {
-                    failed += 1;
-                    results.push(serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "ok": false,
-                        "message": "保存失败"
-                    }));
+                match pool.update(&id, |updated| updated.enabled = true) {
+                    Ok(Some(_)) => {
+                        succeeded += 1;
+                        results.push(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "ok": true,
+                            "message": "账号已启用"
+                        }));
+                    }
+                    Ok(None) => {
+                        failed += 1;
+                        results.push(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "ok": false,
+                            "message": "账号已不存在"
+                        }));
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        results.push(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "ok": false,
+                            "message": "保存失败"
+                        }));
+                    }
                 }
             }
             "disable" => {
-                let mut updated = acc.clone();
-                updated.enabled = false;
-                if pool.save(updated).is_ok() {
-                    succeeded += 1;
-                    results.push(serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "ok": true,
-                        "message": "账号已停用"
-                    }));
-                } else {
-                    failed += 1;
-                    results.push(serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "ok": false,
-                        "message": "保存失败"
-                    }));
+                match pool.update(&id, |updated| updated.enabled = false) {
+                    Ok(Some(_)) => {
+                        succeeded += 1;
+                        results.push(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "ok": true,
+                            "message": "账号已停用"
+                        }));
+                    }
+                    Ok(None) => {
+                        failed += 1;
+                        results.push(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "ok": false,
+                            "message": "账号已不存在"
+                        }));
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        results.push(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "ok": false,
+                            "message": "保存失败"
+                        }));
+                    }
                 }
             }
             "credits" => match provider.refresh_quota(&id).await {
