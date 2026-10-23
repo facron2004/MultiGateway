@@ -1,3 +1,4 @@
+use crate::account::restrict_private_file;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -129,6 +130,14 @@ impl KeyManager {
             master_key,
             keys: RwLock::new(keys),
         };
+        for path in [
+            manager.path.clone(),
+            manager.path.with_extension("json.bak"),
+        ] {
+            if path.exists() {
+                restrict_private_file(&path);
+            }
+        }
         if imported && !manager.keys.read().is_empty() {
             manager.persist(&manager.keys.read())?;
         }
@@ -140,11 +149,14 @@ impl KeyManager {
             .path
             .with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
         let mut file = fs::File::create(&temporary)?;
+        restrict_private_file(&temporary);
         file.write_all(&serde_json::to_vec_pretty(keys)?)?;
         file.sync_all()?;
         drop(file);
         if self.path.exists() {
-            fs::copy(&self.path, self.path.with_extension("json.bak"))?;
+            let backup = self.path.with_extension("json.bak");
+            fs::copy(&self.path, &backup)?;
+            restrict_private_file(&backup);
         }
         fs::rename(temporary, &self.path)
     }
@@ -333,6 +345,25 @@ mod tests {
         assert_eq!(keys.list().len(), 1);
         assert_eq!(KeyManager::new(&dir, None).unwrap().list().len(), 1);
         assert!(keys.is_authorized(&existing.key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = directory();
+        let keys = KeyManager::new(&dir, None).unwrap();
+        keys.generate("private").unwrap();
+        keys.generate("second").unwrap();
+        for path in [
+            dir.join("api_keys.json"),
+            dir.join("api_keys.json.bak"),
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

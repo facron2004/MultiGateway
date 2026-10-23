@@ -521,9 +521,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_concurrent_delete_is_never_undone_on_disk_by_an_update() {
-        use super::AccountPool;
+    fn account_files_and_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_pool_dir("permissions");
+        let pool = AccountPool::new(&dir);
+        pool.save(ready_account("private")).unwrap();
+        let file_mode = std::fs::metadata(dir.join("private.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_concurrent_delete_is_never_undone_on_disk_by_an_update() {        use super::AccountPool;
 
         for attempt in 0..40 {
             let dir = temp_pool_dir(&format!("delete-race-{attempt}"));
@@ -670,9 +689,31 @@ pub fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
+fn ensure_private_dir(path: &std::path::Path) {
+    let _ = fs::create_dir_all(path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+pub(crate) fn restrict_private_file(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     let tmp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     fs::write(&tmp_path, contents).map_err(|e| MgError::Io(e.to_string()))?;
+    restrict_private_file(&tmp_path);
     if let Err(error) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(MgError::Io(error.to_string()));
@@ -845,6 +886,7 @@ impl AccountPool {
             round_robin_idx: AtomicUsize::new(0),
         };
         pool.reload();
+        ensure_private_dir(&pool.dir);
         pool.load_active_region();
         pool
     }
@@ -1175,7 +1217,7 @@ impl AccountPool {
     /// Writes an account file atomically (tmp + rename) so a crash mid-write can
     /// never leave a truncated JSON that the next startup would fail to parse.
     fn persist(&self, account: &Account) -> Result<()> {
-        let _ = fs::create_dir_all(&self.dir);
+        ensure_private_dir(&self.dir);
         let path = self.dir.join(format!("{}.json", account.id));
 
         if !path.exists() {
