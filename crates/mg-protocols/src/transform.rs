@@ -1,7 +1,7 @@
 use crate::anthropic::MessagesRequest;
 use crate::gemini::{
-    GeminiContent, GeminiEnvelope, GeminiFunctionCall, GeminiGenerationConfig, GeminiPart,
-    GeminiRequest, GeminiResponse, GeminiSystemInstruction, GeminiThinkingConfig,
+    GeminiContent, GeminiEnvelope, GeminiFunctionCall, GeminiGenerationConfig, GeminiInlineData,
+    GeminiPart, GeminiRequest, GeminiResponse, GeminiSystemInstruction, GeminiThinkingConfig,
 };
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatMessage, ChatUsage, ChunkChoice, ChunkDelta,
@@ -105,6 +105,8 @@ pub fn anthropic_to_chat(req: MessagesRequest) -> Result<ChatCompletionRequest> 
             }
             serde_json::Value::Array(blocks) => {
                 let mut text_parts = Vec::new();
+                let mut content_parts = Vec::new();
+                let mut has_image = false;
                 let mut tool_calls = Vec::new();
 
                 for block in blocks {
@@ -113,6 +115,16 @@ pub fn anthropic_to_chat(req: MessagesRequest) -> Result<ChatCompletionRequest> 
                         "text" => {
                             if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
                                 text_parts.push(t.to_string());
+                                content_parts
+                                    .push(serde_json::json!({"type": "text", "text": t}));
+                            }
+                        }
+                        "image" => {
+                            if let Some(url) = image_url(&block) {
+                                has_image = true;
+                                content_parts.push(
+                                    serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
+                                );
                             }
                         }
                         "tool_use" => {
@@ -157,8 +169,10 @@ pub fn anthropic_to_chat(req: MessagesRequest) -> Result<ChatCompletionRequest> 
                     }
                 }
 
-                if !text_parts.is_empty() || !tool_calls.is_empty() {
-                    let content_val = if !text_parts.is_empty() {
+                if !text_parts.is_empty() || !tool_calls.is_empty() || has_image {
+                    let content_val = if has_image {
+                        Some(serde_json::Value::Array(content_parts))
+                    } else if !text_parts.is_empty() {
                         Some(serde_json::Value::String(text_parts.join("\n")))
                     } else {
                         None
@@ -227,6 +241,104 @@ fn extract_text(val: &serde_json::Value) -> String {
             parts.join("\n")
         }
         _ => String::new(),
+    }
+}
+
+fn text_part(part: &serde_json::Value) -> Option<&str> {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("text" | "input_text" | "output_text") => {
+            part.get("text").and_then(serde_json::Value::as_str)
+        }
+        _ => None,
+    }
+}
+
+/// Extracts an image URL from OpenAI (`image_url`/`input_image`) and Anthropic
+/// (`image.source`) content parts. Base64 images become data URLs.
+fn image_url(part: &serde_json::Value) -> Option<String> {
+    if part.get("type").and_then(serde_json::Value::as_str) == Some("image") {
+        let source = part.get("source")?;
+        return match source
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "base64" => {
+                let media = source
+                    .get("media_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("image/png");
+                let data = source.get("data").and_then(serde_json::Value::as_str)?;
+                Some(format!("data:{media};base64,{data}"))
+            }
+            "url" => source
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        };
+    }
+    if !matches!(
+        part.get("type").and_then(serde_json::Value::as_str),
+        Some("image_url" | "input_image")
+    ) {
+        return None;
+    }
+    part.pointer("/image_url/url")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| part.get("image_url").and_then(serde_json::Value::as_str))
+        .or_else(|| part.get("url").and_then(serde_json::Value::as_str))
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+fn gemini_inline_image(part: &serde_json::Value) -> Option<(String, String)> {
+    let url = image_url(part)?;
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let mime = meta.strip_suffix(";base64")?;
+    if mime.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((mime.to_string(), data.to_string()))
+}
+
+/// Converts a message content value into OpenAI chat content, preserving text
+/// and image parts in order when any image is present.
+fn openai_content(content: &serde_json::Value) -> Option<serde_json::Value> {
+    match content {
+        serde_json::Value::String(text) if !text.is_empty() => {
+            Some(serde_json::Value::String(text.clone()))
+        }
+        serde_json::Value::Array(parts) => {
+            let mut converted = Vec::new();
+            let mut has_image = false;
+            for part in parts {
+                if let Some(text) = text_part(part) {
+                    if !text.is_empty() {
+                        converted.push(serde_json::json!({"type": "text", "text": text}));
+                    }
+                } else if let Some(url) = image_url(part) {
+                    has_image = true;
+                    converted.push(
+                        serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
+                    );
+                }
+            }
+            if has_image {
+                Some(serde_json::Value::Array(converted))
+            } else if converted.is_empty() {
+                None
+            } else {
+                let text = extract_text(content);
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::String(text))
+                }
+            }
+        }
+        _ => None,
     }
 }
 
@@ -354,11 +466,10 @@ pub fn responses_to_chat(req: ResponsesRequest) -> Result<ChatCompletionRequest>
                         let role = map.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                         let role = if role == "developer" { "system" } else { role };
                         let content = map.get("content").or_else(|| map.get("text"));
-                        let text = content.map(extract_text).unwrap_or_default();
-                        if !text.is_empty() {
+                        if let Some(content) = content.and_then(openai_content) {
                             messages.push(ChatMessage {
                                 role: role.to_string(),
-                                content: Some(serde_json::Value::String(text)),
+                                content: Some(content),
                                 name: None,
                                 tool_calls: None,
                                 tool_call_id: None,
@@ -437,12 +548,32 @@ pub fn chat_to_gemini(
         let mut parts = Vec::new();
 
         if let Some(c) = &msg.content {
-            let text = extract_text(c);
-            if !text.is_empty() {
-                parts.push(GeminiPart::Text {
-                    text,
-                    thought: None,
-                });
+            match c {
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        if let Some(text) = text_part(item) {
+                            if !text.is_empty() {
+                                parts.push(GeminiPart::Text {
+                                    text: text.to_string(),
+                                    thought: None,
+                                });
+                            }
+                        } else if let Some((mime_type, data)) = gemini_inline_image(item) {
+                            parts.push(GeminiPart::InlineData {
+                                inline_data: GeminiInlineData { mime_type, data },
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    let text = extract_text(c);
+                    if !text.is_empty() {
+                        parts.push(GeminiPart::Text {
+                            text,
+                            thought: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -620,6 +751,74 @@ mod tests {
         }))
         .unwrap();
         responses_to_chat(req).unwrap()
+    }
+
+    #[test]
+    fn anthropic_images_become_openai_image_parts() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3-flash",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this screenshot?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aGk="
+                    }}
+                ]
+            }]
+        }))
+        .unwrap();
+        let chat = anthropic_to_chat(req).unwrap();
+        assert_eq!(
+            chat.messages[0].content,
+            Some(serde_json::json!([
+                {"type": "text", "text": "what is in this screenshot?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+            ]))
+        );
+    }
+
+    #[test]
+    fn responses_input_images_reach_chat_content() {
+        let chat = converted(serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "input_text", "text": "look at this"},
+                {"type": "input_image", "image_url": "https://example.com/a.png"}
+            ]}
+        ]));
+        assert_eq!(
+            chat.messages[0].content,
+            Some(serde_json::json!([
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+            ]))
+        );
+    }
+
+    #[test]
+    fn gemini_request_inlines_base64_images() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3-flash",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Zm9v"}}
+            ]}]
+        }))
+        .unwrap();
+        let body = serde_json::to_value(chat_to_gemini(&req, None).unwrap()).unwrap();
+        assert_eq!(
+            body["request"]["contents"][0]["parts"][0]["text"],
+            "describe this"
+        );
+        assert_eq!(
+            body["request"]["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+            "image/jpeg"
+        );
+        assert_eq!(
+            body["request"]["contents"][0]["parts"][1]["inlineData"]["data"],
+            "Zm9v"
+        );
     }
 
     #[test]
