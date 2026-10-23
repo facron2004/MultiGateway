@@ -93,6 +93,34 @@ async fn local_management_only(
     next.run(request).await
 }
 
+/// `KeyManager` intentionally allows keyless access before the first API key is
+/// created, which is convenient on loopback but turns a `0.0.0.0` listener into
+/// an open proxy. Remote inference therefore requires at least one configured
+/// key; `/health` stays public for monitoring.
+async fn inference_remote_auth(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if !peer.ip().is_loopback()
+        && path != "/health"
+        && !state.key_manager.auth_required()
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Create an API key before exposing inference to the network"
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "High Performance Multi-Account AI Reverse Proxy Gateway in Rust")]
 struct Args {
@@ -256,7 +284,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/:provider/v1/models", get(handlers::list_provider_models))
         // Agent contexts and base64 image inputs routinely exceed Axum's 2MB default.
         .layer(DefaultBodyLimit::max(MAX_INFERENCE_BODY_BYTES))
-        .layer(inference_cors);
+        .layer(inference_cors)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            inference_remote_auth,
+        ));
 
     let dashboard = Router::new()
         // Dashboard and static assets
