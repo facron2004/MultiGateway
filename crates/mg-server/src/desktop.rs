@@ -220,19 +220,19 @@ fn launch_agent_plist(arguments: &[String]) -> String {
 mod tests {
     use super::{load, startup_command};
     use mg_core::Config;
-    use std::path::Path;
 
     #[test]
     fn startup_command_preserves_executable_and_data_paths_with_spaces() {
+        let executable = std::env::temp_dir().join("MG Rust").join("MultiGateway.exe");
         let config = Config {
-            data_dir: Path::new(r"E:\User Data\Gateway").into(),
+            data_dir: std::env::temp_dir().join("User Data").join("Gateway"),
             port: 8792,
             ..Config::default()
         };
-        let command = startup_command(&config, Path::new(r"E:\MG Rust\MultiGateway.exe")).unwrap();
-        assert!(command.starts_with("\"E:\\MG Rust\\MultiGateway.exe\" "));
+        let command = startup_command(&config, &executable).unwrap();
+        assert!(command.starts_with(&format!("\"{}\" ", executable.display())));
         assert!(command.contains("--port 8792"));
-        assert!(command.ends_with("--data-dir \"E:\\User Data\\Gateway\""));
+        assert!(command.ends_with(&format!("--data-dir \"{}\"", config.data_dir.display())));
         let settings = load(&std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap();
         assert!(settings.close_to_tray);
         assert!(!settings.auto_start);
