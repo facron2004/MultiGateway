@@ -52,10 +52,10 @@ Version **0.11.2** is the Rust gateway. The Tauri 2 desktop window, tray, and we
 
 | Provider | Regions | Check-in | Notes |
 | --- | --- | --- | --- |
-| **WorkBuddy** | China / International | China personal accounts | Quota query and credential refresh |
-| **Trae** | China / International | Yes | International catalog, credits, and check-in use the international hosts |
-| **MiniMax** | China / International | No | Credential refresh; Token Plan quota needs a Subscription Key |
-| **Qoder** | China / International | When the region exposes it | Catalog includes credit factors; credentials can be refreshed |
+| **WorkBuddy** | China / International | China personal accounts | Quota query, account import, and credential refresh |
+| **Trae** | China / International | Yes | Account import; international catalog, credits, and check-in use the international hosts |
+| **MiniMax** | China / International | No | Account import and credential refresh; Token Plan quota needs a Subscription Key |
+| **Qoder** | China / International | When the region exposes it | Account import; catalog includes credit factors; credentials can be refreshed |
 | **Antigravity** | Single region | No | Account import and credential refresh |
 | **Grok** | Single region | No | Account import, quota query, and credential refresh |
 | **GitHub Copilot** | Single region | No | GitHub device-code login, then a short-lived Copilot token |

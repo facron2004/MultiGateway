@@ -1502,11 +1502,12 @@ impl Provider for TraeProvider {
 
     fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({
+            "login": false,
             "credentials": true,
             "credits": true,
             "checkin": true,
             "regions": true,
-            "import": false
+            "import": true
         })
     }
 

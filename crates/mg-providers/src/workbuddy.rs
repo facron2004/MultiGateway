@@ -1322,11 +1322,12 @@ impl Provider for WorkBuddyProvider {
 
     fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({
+            "login": true,
             "credentials": true,
             "credits": true,
             "checkin": true,
             "regions": true,
-            "import": false
+            "import": true
         })
     }
 

@@ -309,8 +309,8 @@ impl Provider for MiniMaxProvider {
 
     fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({
-            "login": true,
-            "import": false,
+            "login": false,
+            "import": true,
             "credits": false,
             "regions": true,
             "checkin": false,

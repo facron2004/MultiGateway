@@ -918,7 +918,7 @@ impl Provider for AntigravityProvider {
 
     fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({
-            "login": true,
+            "login": false,
             "import": true,
             "credits": true,
             "regions": false,

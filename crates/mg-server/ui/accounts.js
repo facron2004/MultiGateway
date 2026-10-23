@@ -121,8 +121,22 @@ export function bindAccounts(state, refresh, mutate, closeMenus) {
     clearTimeout(pollTimer);
     loginContext = null;
   });
+  function openImport() {
+    if (!state.current) return;
+    $("import-title").textContent = "导入 " + names[state.provider] + " 账号";
+    $("import-data").value = "";
+    $("import-dialog").dataset.provider = state.provider;
+    $("import-dialog").showModal();
+  }
+
   $("add-account").onclick = () => {
     if (!state.current) return;
+    // Providers without a browser OAuth flow (Trae/Qoder/MiniMax/Grok/
+    // Antigravity) import exported credentials instead of polling forever.
+    if (state.current.capabilities.login === false) {
+      openImport();
+      return;
+    }
     epoch++;
     loginContext = { provider: state.provider, epoch };
     $("account-dialog-title").textContent =
@@ -222,10 +236,7 @@ export function bindAccounts(state, refresh, mutate, closeMenus) {
   };
   $("import-account").onclick = () => {
     closeMenus();
-    $("import-title").textContent = "导入 " + names[state.provider] + " 账号";
-    $("import-data").value = "";
-    $("import-dialog").dataset.provider = state.provider;
-    $("import-dialog").showModal();
+    openImport();
   };
   $("import-dialog").addEventListener("close", () => {
     $("import-data").value = "";
