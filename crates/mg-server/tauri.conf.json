@@ -19,7 +19,7 @@
     }
   },
   "bundle": {
-    "icon": ["ui/favicon.ico"],
+    "icon": ["ui/favicon.ico", "ui/icons/multigateway.png"],
     "shortDescription": "Multi-Account AI Reverse Proxy Gateway",
     "copyright": "Copyright (c) 2026 MultiGateway Authors"
   }
