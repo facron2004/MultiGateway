@@ -305,10 +305,12 @@ impl WorkBuddyProvider {
     /// request already refreshed while this one was in flight.
     async fn refresh_after_401(&self, account_id: &str, failed_token: &str) -> Result<()> {
         let lock = self.pool.refresh_lock(account_id);
-        let _guard = lock.lock().await;
-        if let Some(current) = self.pool.get(account_id) {
-            if current.access_token != failed_token && !Self::token_needs_refresh(&current) {
-                return Ok(());
+        {
+            let _guard = lock.lock().await;
+            if let Some(current) = self.pool.get(account_id) {
+                if current.access_token != failed_token && !Self::token_needs_refresh(&current) {
+                    return Ok(());
+                }
             }
         }
         self.refresh_credentials(account_id).await?;
@@ -323,11 +325,14 @@ impl WorkBuddyProvider {
         // re-read after waiting: a concurrent request may already have
         // refreshed the token, and exchanging the old one again would fail.
         let lock = self.pool.refresh_lock(&account.id);
-        let _guard = lock.lock().await;
-        let account = self.pool.get(&account.id).unwrap_or(account);
-        if !Self::token_needs_refresh(&account) {
-            return Ok(account);
-        }
+        let account = {
+            let _guard = lock.lock().await;
+            let account = self.pool.get(&account.id).unwrap_or(account);
+            if !Self::token_needs_refresh(&account) {
+                return Ok(account);
+            }
+            account
+        };
         let started_token = account.access_token.clone();
         match self.refresh_credentials(&account.id).await {
             Ok(_) => self
@@ -1879,6 +1884,8 @@ impl Provider for WorkBuddyProvider {
     }
 
     async fn refresh_credentials(&self, account_id: &str) -> Result<serde_json::Value> {
+        let lock = self.pool.refresh_lock(account_id);
+        let _guard = lock.lock().await;
         let account = self
             .pool
             .get(account_id)

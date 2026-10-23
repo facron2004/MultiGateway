@@ -1433,19 +1433,22 @@ impl TraeProvider {
         if !trae_token_needs_refresh(&account) || account.refresh_token.is_empty() {
             return Ok(account);
         }
-        let lock = self.pool.refresh_lock(&account.id);
-        let _guard = lock.lock().await;
-        let account = self.pool.get(&account.id).unwrap_or(account);
-        if !trae_token_needs_refresh(&account) {
-            return Ok(account);
+        let account_id = account.id.clone();
+        let lock = self.pool.refresh_lock(&account_id);
+        {
+            let _guard = lock.lock().await;
+            let current = self.pool.get(&account_id).unwrap_or(account);
+            if !trae_token_needs_refresh(&current) {
+                return Ok(current);
+            }
         }
-        match self.refresh_credentials(&account.id).await {
+        match self.refresh_credentials(&account_id).await {
             Ok(_) => self
                 .pool
-                .get(&account.id)
+                .get(&account_id)
                 .ok_or_else(|| MgError::not_found("Account not found")),
             Err(error) => {
-                self.pool.set_error(&account.id, &error.message());
+                self.pool.set_error(&account_id, &error.message());
                 Err(error)
             }
         }
@@ -1957,6 +1960,8 @@ impl Provider for TraeProvider {
     }
 
     async fn refresh_credentials(&self, account_id: &str) -> Result<serde_json::Value> {
+        let lock = self.pool.refresh_lock(account_id);
+        let _guard = lock.lock().await;
         let account = self
             .pool
             .get(account_id)
