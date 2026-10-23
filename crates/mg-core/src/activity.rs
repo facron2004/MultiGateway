@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 
 pub const MEMORY_ROWS: usize = 2000;
 
-/// Upper bound for `requests.jsonl`. Older lines are dropped at startup so the log
-/// cannot grow forever and slow down every subsequent launch.
+/// Upper bound for `requests.jsonl`. Older lines are dropped at startup and
+/// again once the live log exceeds the cap by `LOG_TRIM_SLACK` lines, so a
+/// long-running gateway cannot grow the file without bound.
 pub const MAX_LOG_LINES: usize = 20_000;
+const LOG_TRIM_SLACK: usize = 2_000;
 
 fn deserialize_flexible_f64_opt<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
 where
@@ -89,6 +91,8 @@ pub struct Activity {
     daily_accounts: RwLock<HashMap<(String, String), HashMap<String, DaySummary>>>,
     revision: AtomicU64,
     board_cache: RwLock<Option<(u64, HashMap<(String, String), String>, serde_json::Value)>>,
+    log_lock: std::sync::Mutex<()>,
+    log_lines: AtomicU64,
 }
 
 impl Activity {
@@ -102,6 +106,8 @@ impl Activity {
             daily_accounts: RwLock::new(HashMap::new()),
             revision: AtomicU64::new(0),
             board_cache: RwLock::new(None),
+            log_lock: std::sync::Mutex::new(()),
+            log_lines: AtomicU64::new(0),
         };
         activity.load_history();
         activity
@@ -113,16 +119,23 @@ impl Activity {
         };
 
         // map_while stops at the first read error; flatten() would keep retrying a
-        // persistently failing reader forever.
-        let mut lines: Vec<String> = BufReader::new(file).lines().map_while(Result::ok).collect();
-
-        // requests.jsonl grows without bound and is reparsed in full on every start,
-        // so trim it once here rather than paying that cost forever.
-        if lines.len() > MAX_LOG_LINES {
-            let dropped = lines.len() - MAX_LOG_LINES;
-            lines.drain(..dropped);
+        // persistently failing reader forever. Retain only the newest lines while
+        // reading so a pre-existing oversized log cannot exhaust memory.
+        let mut retained: VecDeque<String> = VecDeque::with_capacity(MAX_LOG_LINES);
+        let mut dropped = false;
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if retained.len() >= MAX_LOG_LINES {
+                retained.pop_front();
+                dropped = true;
+            }
+            retained.push_back(line);
+        }
+        let lines: Vec<String> = retained.into_iter().collect();
+        if dropped {
             self.rewrite_log(&lines);
         }
+        self.log_lines
+            .store(lines.len() as u64, Ordering::Relaxed);
 
         {
             let mut rows = self.rows.write();
@@ -320,15 +333,55 @@ impl Activity {
     }
 
     fn append_to_file(&self, record: &RequestRecord) {
-        if let Ok(json) = serde_json::to_string(record) {
-            if let Ok(mut file) = OpenOptions::new()
+        let Ok(json) = serde_json::to_string(record) else {
+            return;
+        };
+        // Serialize appends with compaction: a rewrite that read the file while
+        // another request appended could otherwise drop that request.
+        let over_capacity = {
+            let _guard = self
+                .log_lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let appended = match OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&self.path)
             {
-                let _ = writeln!(file, "{}", json);
+                Ok(mut file) => writeln!(file, "{}", json).is_ok(),
+                Err(_) => false,
+            };
+            if appended {
+                let lines = self.log_lines.fetch_add(1, Ordering::Relaxed) + 1;
+                lines > (MAX_LOG_LINES + LOG_TRIM_SLACK) as u64
+            } else {
+                false
             }
+        };
+        if over_capacity {
+            self.trim_log();
         }
+    }
+
+    fn trim_log(&self) {
+        let _guard = self
+            .log_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.log_lines.load(Ordering::Relaxed) <= (MAX_LOG_LINES + LOG_TRIM_SLACK) as u64 {
+            return;
+        }
+        let Ok(file) = File::open(&self.path) else {
+            return;
+        };
+        let mut lines: Vec<String> = BufReader::new(file).lines().map_while(Result::ok).collect();
+        if lines.len() > MAX_LOG_LINES {
+            let dropped = lines.len() - MAX_LOG_LINES;
+            lines.drain(..dropped);
+            self.rewrite_log(&lines);
+        }
+        self.log_lines
+            .store(lines.len() as u64, Ordering::Relaxed);
     }
 
     pub fn account_usage(&self, provider: &str) -> HashMap<String, DaySummary> {
@@ -605,6 +658,31 @@ mod tests {
             .unwrap();
         assert_eq!(today, 0);
         assert!(activity.account_usage("grok").is_empty());
+
+        drop(activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_log_is_compacted_once_it_exceeds_the_cap() {
+        let dir = temp_dir();
+        let path = dir.join("requests.jsonl");
+        std::fs::write(&path, "{}\n".repeat(MAX_LOG_LINES)).unwrap();
+        let activity = Activity::new(&dir);
+
+        let mut last_id = String::new();
+        for _ in 0..=super::LOG_TRIM_SLACK {
+            let record = activity.begin("qoder", "qoder-test", "chat", 8791, None);
+            last_id = record.id.clone();
+            activity.finish(record, 200, None, false);
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), MAX_LOG_LINES);
+        let last: super::RequestRecord =
+            serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+        assert_eq!(last.id, last_id);
+        assert_eq!(last.status, "success");
 
         drop(activity);
         let _ = std::fs::remove_dir_all(dir);
