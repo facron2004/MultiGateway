@@ -769,8 +769,46 @@ pub async fn provider_import(
         }
     };
 
-    match provider.import_accounts(payload.data).await {
-        Ok(v) => Json(v).into_response(),
+    let capabilities = provider.capabilities();
+    if capabilities.get("import").and_then(serde_json::Value::as_bool) != Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                MgError::bad_request(format!(
+                    "Provider '{}' does not support account import",
+                    provider_name
+                ))
+                .to_openai_json(),
+            ),
+        )
+            .into_response();
+    }
+
+    let pool = state.pool(&provider_name).unwrap_or_else(|| {
+        std::sync::Arc::new(mg_core::AccountPool::new(mg_core::resolve_pool_dir(
+            &state.config.data_dir,
+            &provider_name,
+        )))
+    });
+    let default_region = if capabilities
+        .get("regions")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        provider.active_region().unwrap_or_else(|| "cn".to_string())
+    } else {
+        // Single-region providers (Grok, Antigravity, Copilot) serve the
+        // international endpoints; tagging their accounts "cn" would mislabel
+        // them in the dashboard.
+        "intl".to_string()
+    };
+    match pool.import_values(&payload.data, &default_region) {
+        Ok(accounts) => Json(serde_json::json!({
+            "ok": true,
+            "count": accounts.len(),
+            "accounts": accounts,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::BAD_REQUEST),
             Json(e.to_openai_json()),

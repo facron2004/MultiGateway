@@ -451,6 +451,75 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn imports_accounts_from_objects_arrays_and_legacy_wrappers() {
+        use super::AccountPool;
+
+        let dir = temp_pool_dir("import");
+        let pool = AccountPool::new(&dir);
+
+        let ids = pool
+            .import_values(
+                &json!({
+                    "accounts": {
+                        "a1": {"label": "One", "access_token": "t1", "refresh_token": "r1"}
+                    }
+                }),
+                "cn",
+            )
+            .unwrap();
+        assert_eq!(ids, vec!["a1".to_string()]);
+        let imported = pool.get("a1").unwrap();
+        assert_eq!(imported.region, "cn");
+        assert_eq!(imported.access_token, "t1");
+
+        let ids = pool
+            .import_values(
+                &json!([
+                    {"email": "User@Example.com", "accessToken": "t2"},
+                    {"id": "empty"},
+                    "not-an-object"
+                ]),
+                "intl",
+            )
+            .unwrap();
+        assert_eq!(ids, vec!["User@Example.com".to_string()]);
+        let second = pool.get("User@Example.com").unwrap();
+        assert_eq!(second.region, "intl");
+        assert_eq!(second.access_token, "t2");
+
+        pool.update("a1", |account| {
+            account.enabled = false;
+            account.quota = Some(json!({"remaining": 3}));
+            account.checkin = Some(json!({"today_checked_in": true}));
+            account.credential_invalid = true;
+        })
+        .unwrap();
+        pool.import_values(
+            &json!({"id": "a1", "access_token": "t1-new", "refresh_token": "r1-new"}),
+            "cn",
+        )
+        .unwrap();
+        let merged = pool.get("a1").unwrap();
+        assert_eq!(merged.access_token, "t1-new");
+        assert_eq!(merged.refresh_token, "r1-new");
+        assert!(!merged.enabled);
+        assert!(!merged.credential_invalid);
+        assert_eq!(merged.quota, Some(json!({"remaining": 3})));
+        assert_eq!(merged.checkin, Some(json!({"today_checked_in": true})));
+
+        let ids = pool
+            .import_values(&json!({"id": "../../evil", "access_token": "x"}), "cn")
+            .unwrap();
+        assert!(!ids[0].contains('/') && !ids[0].contains('\\'));
+        assert!(dir.join(format!("{}.json", ids[0])).exists());
+
+        assert!(pool.import_values(&json!([]), "cn").is_err());
+        assert!(pool.import_values(&json!(42), "cn").is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 impl Account {
@@ -569,6 +638,56 @@ fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<()> {
         return Err(MgError::Io(error.to_string()));
     }
     Ok(())
+}
+
+fn sanitize_account_id(value: &str) -> String {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@' | '~') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        uuid::Uuid::new_v4().simple().to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn imported_entries(data: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
+    match data {
+        serde_json::Value::Array(items) => Ok(items.clone()),
+        serde_json::Value::Object(object) => {
+            let wrapper = object
+                .get("accounts")
+                .or_else(|| object.get("data").filter(|value| value.is_array()));
+            match wrapper {
+                Some(serde_json::Value::Array(items)) => Ok(items.clone()),
+                Some(serde_json::Value::Object(accounts)) => Ok(accounts
+                    .iter()
+                    .map(|(id, value)| {
+                        let mut value = value.clone();
+                        if let Some(object) = value.as_object_mut() {
+                            object
+                                .entry("id")
+                                .or_insert_with(|| serde_json::Value::String(id.clone()));
+                        }
+                        value
+                    })
+                    .collect()),
+                _ => Ok(vec![data.clone()]),
+            }
+        }
+        _ => Err(MgError::bad_request(
+            "Import expects an account object, an array, or an accounts wrapper",
+        )),
+    }
 }
 
 fn merge_account_json(existing: serde_json::Value, account: &Account) -> Result<serde_json::Value> {
@@ -892,6 +1011,118 @@ impl AccountPool {
         };
         self.persist(&updated)?;
         Ok(Some(updated))
+    }
+
+    /// Imports pasted or exported account JSON. Accepts a single account, an
+    /// array, or the legacy `{"accounts": ...}` wrapper. Credentials replace
+    /// those of an existing id while local state (enabled, quota, check-in)
+    /// stays intact.
+    pub fn import_values(&self, data: &serde_json::Value, default_region: &str) -> Result<Vec<String>> {
+        let entries = imported_entries(data)?;
+        let mut imported = Vec::new();
+        let mut skipped = 0usize;
+        for entry in entries {
+            let Some(object) = entry.as_object() else {
+                skipped += 1;
+                continue;
+            };
+            let mut object = object.clone();
+            let raw_id = ["id", "uid", "user_id"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .or_else(|| {
+                    ["email", "preferred_username", "username", "nickname", "name", "label"]
+                        .iter()
+                        .find_map(|key| {
+                            object
+                                .get(*key)
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|value| !value.trim().is_empty())
+                                .map(str::to_string)
+                        })
+                })
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+            let id = sanitize_account_id(&raw_id);
+            object.insert("id".to_string(), serde_json::Value::String(id.clone()));
+
+            let has_region = ["region", "realm", "edition"].iter().any(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            });
+            if !has_region {
+                object.insert(
+                    "region".to_string(),
+                    serde_json::Value::String(default_region.to_string()),
+                );
+            }
+
+            let account: Account = match serde_json::from_value(serde_json::Value::Object(object)) {
+                Ok(account) => account,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if account.access_token.is_empty() && account.refresh_token.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            if self.get(&id).is_some() {
+                let token_fields = (
+                    account.access_token.clone(),
+                    account.refresh_token.clone(),
+                    account.expires_at,
+                );
+                self.update(&id, |current| {
+                    current.access_token = token_fields.0;
+                    current.refresh_token = token_fields.1;
+                    current.expires_at = token_fields.2;
+                    current.credential_invalid = false;
+                    current.error.clear();
+                    if !account.label.is_empty() {
+                        current.label = account.label.clone();
+                    }
+                    if !account.email.is_empty() {
+                        current.email = account.email.clone();
+                    }
+                    if !account.region.is_empty() {
+                        current.region = account.region.clone();
+                    }
+                    for (key, value) in &account.extra {
+                        current.extra.insert(key.clone(), value.clone());
+                    }
+                    if account.provider_specific.is_some() {
+                        current.provider_specific = account.provider_specific.clone();
+                    }
+                    if account.user_type.is_some() {
+                        current.user_type = account.user_type.clone();
+                    }
+                    if account.organization_id.is_some() {
+                        current.organization_id = account.organization_id.clone();
+                    }
+                    if account.organization_name.is_some() {
+                        current.organization_name = account.organization_name.clone();
+                    }
+                })?;
+            } else {
+                self.save(account)?;
+            }
+            imported.push(id);
+        }
+
+        if imported.is_empty() {
+            return Err(MgError::bad_request(
+                "Import contains no account with usable credentials",
+            ));
+        }
+        if skipped > 0 {
+            info!(imported = imported.len(), skipped, "Imported accounts with skipped entries");
+        }
+        Ok(imported)
     }
 
     /// Writes an account file atomically (tmp + rename) so a crash mid-write can
