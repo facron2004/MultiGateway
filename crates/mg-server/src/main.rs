@@ -14,8 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::{DefaultBodyLimit, Extension, Path},
-    http::HeaderMap,
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -37,6 +39,59 @@ use crate::static_assets::{if_none_match, serve_asset, UiAssets};
 /// Agent conversation histories and base64 image inputs routinely exceed Axum's
 /// 2MB default, which surfaced to clients as an opaque 413.
 const MAX_INFERENCE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+fn local_management_origin(value: &str, port: u16) -> bool {
+    let allowed = [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        format!("http://[::1]:{port}"),
+    ];
+    allowed.iter().any(|origin| origin.eq_ignore_ascii_case(value))
+}
+
+fn is_local_management_request(headers: &HeaderMap, port: u16) -> bool {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !local_management_origin(&format!("http://{host}"), port) {
+        return false;
+    }
+    // Browsers send Origin on state-changing requests. Reject cross-origin
+    // pages even when they reach the loopback interface through DNS rebinding.
+    match headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(origin) => local_management_origin(origin, port),
+        None => true,
+    }
+}
+
+/// The desktop window talks to Tauri IPC; HTTP management is for the local
+/// dashboard only. Keeping it loopback-only prevents `--host 0.0.0.0` from
+/// exposing account credentials and plaintext API keys to the LAN.
+async fn local_management_only(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !peer.ip().is_loopback()
+        || !is_local_management_request(request.headers(), state.config.port)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Management endpoints are available on the local machine only"
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "High Performance Multi-Account AI Reverse Proxy Gateway in Rust")]
@@ -288,7 +343,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/gateway/api-keys", get(handlers::api_key_list))
         // The dashboard ships ~50KB of CSS/JS and the usage board returns large JSON;
         // SSE lives only on the inference router, so compression is safe here.
-        .layer(CompressionLayer::new());
+        .layer(CompressionLayer::new())
+        // Management endpoints expose credentials and plaintext keys. Keep the
+        // entire dashboard surface on loopback even when inference is bound to
+        // 0.0.0.0 for LAN clients.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            local_management_only,
+        ));
 
     let app = Router::new()
         .merge(dashboard)
@@ -325,7 +387,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     info!("Shutdown signal received, draining in-flight requests...");
                 };
-                if let Err(e) = axum::serve(listener, app)
+                if let Err(e) = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
                     .with_graceful_shutdown(shutdown)
                     .await
                 {
@@ -390,4 +455,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_local_management_request, local_management_origin};
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    fn headers(host: &str, origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn management_requests_accept_only_loopback_hosts_and_origins() {
+        assert!(is_local_management_request(
+            &headers("127.0.0.1:8791", Some("http://127.0.0.1:8791")),
+            8791
+        ));
+        assert!(is_local_management_request(
+            &headers("localhost:8791", None),
+            8791
+        ));
+        assert!(is_local_management_request(
+            &headers("[::1]:8791", Some("http://[::1]:8791")),
+            8791
+        ));
+        // A LAN host means the request reached a 0.0.0.0 listener remotely.
+        assert!(!is_local_management_request(
+            &headers("192.168.1.10:8791", None),
+            8791
+        ));
+        // DNS rebinding keeps the peer loopback but changes the Host/Origin.
+        assert!(!is_local_management_request(
+            &headers("evil.example:8791", Some("http://evil.example:8791")),
+            8791
+        ));
+        assert!(!is_local_management_request(
+            &headers("127.0.0.1:8791", Some("http://evil.example")),
+            8791
+        ));
+        assert!(!is_local_management_request(
+            &headers("127.0.0.1:8792", None),
+            8791
+        ));
+        assert!(local_management_origin("HTTP://LOCALHOST:8791", 8791));
+    }
 }

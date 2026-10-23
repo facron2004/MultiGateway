@@ -125,6 +125,9 @@ GitHub Actions 分别在 Windows x64、ARM64 和 macOS Apple Silicon、Intel 上
 | Anthropic Messages | `http://127.0.0.1:8791/v1/messages` |
 | 模型列表 | `http://127.0.0.1:8791/v1/models` |
 
+管理接口（`/gateway/*`、`/settings*` 和面板静态资源）只接受本机回环地址的请求。即使使用
+`--host 0.0.0.0` 向局域网提供推理接口，账号管理、API Key 和设置页也不会暴露到局域网。
+
 统一的 `/v1/models` 只返回带服务前缀的模型 ID。模型条目会带上上游实际提供的能力，所有服务使用同一套字段：
 
 - **识图**：`supports_vision`、`supports_images`、`vision`、`multimodal`、`abilities.vision`

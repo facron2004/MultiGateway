@@ -125,6 +125,10 @@ GitHub Actions tests, builds, and checks release packages on native Windows x64/
 | Anthropic Messages | `http://127.0.0.1:8791/v1/messages` |
 | Model list | `http://127.0.0.1:8791/v1/models` |
 
+Management endpoints (`/gateway/*`, `/settings*` and dashboard assets) accept loopback requests
+only. Binding the gateway to `0.0.0.0` exposes the inference API to the LAN without exposing
+account management, API keys or settings.
+
 The combined `/v1/models` list returns provider-prefixed ids only. Each model carries the capabilities the upstream actually reported, published under the same field set for every provider:
 
 - **Image input**: `supports_vision`, `supports_images`, `vision`, `multimodal`, `abilities.vision`
