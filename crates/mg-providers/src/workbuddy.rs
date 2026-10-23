@@ -301,16 +301,50 @@ impl WorkBuddyProvider {
     /// Refresh before the request when the local expiry says the token is old.
     /// A rejected refresh means the account must be signed in again, so the
     /// caller stops instead of forwarding a request that is certain to 401.
+    /// Force a refresh after a 401 without rotating a token that another
+    /// request already refreshed while this one was in flight.
+    async fn refresh_after_401(&self, account_id: &str, failed_token: &str) -> Result<()> {
+        let lock = self.pool.refresh_lock(account_id);
+        let _guard = lock.lock().await;
+        if let Some(current) = self.pool.get(account_id) {
+            if current.access_token != failed_token && !Self::token_needs_refresh(&current) {
+                return Ok(());
+            }
+        }
+        self.refresh_credentials(account_id).await?;
+        Ok(())
+    }
+
     async fn ensure_fresh_account(&self, account: Account) -> Result<Account> {
         if !Self::token_needs_refresh(&account) || account.refresh_token.is_empty() {
             return Ok(account);
         }
+        // Refresh tokens rotate. Serialize the expiry path per account and
+        // re-read after waiting: a concurrent request may already have
+        // refreshed the token, and exchanging the old one again would fail.
+        let lock = self.pool.refresh_lock(&account.id);
+        let _guard = lock.lock().await;
+        let account = self.pool.get(&account.id).unwrap_or(account);
+        if !Self::token_needs_refresh(&account) {
+            return Ok(account);
+        }
+        let started_token = account.access_token.clone();
         match self.refresh_credentials(&account.id).await {
             Ok(_) => self
                 .pool
                 .get(&account.id)
                 .ok_or_else(|| MgError::not_found("Account not found")),
             Err(error) => {
+                // A manual refresh (or a refresh from another path) may have
+                // succeeded while this request was waiting. Never mark a
+                // credential invalid when the pool already has a fresh token.
+                if let Some(current) = self.pool.get(&account.id) {
+                    if current.access_token != started_token
+                        && !Self::token_needs_refresh(&current)
+                    {
+                        return Ok(current);
+                    }
+                }
                 if matches!(error.status_code(), 401 | 403) {
                     self.pool.set_credential_invalid(
                         &account.id,
@@ -1463,7 +1497,8 @@ impl Provider for WorkBuddyProvider {
             if matches!(status.as_u16(), 401 | 403) {
                 if !refreshed_after_401 && !account.refresh_token.is_empty() {
                     refreshed_after_401 = true;
-                    match self.refresh_credentials(&account_id).await {
+                    let failed_token = account.access_token.clone();
+                    match self.refresh_after_401(&account_id, &failed_token).await {
                         Ok(_) => {
                             if let Some(updated) = self.pool.get(&account_id) {
                                 account = updated;
@@ -1656,7 +1691,8 @@ impl Provider for WorkBuddyProvider {
                 && !account.refresh_token.is_empty()
             {
                 refreshed = true;
-                if let Err(error) = self.refresh_credentials(account_id).await {
+                let failed_token = account.access_token.clone();
+                if let Err(error) = self.refresh_after_401(account_id, &failed_token).await {
                     if matches!(error.status_code(), 401 | 403) {
                         self.pool.set_credential_invalid(
                             account_id,

@@ -1433,6 +1433,12 @@ impl TraeProvider {
         if !trae_token_needs_refresh(&account) || account.refresh_token.is_empty() {
             return Ok(account);
         }
+        let lock = self.pool.refresh_lock(&account.id);
+        let _guard = lock.lock().await;
+        let account = self.pool.get(&account.id).unwrap_or(account);
+        if !trae_token_needs_refresh(&account) {
+            return Ok(account);
+        }
         match self.refresh_credentials(&account.id).await {
             Ok(_) => self
                 .pool

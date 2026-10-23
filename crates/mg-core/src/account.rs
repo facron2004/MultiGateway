@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
@@ -385,6 +386,26 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn refresh_locks_are_shared_per_account_and_released_on_delete() {
+        use super::AccountPool;
+
+        let dir = temp_pool_dir("refresh-lock");
+        let pool = AccountPool::new(&dir);
+        let first = pool.refresh_lock("same");
+        let second = pool.refresh_lock("same");
+        let other = pool.refresh_lock("other");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(!std::sync::Arc::ptr_eq(&first, &other));
+
+        pool.save(ready_account("same")).unwrap();
+        pool.delete("same").unwrap();
+        let recreated = pool.refresh_lock("same");
+        assert!(!std::sync::Arc::ptr_eq(&first, &recreated));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 impl Account {
@@ -591,6 +612,10 @@ pub struct AccountPool {
     /// upstream failure. Kept beside Account (not inside it) so it stays in-memory
     /// only and does not perturb account serialization or struct literals.
     cooldowns: RwLock<HashMap<String, f64>>,
+    /// One async lock per account so concurrent requests that discover an
+    /// expiring token refresh it once instead of racing on the same
+    /// single-use refresh token.
+    refresh_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     round_robin_idx: AtomicUsize,
 }
 
@@ -608,6 +633,7 @@ impl AccountPool {
             active_region: RwLock::new(String::new()),
             session_map: RwLock::new(HashMap::new()),
             cooldowns: RwLock::new(HashMap::new()),
+            refresh_locks: RwLock::new(HashMap::new()),
             round_robin_idx: AtomicUsize::new(0),
         };
         pool.reload();
@@ -779,6 +805,17 @@ impl AccountPool {
         self.accounts.read().get(id).cloned()
     }
 
+    /// Serialize credential refreshes for one account. Refresh tokens rotate,
+    /// so two concurrent exchanges with the same token can invalidate each
+    /// other and make a healthy account look dead.
+    pub fn refresh_lock(&self, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.refresh_locks
+            .write()
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     #[cfg(test)]
     pub fn session_map_len(&self) -> usize {
         self.session_map.read().len()
@@ -904,6 +941,7 @@ impl AccountPool {
             }
         }
         self.accounts.write().remove(id);
+        self.refresh_locks.write().remove(id);
         Ok(())
     }
 
