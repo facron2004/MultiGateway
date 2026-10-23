@@ -572,6 +572,42 @@ fn workbuddy_auth_config(realm: &str) -> (&'static str, &'static str, &'static s
     }
 }
 
+async fn save_workbuddy_checked_in(pool: &Arc<AccountPool>, account: Account) -> Result<()> {
+    let mut updated = account;
+    let mut checkin_state = updated
+        .checkin
+        .take()
+        .filter(serde_json::Value::is_object)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    checkin_state.insert("today_checked_in".to_string(), serde_json::json!(true));
+    checkin_state.insert("checked_in".to_string(), serde_json::json!(true));
+    updated.checkin = Some(serde_json::Value::Object(checkin_state));
+    let mut credits = updated
+        .credits
+        .take()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let checkin = credits
+        .as_object_mut()
+        .expect("credits is an object")
+        .entry("checkin")
+        .or_insert_with(|| serde_json::json!({}));
+    if !checkin.is_object() {
+        *checkin = serde_json::json!({});
+    }
+    checkin
+        .as_object_mut()
+        .expect("checkin is an object")
+        .insert("today_checked_in".to_string(), serde_json::json!(true));
+    updated.credits = Some(credits);
+    let pool = Arc::clone(pool);
+    tokio::task::spawn_blocking(move || pool.save(updated))
+        .await
+        .map_err(|error| MgError::Io(error.to_string()))??;
+    Ok(())
+}
+
 fn parse_workbuddy_quota(payload: &serde_json::Value, checked_at: f64) -> Result<AccountQuota> {
     if payload.get("code").and_then(serde_json::Value::as_i64) != Some(0) {
         return Err(MgError::provider(
@@ -1708,6 +1744,16 @@ impl Provider for WorkBuddyProvider {
                 let status = res.status();
                 let text = res.text().await.unwrap_or_default();
                 if !status.is_success() {
+                    // WorkBuddy answers an already-claimed day with HTTP 400
+                    // and "今日已签到"; that is a success state, not a failure.
+                    if crate::is_already_checked_in_message(&text) {
+                        save_workbuddy_checked_in(&self.pool, account.clone()).await?;
+                        return Ok(serde_json::json!({
+                            "ok": true,
+                            "already": true,
+                            "message": "今日已签到"
+                        }));
+                    }
                     return Err(MgError::provider(
                         status.as_u16(),
                         format!(
@@ -1723,22 +1769,7 @@ impl Provider for WorkBuddyProvider {
                 let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
                 let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("未知响应");
                 if code == 0 || code == 10001 {
-                    let mut updated = account.clone();
-                    if let Some(mut credits) = updated.credits.clone() {
-                        if let Some(checkin) = credits.get_mut("checkin") {
-                            if let Some(obj) = checkin.as_object_mut() {
-                                obj.insert(
-                                    "today_checked_in".to_string(),
-                                    serde_json::Value::Bool(true),
-                                );
-                            }
-                        }
-                        updated.credits = Some(credits);
-                        let pool = Arc::clone(&self.pool);
-                        tokio::task::spawn_blocking(move || pool.save(updated))
-                            .await
-                            .map_err(|error| MgError::Io(error.to_string()))??;
-                    }
+                    save_workbuddy_checked_in(&self.pool, account.clone()).await?;
                     Ok(serde_json::json!({
                         "ok": true,
                         "code": code,

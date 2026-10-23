@@ -587,6 +587,75 @@ fn trae_account_value(account: &mg_core::Account, keys: &[&str], fallback: &str)
         .to_string()
 }
 
+fn trae_refresh_host(account: &mg_core::Account) -> String {
+    let configured = trae_provider_value(account, &["host", "apiHost", "api_host"])
+        .or_else(|| {
+            account
+                .extra
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|host| host.starts_with("http"));
+    if let Some(host) = configured {
+        return host.trim_end_matches('/').to_string();
+    }
+    if regions_match(&account.region, "cn") {
+        "https://api.trae.com.cn".to_string()
+    } else {
+        "https://api.trae.ai".to_string()
+    }
+}
+
+fn trae_refresh_client_id(account: &mg_core::Account) -> String {
+    trae_account_value(
+        account,
+        &["client_id", "clientId", "clientID", "ClientID"],
+        "ono9krqynydwx5",
+    )
+}
+
+fn trae_refresh_user_id(account: &mg_core::Account) -> String {
+    trae_provider_value(account, &["bizUserId", "user_id", "userId", "userUniqueId"])
+        .unwrap_or(&account.id)
+        .to_string()
+}
+
+fn trae_jwt_expiry(token: &str) -> Option<f64> {
+    let body = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(body))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("exp")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|expiry| *expiry > 0.0)
+}
+
+fn trae_expire_at(value: Option<&serde_json::Value>) -> Option<f64> {
+    let value = value?;
+    if let Some(number) = value.as_f64() {
+        return Some(if number > 1e11 {
+            number / 1000.0
+        } else {
+            number
+        });
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(number) = text.parse::<f64>() {
+        return Some(if number > 1e11 {
+            number / 1000.0
+        } else {
+            number
+        });
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|timestamp| timestamp.timestamp() as f64)
+}
+
 fn trae_web_headers(account: &mg_core::Account, surface: &TraeSurface) -> Vec<(String, String)> {
     let language = trae_account_value(account, &["appLanguage"], surface.default_language);
     let user_region = trae_account_value(
@@ -1331,6 +1400,16 @@ impl TraeProvider {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
+            // The claim endpoint reports an already-claimed day as HTTP 400
+            // with a business message; treat it as success so batch results do
+            // not show a false failure.
+            if crate::is_already_checked_in_message(&text) {
+                return Ok(serde_json::json!({
+                    "code": 0,
+                    "checked_in": true,
+                    "message": "今日已签到"
+                }));
+            }
             return Err(MgError::provider(
                 status.as_u16(),
                 format!(
@@ -1393,7 +1472,7 @@ impl Provider for TraeProvider {
 
     fn capabilities(&self) -> serde_json::Value {
         serde_json::json!({
-            "credentials": false,
+            "credentials": true,
             "credits": true,
             "checkin": true,
             "regions": true,
@@ -1835,6 +1914,108 @@ impl Provider for TraeProvider {
         let quota = parse_trae_quota(&payload, mg_core::now_secs())?;
         self.pool.update_quota(account_id, quota.clone())?;
         Ok(quota)
+    }
+
+    async fn refresh_credentials(&self, account_id: &str) -> Result<serde_json::Value> {
+        let account = self
+            .pool
+            .get(account_id)
+            .ok_or_else(|| MgError::not_found("Account not found"))?;
+        if account.refresh_token.is_empty() {
+            if !account.access_token.is_empty()
+                && account.expires_at > mg_core::now_secs() + 300.0
+            {
+                return Ok(serde_json::json!({"ok": true, "message": "当前凭证仍有效"}));
+            }
+            return Err(MgError::unauthorized(
+                "Trae account has no refresh token; sign in again",
+            ));
+        }
+
+        let host = trae_refresh_host(&account);
+        let payload = serde_json::json!({
+            "ClientID": trae_refresh_client_id(&account),
+            "RefreshToken": account.refresh_token.clone(),
+            "ClientSecret": "-",
+            "UserID": trae_refresh_user_id(&account),
+        });
+        let response = self
+            .client
+            .post(format!(
+                "{host}/cloudide/api/v3/trae/oauth/ExchangeToken"
+            ))
+            .timeout(Duration::from_secs(30))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| {
+                MgError::provider(
+                    502,
+                    format!("Trae credential refresh failed: {error}"),
+                    "network_error",
+                )
+            })?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let body = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
+        if !status.is_success() {
+            let message = body
+                .pointer("/ResponseMetadata/Error/Message")
+                .or_else(|| body.get("message"))
+                .or_else(|| body.get("msg"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("upstream rejected the refresh token");
+            return Err(MgError::provider(
+                status.as_u16(),
+                format!("Trae credential refresh failed: {message}"),
+                "upstream_error",
+            ));
+        }
+        let result = body
+            .get("Result")
+            .or_else(|| body.get("result"))
+            .unwrap_or(&body);
+        let access_token = result
+            .get("Token")
+            .or_else(|| result.get("token"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                MgError::provider(
+                    502,
+                    "Trae refresh response has no token",
+                    "invalid_response",
+                )
+            })?;
+        let mut updated = account;
+        updated.access_token = access_token.to_string();
+        if let Some(refresh_token) = result
+            .get("RefreshToken")
+            .or_else(|| result.get("refreshToken"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+        {
+            updated.refresh_token = refresh_token.to_string();
+        }
+        if let Some(expires_at) = trae_expire_at(
+            result
+                .get("TokenExpireAt")
+                .or_else(|| result.get("tokenExpireAt")),
+        )
+        .or_else(|| trae_jwt_expiry(access_token))
+        {
+            updated.expires_at = expires_at;
+        }
+        updated.credential_invalid = false;
+        updated.error.clear();
+        let pool = Arc::clone(&self.pool);
+        let saved = updated.clone();
+        tokio::task::spawn_blocking(move || pool.save(saved))
+            .await
+            .map_err(|error| MgError::Io(error.to_string()))??;
+        Ok(serde_json::json!({"ok": true, "message": "Trae 凭证已刷新"}))
     }
 
     async fn checkin(&self, account_id: &str) -> Result<serde_json::Value> {

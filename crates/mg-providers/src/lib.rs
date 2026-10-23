@@ -37,6 +37,37 @@ pub fn is_account_level_failure(status: u16) -> bool {
     matches!(status, 401 | 403 | 429 | 500..=599)
 }
 
+/// Whether an upstream check-in error body actually means "already checked in
+/// today". Several providers answer the claim endpoint with HTTP 400 and this
+/// business message instead of a success code.
+pub fn is_already_checked_in_message(body: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if value.get("code").and_then(serde_json::Value::as_i64) == Some(10001) {
+            return true;
+        }
+        for key in ["msg", "message", "error"] {
+            if let Some(text) = value.get(key).and_then(serde_json::Value::as_str) {
+                if text.contains("今日已签到")
+                    || text.contains("已完成签到")
+                    || text.contains("今天已签到")
+                    || text.to_ascii_lowercase().contains("already checked")
+                    || text.to_ascii_lowercase().contains("already claimed")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    body.contains("今日已签到")
+        || body.contains("已完成签到")
+        || body.contains("今天已签到")
+        || lower.contains("already checked")
+        || lower.contains("already_checked")
+        || lower.contains("already claimed")
+        || lower.contains("already_claimed")
+}
+
 /// Maximum number of characters kept from a cleaned upstream error body.
 pub const UPSTREAM_ERROR_BODY_MAX_CHARS: usize = 200;
 
@@ -121,6 +152,20 @@ mod tests {
         Provider, QoderProvider, TraeProvider, WorkBuddyProvider, UPSTREAM_ERROR_BODY_MAX_CHARS,
     };
     use mg_core::AccountPool;
+
+    #[test]
+    fn detects_already_checked_in_business_messages() {
+        assert!(super::is_already_checked_in_message(
+            "{\"code\":400,\"msg\":\"今日已签到\"}"
+        ));
+        assert!(super::is_already_checked_in_message("ALREADY_CLAIMED"));
+        assert!(super::is_already_checked_in_message(
+            "The user has already checked in today"
+        ));
+        assert!(!super::is_already_checked_in_message(
+            "refreshing the access token failed"
+        ));
+    }
 
     #[test]
     fn upstream_error_body_strips_html_and_collapses_whitespace() {

@@ -1828,6 +1828,14 @@ impl Provider for QoderProvider {
             }));
         }
         if !(200..300).contains(&status_code) {
+            if crate::is_already_checked_in_message(&status_body) {
+                save_qoder_checkin(&self.pool, account, true)?;
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "already": true,
+                    "message": "今日已签到"
+                }));
+            }
             return Err(MgError::provider(
                 status_code,
                 format!(
@@ -1866,7 +1874,9 @@ impl Provider for QoderProvider {
                 Some("{}"),
             )
             .await?;
-        if claim_body.contains("ALREADY_CLAIMED") {
+        if claim_body.contains("ALREADY_CLAIMED")
+            || crate::is_already_checked_in_message(&claim_body)
+        {
             save_qoder_checkin(&self.pool, account, true)?;
             return Ok(serde_json::json!({"ok": true, "already": true, "message": "今日已签到"}));
         }
