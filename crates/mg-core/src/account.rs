@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -520,6 +520,46 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn a_concurrent_delete_is_never_undone_on_disk_by_an_update() {
+        use super::AccountPool;
+
+        for attempt in 0..40 {
+            let dir = temp_pool_dir(&format!("delete-race-{attempt}"));
+            let pool = std::sync::Arc::new(AccountPool::new(&dir));
+            pool.save(ready_account("same")).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+            let updater = {
+                let pool = std::sync::Arc::clone(&pool);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let _ = pool.update("same", |account| {
+                        account.access_token = "raced".to_string();
+                    });
+                })
+            };
+            let deleter = {
+                let pool = std::sync::Arc::clone(&pool);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    pool.delete("same").unwrap();
+                })
+            };
+
+            barrier.wait();
+            updater.join().unwrap();
+            deleter.join().unwrap();
+
+            assert!(pool.get("same").is_none(), "attempt {attempt}");
+            assert!(!dir.join("same.json").exists(), "attempt {attempt}");
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 impl Account {
@@ -780,6 +820,9 @@ pub struct AccountPool {
     /// expiring token refresh it once instead of racing on the same
     /// single-use refresh token.
     refresh_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes mutations through their disk write so an older snapshot can
+    /// never be persisted after a newer one (or resurrect a deleted account).
+    persist_lock: Mutex<()>,
     round_robin_idx: AtomicUsize,
 }
 
@@ -798,6 +841,7 @@ impl AccountPool {
             session_map: RwLock::new(HashMap::new()),
             cooldowns: RwLock::new(HashMap::new()),
             refresh_locks: RwLock::new(HashMap::new()),
+            persist_lock: Mutex::new(()),
             round_robin_idx: AtomicUsize::new(0),
         };
         pool.reload();
@@ -863,6 +907,7 @@ impl AccountPool {
     }
 
     pub fn reload(&self) {
+        let _persist = self.persist_lock.lock();
         if !self.dir.exists() {
             let _ = fs::create_dir_all(&self.dir);
             return;
@@ -986,6 +1031,7 @@ impl AccountPool {
     }
 
     pub fn save(&self, account: Account) -> Result<()> {
+        let _persist = self.persist_lock.lock();
         self.persist(&account)?;
         self.accounts.write().insert(account.id.clone(), account);
         Ok(())
@@ -999,6 +1045,7 @@ impl AccountPool {
     where
         F: FnOnce(&mut Account),
     {
+        let _persist = self.persist_lock.lock();
         let updated = {
             let mut accounts = self.accounts.write();
             match accounts.get_mut(id) {
@@ -1219,6 +1266,7 @@ impl AccountPool {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
+        let _persist = self.persist_lock.lock();
         let path = self.dir.join(format!("{}.json", id));
         if path.exists() {
             fs::remove_file(path).map_err(|e| MgError::Io(e.to_string()))?;
@@ -1348,6 +1396,7 @@ impl AccountPool {
     }
 
     pub fn update_quota(&self, account_id: &str, quota: AccountQuota) -> Result<()> {
+        let _persist = self.persist_lock.lock();
         let updated = {
             let mut accounts = self.accounts.write();
             match accounts.get_mut(account_id) {
@@ -1364,6 +1413,7 @@ impl AccountPool {
     }
 
     pub fn set_error(&self, account_id: &str, err_msg: &str) {
+        let _persist = self.persist_lock.lock();
         let updated = {
             let mut accounts = self.accounts.write();
             match accounts.get_mut(account_id) {
@@ -1381,6 +1431,7 @@ impl AccountPool {
     /// refresh token could not recover them). The account stops being selected
     /// until a successful sign-in or credential refresh clears the flag.
     pub fn set_credential_invalid(&self, account_id: &str, err_msg: &str) {
+        let _persist = self.persist_lock.lock();
         let updated = {
             let mut accounts = self.accounts.write();
             match accounts.get_mut(account_id) {
