@@ -371,14 +371,32 @@ pub async fn chat_completions(
     }
 }
 
+/// Resolves a model on a provider-scoped route. The path provider is
+/// authoritative: a model prefixed with another provider is a client error
+/// rather than a silent request to a different upstream.
+pub(crate) fn scoped_model(provider: &str, model: &str) -> Result<String, MgError> {
+    match model.split_once('/') {
+        Some((prefix, rest)) if prefix.eq_ignore_ascii_case(provider) && !rest.is_empty() => {
+            Ok(format!("{provider}/{rest}"))
+        }
+        Some(_) => Err(MgError::bad_request(format!(
+            "Model '{model}' does not belong to provider '{provider}'"
+        ))),
+        None => Ok(format!("{provider}/{model}")),
+    }
+}
+
 pub async fn provider_chat_completions(
     axum::extract::Path(provider): axum::extract::Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> Response {
-    if !req.model.contains('/') {
-        req.model = format!("{}/{}", provider, req.model);
+    match scoped_model(&provider, &req.model) {
+        Ok(model) => req.model = model,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(error.to_openai_json())).into_response()
+        }
     }
     chat_completions(State(state), headers, Json(req)).await
 }
@@ -386,6 +404,7 @@ pub async fn provider_chat_completions(
 #[cfg(test)]
 mod tests {
     use super::copy_usage_to_record;
+    use super::scoped_model;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -826,6 +845,17 @@ mod tests {
         assert!(body["error"]["message"].as_str().unwrap().contains("rate limited"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn provider_scoped_models_must_match_the_path_provider() {
+        assert_eq!(scoped_model("grok", "grok-4.7").unwrap(), "grok/grok-4.7");
+        assert_eq!(
+            scoped_model("grok", "GROK/grok-4.7").unwrap(),
+            "grok/grok-4.7"
+        );
+        assert!(scoped_model("grok", "workbuddy/step-5-preview").is_err());
+        assert!(scoped_model("grok", "grok/").is_err());
     }
 
     #[tokio::test]

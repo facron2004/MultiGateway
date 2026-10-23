@@ -581,8 +581,11 @@ pub async fn provider_messages(
     headers: HeaderMap,
     Json(mut req): Json<MessagesRequest>,
 ) -> Response {
-    if !req.model.contains('/') {
-        req.model = format!("{}/{}", provider, req.model);
+    match crate::handlers::chat::scoped_model(&provider, &req.model) {
+        Ok(model) => req.model = model,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(error.to_openai_json())).into_response()
+        }
     }
     messages(State(state), headers, Json(req)).await
 }
