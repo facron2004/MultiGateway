@@ -656,6 +656,12 @@ fn trae_expire_at(value: Option<&serde_json::Value>) -> Option<f64> {
         .map(|timestamp| timestamp.timestamp() as f64)
 }
 
+fn trae_token_needs_refresh(account: &mg_core::Account) -> bool {
+    account.access_token.is_empty()
+        || (account.expires_at > 0.0
+            && account.expires_at <= mg_core::now_secs() + 300.0)
+}
+
 fn trae_web_headers(account: &mg_core::Account, surface: &TraeSurface) -> Vec<(String, String)> {
     let language = trae_account_value(account, &["appLanguage"], surface.default_language);
     let user_region = trae_account_value(
@@ -1422,6 +1428,22 @@ impl TraeProvider {
         serde_json::from_str(&text)
             .map_err(|error| MgError::provider(502, error.to_string(), "invalid_response"))
     }
+
+    async fn ensure_fresh_account(&self, account: mg_core::Account) -> Result<mg_core::Account> {
+        if !trae_token_needs_refresh(&account) || account.refresh_token.is_empty() {
+            return Ok(account);
+        }
+        match self.refresh_credentials(&account.id).await {
+            Ok(_) => self
+                .pool
+                .get(&account.id)
+                .ok_or_else(|| MgError::not_found("Account not found")),
+            Err(error) => {
+                self.pool.set_error(&account.id, &error.message());
+                Err(error)
+            }
+        }
+    }
 }
 
 fn save_trae_checkin(
@@ -1520,6 +1542,13 @@ impl Provider for TraeProvider {
             .unwrap_or(&active_region);
         let Some(account) = representative_account(&self.pool, Some(selected_region)) else {
             return Ok(fallback);
+        };
+        let account = match self.ensure_fresh_account(account).await {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::warn!(provider = "trae", %error, "model catalog skipped: credential refresh failed");
+                return Ok(fallback);
+            }
         };
         let surface = trae_surface(selected_region);
         let provider_specific = account
@@ -1682,6 +1711,7 @@ impl Provider for TraeProvider {
         let account = self
             .pool
             .choose_in_region(session_id, None, Some(&region))?;
+        let account = self.ensure_fresh_account(account).await?;
         if account.access_token.is_empty() {
             return Err(MgError::unauthorized("Trae account has no token"));
         }
@@ -1875,6 +1905,7 @@ impl Provider for TraeProvider {
             .pool
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
+        let account = self.ensure_fresh_account(account).await?;
 
         let surface = trae_surface(&account.region);
         let response = self
@@ -2023,6 +2054,7 @@ impl Provider for TraeProvider {
             .pool
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
+        let account = self.ensure_fresh_account(account).await?;
         if account.access_token.is_empty() {
             return Err(MgError::unauthorized("Trae account has no token"));
         }
@@ -2122,9 +2154,79 @@ mod tests {
     use super::{
         canonical_trae_model_name, parse_trae_catalog, parse_trae_quota, parse_trae_solo_catalog,
         trae_custom_model, trae_fallback_models, trae_model_config_names, trae_surface_with,
-        TraeSurfaceEnv, TraeTranslator,
+        trae_token_needs_refresh, TraeProvider, TraeSurfaceEnv, TraeTranslator,
     };
     use serde_json::json;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn refreshes_trae_tokens_before_they_expire_but_not_long_lived_ones() {
+        let future = mg_core::now_secs() + 3600.0;
+        let soon = mg_core::now_secs() + 60.0;
+        let account = |token: &str, expiry: f64| -> mg_core::Account {
+            serde_json::from_value(json!({
+                "id": "trae-user",
+                "access_token": token,
+                "expires_at": expiry
+            }))
+            .unwrap()
+        };
+        assert!(!trae_token_needs_refresh(&account("token", future)));
+        assert!(trae_token_needs_refresh(&account("token", soon)));
+        assert!(trae_token_needs_refresh(&account("", 0.0)));
+        // Unknown expiry is not treated as expired, otherwise every request
+        // would refresh.
+        assert!(!trae_token_needs_refresh(&account("token", 0.0)));
+    }
+
+    #[tokio::test]
+    async fn expired_trae_accounts_refresh_and_persist_before_use() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 2048];
+            let _ = socket.read(&mut buffer).await;
+            let expires_at = (mg_core::now_secs() + 7200.0) as u64;
+            let body = format!(
+                "{{\"Result\":{{\"Token\":\"fresh-token\",\"RefreshToken\":\"fresh-refresh\",\"TokenExpireAt\":{expires_at}}}}}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!("mg-trae-refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = Arc::new(mg_core::AccountPool::new(&dir));
+        let account: mg_core::Account = serde_json::from_value(json!({
+            "id": "trae-user",
+            "region": "cn",
+            "access_token": "stale-token",
+            "refresh_token": "stale-refresh",
+            "expires_at": 1.0,
+            "provider_specific": {"host": format!("http://{address}")}
+        }))
+        .unwrap();
+        pool.save(account.clone()).unwrap();
+
+        let provider = TraeProvider::new(pool.clone());
+        let refreshed = provider.ensure_fresh_account(account).await.unwrap();
+        assert_eq!(refreshed.access_token, "fresh-token");
+        assert_eq!(refreshed.refresh_token, "fresh-refresh");
+        assert!(refreshed.expires_at > mg_core::now_secs());
+        assert_eq!(
+            pool.get("trae-user").unwrap().access_token,
+            "fresh-token"
+        );
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn remote_events_emit_only_the_new_snapshot_text() {
