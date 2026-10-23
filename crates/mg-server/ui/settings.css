@@ -41,7 +41,7 @@ body.settings-open:not(.sidebar-expanded) {
 .settings-nav-item {
   flex-shrink: 0;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   color: var(--nav-muted);
   background: transparent;
   width: 50px;
@@ -86,7 +86,7 @@ body.settings-open:not(.sidebar-expanded) {
 .settings-card {
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   background: var(--card);
 }
 .setting-row {
@@ -146,8 +146,8 @@ label.setting-row:hover {
   margin: 0;
   padding: 0;
   border: 0;
-  border-radius: 20px;
-  background: #96969e;
+  border-radius: var(--radius-pill);
+  background: var(--switch-off);
   cursor: pointer;
   transition: background .16s ease;
 }
@@ -161,7 +161,7 @@ label.setting-row:hover {
   left: 2px;
   border-radius: 50%;
   background: var(--knob);
-  box-shadow: 0 1px 2px #00000018;
+  box-shadow: var(--shadow-xs);
   transition: transform .16s ease;
 }
 .setting-row input.setting-switch:checked {
@@ -218,7 +218,7 @@ label.setting-row:hover {
   width: 36px;
   height: 38px;
   padding: 0;
-  color: #51525c;
+  color: var(--ink-2);
 }
 .settings-section-heading {
   display: flex;
@@ -227,7 +227,7 @@ label.setting-row:hover {
   gap: 16px;
 }
 .settings-count {
-  color: #858691;
+  color: var(--ink-4);
   font-size: 12px;
 }
 .settings-description {
@@ -261,7 +261,7 @@ label.setting-row:hover {
   gap: 2px;
   padding: 3px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   background: var(--soft-2);
 }
 .segmented button {
@@ -270,7 +270,7 @@ label.setting-row:hover {
   color: var(--muted);
   min-height: 30px;
   padding: 0 12px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   font-size: 13px;
   font-weight: 550;
 }
@@ -282,18 +282,18 @@ label.setting-row:hover {
 .segmented button[aria-pressed="true"]:hover {
   background: var(--card);
   color: var(--ink);
-  box-shadow: 0 1px 2px #0000001a;
+  box-shadow: var(--shadow-selected);
 }
 html[data-theme="dark"] .segmented button[aria-pressed="true"],
 html[data-theme="dark"] .segmented button[aria-pressed="true"]:hover {
-  background: #3a3b46;
+  background: var(--surface-raised);
 }
 .setting-select {
   width: auto;
   min-width: 148px;
   height: 36px;
   padding: 0 28px 0 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   background: var(--soft);
   color: var(--ink);
 }

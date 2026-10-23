@@ -169,7 +169,7 @@ export function bindAccess(state, callbacks) {
           }
         } else {
           delBtn.dataset.confirming = "true";
-          delBtn.innerHTML = `<span style="font-size:11px;color:var(--red);">${escape(t("confirmDelete"))}</span>`;
+          delBtn.innerHTML = `<span class="danger-text">${escape(t("confirmDelete"))}</span>`;
           setTimeout(() => {
             if (delBtn.dataset.confirming === "true") {
               delete delBtn.dataset.confirming;
