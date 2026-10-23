@@ -224,16 +224,30 @@ impl MiniMaxProvider {
             .and_then(|v| v.as_f64())
             .unwrap_or(3600.0);
 
+        let refresh_token = data
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         account.access_token = new_token.clone();
-        if let Some(rf) = data.get("refresh_token").and_then(|v| v.as_str()) {
-            account.refresh_token = rf.to_string();
+        if let Some(refresh_token) = &refresh_token {
+            account.refresh_token = refresh_token.clone();
         }
         account.expires_at = now + expires_in;
         let pool = Arc::clone(&self.pool);
-        let snapshot = account.clone();
-        tokio::task::spawn_blocking(move || pool.save(snapshot))
-            .await
-            .map_err(|error| MgError::Io(error.to_string()))??;
+        let account_id = account.id.clone();
+        let access_token = new_token.clone();
+        let expires_at = account.expires_at;
+        tokio::task::spawn_blocking(move || {
+            pool.update(&account_id, |current| {
+                current.access_token = access_token;
+                if let Some(refresh_token) = refresh_token {
+                    current.refresh_token = refresh_token;
+                }
+                current.expires_at = expires_at;
+            })
+        })
+        .await
+        .map_err(|error| MgError::Io(error.to_string()))??;
 
         Ok(new_token)
     }

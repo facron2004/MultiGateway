@@ -607,38 +607,41 @@ fn workbuddy_auth_config(realm: &str) -> (&'static str, &'static str, &'static s
 }
 
 async fn save_workbuddy_checked_in(pool: &Arc<AccountPool>, account: Account) -> Result<()> {
-    let mut updated = account;
-    let mut checkin_state = updated
-        .checkin
-        .take()
-        .filter(serde_json::Value::is_object)
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    checkin_state.insert("today_checked_in".to_string(), serde_json::json!(true));
-    checkin_state.insert("checked_in".to_string(), serde_json::json!(true));
-    updated.checkin = Some(serde_json::Value::Object(checkin_state));
-    let mut credits = updated
-        .credits
-        .take()
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    let checkin = credits
-        .as_object_mut()
-        .expect("credits is an object")
-        .entry("checkin")
-        .or_insert_with(|| serde_json::json!({}));
-    if !checkin.is_object() {
-        *checkin = serde_json::json!({});
-    }
-    checkin
-        .as_object_mut()
-        .expect("checkin is an object")
-        .insert("today_checked_in".to_string(), serde_json::json!(true));
-    updated.credits = Some(credits);
+    let account_id = account.id.clone();
     let pool = Arc::clone(pool);
-    tokio::task::spawn_blocking(move || pool.save(updated))
-        .await
-        .map_err(|error| MgError::Io(error.to_string()))??;
+    tokio::task::spawn_blocking(move || {
+        pool.update(&account_id, |updated| {
+            let mut checkin_state = updated
+                .checkin
+                .take()
+                .filter(serde_json::Value::is_object)
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            checkin_state.insert("today_checked_in".to_string(), serde_json::json!(true));
+            checkin_state.insert("checked_in".to_string(), serde_json::json!(true));
+            updated.checkin = Some(serde_json::Value::Object(checkin_state));
+            let mut credits = updated
+                .credits
+                .take()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            let checkin = credits
+                .as_object_mut()
+                .expect("credits is an object")
+                .entry("checkin")
+                .or_insert_with(|| serde_json::json!({}));
+            if !checkin.is_object() {
+                *checkin = serde_json::json!({});
+            }
+            checkin
+                .as_object_mut()
+                .expect("checkin is an object")
+                .insert("today_checked_in".to_string(), serde_json::json!(true));
+            updated.credits = Some(credits);
+        })
+    })
+    .await
+    .map_err(|error| MgError::Io(error.to_string()))??;
     Ok(())
 }
 
@@ -1920,25 +1923,34 @@ impl Provider for WorkBuddyProvider {
                     "invalid_response",
                 )
             })?;
-        let mut updated = account;
-        updated.access_token = access_token.to_string();
-        if let Some(refresh_token) = data.get("refreshToken").and_then(serde_json::Value::as_str) {
-            updated.refresh_token = refresh_token.to_string();
-        }
-        updated.credential_invalid = false;
-        updated.error.clear();
-        updated.expires_at = workbuddy_token_expiry(access_token)
-            .or_else(|| {
-                data.get("expires_in")
-                    .or_else(|| data.get("expiresIn"))
-                    .and_then(serde_json::Value::as_f64)
-                    .map(|seconds| mg_core::now_secs() + seconds)
-            })
-            .unwrap_or(updated.expires_at);
+        let access_token = access_token.to_string();
+        let refresh_token = data
+            .get("refreshToken")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let expires_at = workbuddy_token_expiry(&access_token).or_else(|| {
+            data.get("expires_in")
+                .or_else(|| data.get("expiresIn"))
+                .and_then(serde_json::Value::as_f64)
+                .map(|seconds| mg_core::now_secs() + seconds)
+        });
         let pool = Arc::clone(&self.pool);
-        tokio::task::spawn_blocking(move || pool.save(updated))
-            .await
-            .map_err(|error| MgError::Io(error.to_string()))??;
+        let account_id = account.id.clone();
+        tokio::task::spawn_blocking(move || {
+            pool.update(&account_id, |current| {
+                current.access_token = access_token;
+                if let Some(refresh_token) = refresh_token {
+                    current.refresh_token = refresh_token;
+                }
+                if let Some(expires_at) = expires_at {
+                    current.expires_at = expires_at;
+                }
+                current.credential_invalid = false;
+                current.error.clear();
+            })
+        })
+        .await
+        .map_err(|error| MgError::Io(error.to_string()))??;
         Ok(serde_json::json!({ "ok": true, "message": "WorkBuddy 凭证已刷新" }))
     }
 

@@ -1471,21 +1471,23 @@ fn save_trae_checkin(
 
 fn save_trae_checkin_patch(
     pool: &AccountPool,
-    mut account: mg_core::Account,
+    account: mg_core::Account,
     patch: serde_json::Value,
 ) -> Result<()> {
-    let mut checkin = account
-        .checkin
-        .clone()
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    if let Some(patch) = patch.as_object() {
-        for (key, value) in patch {
-            checkin.insert(key.clone(), value.clone());
+    pool.update(&account.id, |current| {
+        let mut checkin = current
+            .checkin
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(patch) = patch.as_object() {
+            for (key, value) in patch {
+                checkin.insert(key.clone(), value.clone());
+            }
         }
-    }
-    account.checkin = Some(serde_json::Value::Object(checkin));
-    pool.save(account)
+        current.checkin = Some(serde_json::Value::Object(checkin));
+    })?;
+    Ok(())
 }
 
 #[async_trait]
@@ -2026,32 +2028,36 @@ impl Provider for TraeProvider {
                     "invalid_response",
                 )
             })?;
-        let mut updated = account;
-        updated.access_token = access_token.to_string();
-        if let Some(refresh_token) = result
+        let access_token = access_token.to_string();
+        let refresh_token = result
             .get("RefreshToken")
             .or_else(|| result.get("refreshToken"))
             .and_then(serde_json::Value::as_str)
             .filter(|token| !token.is_empty())
-        {
-            updated.refresh_token = refresh_token.to_string();
-        }
-        if let Some(expires_at) = trae_expire_at(
+            .map(str::to_string);
+        let expires_at = trae_expire_at(
             result
                 .get("TokenExpireAt")
                 .or_else(|| result.get("tokenExpireAt")),
         )
-        .or_else(|| trae_jwt_expiry(access_token))
-        {
-            updated.expires_at = expires_at;
-        }
-        updated.credential_invalid = false;
-        updated.error.clear();
+        .or_else(|| trae_jwt_expiry(&access_token));
         let pool = Arc::clone(&self.pool);
-        let saved = updated.clone();
-        tokio::task::spawn_blocking(move || pool.save(saved))
-            .await
-            .map_err(|error| MgError::Io(error.to_string()))??;
+        let account_id = account.id.clone();
+        tokio::task::spawn_blocking(move || {
+            pool.update(&account_id, |current| {
+                current.access_token = access_token;
+                if let Some(refresh_token) = refresh_token {
+                    current.refresh_token = refresh_token;
+                }
+                if let Some(expires_at) = expires_at {
+                    current.expires_at = expires_at;
+                }
+                current.credential_invalid = false;
+                current.error.clear();
+            })
+        })
+        .await
+        .map_err(|error| MgError::Io(error.to_string()))??;
         Ok(serde_json::json!({"ok": true, "message": "Trae 凭证已刷新"}))
     }
 

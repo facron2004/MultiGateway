@@ -406,6 +406,51 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn update_merges_into_live_account_and_never_resurrects_a_deleted_one() {
+        use super::AccountPool;
+
+        let dir = temp_pool_dir("update");
+        let pool = AccountPool::new(&dir);
+        let mut account = ready_account("same");
+        account.checkin = Some(json!({"today_checked_in": false}));
+        pool.save(account).unwrap();
+
+        // A check-in lands while a credential refresh is still in flight.
+        pool.update("same", |current| {
+            current.checkin = Some(json!({"today_checked_in": true}));
+        })
+        .unwrap();
+
+        let updated = pool
+            .update("same", |current| {
+                current.access_token = "fresh".to_string();
+                current.credential_invalid = false;
+                current.error.clear();
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.access_token, "fresh");
+        assert_eq!(updated.checkin, Some(json!({"today_checked_in": true})));
+
+        let on_disk: Account = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("same.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk.access_token, "fresh");
+        assert_eq!(on_disk.checkin, Some(json!({"today_checked_in": true})));
+
+        pool.delete("same").unwrap();
+        assert!(pool
+            .update("same", |current| current.access_token = "ghost".into())
+            .unwrap()
+            .is_none());
+        assert!(!dir.join("same.json").exists());
+        assert!(pool.get("same").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 impl Account {
@@ -825,6 +870,28 @@ impl AccountPool {
         self.persist(&account)?;
         self.accounts.write().insert(account.id.clone(), account);
         Ok(())
+    }
+
+    /// Mutates the live account before persisting, so a refresh that was in
+    /// flight only rewrites the fields it owns instead of restoring a stale
+    /// snapshot over concurrent quota/check-in updates. Returns `None` when the
+    /// account was deleted meanwhile; it must not be resurrected.
+    pub fn update<F>(&self, id: &str, mutate: F) -> Result<Option<Account>>
+    where
+        F: FnOnce(&mut Account),
+    {
+        let updated = {
+            let mut accounts = self.accounts.write();
+            match accounts.get_mut(id) {
+                Some(account) => {
+                    mutate(account);
+                    account.clone()
+                }
+                None => return Ok(None),
+            }
+        };
+        self.persist(&updated)?;
+        Ok(Some(updated))
     }
 
     /// Writes an account file atomically (tmp + rename) so a crash mid-write can

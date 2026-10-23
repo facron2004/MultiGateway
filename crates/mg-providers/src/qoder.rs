@@ -1508,15 +1508,17 @@ fn qoder_claim_date(value: &serde_json::Value) -> String {
 
 fn save_qoder_checkin(
     pool: &AccountPool,
-    mut account: mg_core::Account,
+    account: mg_core::Account,
     checked_in: bool,
 ) -> Result<()> {
-    account.checkin = Some(serde_json::json!({
-        "checked_in": checked_in,
-        "today_checked_in": checked_in,
-        "updated_at": mg_core::now_secs()
-    }));
-    pool.save(account)
+    pool.update(&account.id, |current| {
+        current.checkin = Some(serde_json::json!({
+            "checked_in": checked_in,
+            "today_checked_in": checked_in,
+            "updated_at": mg_core::now_secs()
+        }));
+    })?;
+    Ok(())
 }
 
 #[async_trait]
@@ -1915,7 +1917,7 @@ impl Provider for QoderProvider {
     }
 
     async fn refresh_credentials(&self, account_id: &str) -> Result<serde_json::Value> {
-        let mut account = self
+        let account = self
             .pool
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
@@ -1978,33 +1980,46 @@ impl Provider for QoderProvider {
                     "invalid_response",
                 )
             })?;
-        account.access_token = token.to_string();
-        if let Some(refresh_token) = data
+        let access_token = token.to_string();
+        let refresh_token = data
             .get("refresh_token")
             .and_then(serde_json::Value::as_str)
-        {
-            account.refresh_token = refresh_token.to_string();
-        }
-        if is_device {
-            account.expires_at = data
-                .get("expires_at")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-                .map(|timestamp| timestamp.timestamp() as f64)
-                .or_else(|| {
-                    data.get("expires_in")
-                        .and_then(qoder_number)
-                        .map(|millis| mg_core::now_secs() + millis / 1000.0)
-                })
-                .unwrap_or_else(|| mg_core::now_secs() + 30.0 * 86400.0);
-        } else if let Some(expires_in) = data.get("expires_in").and_then(qoder_number) {
-            account.expires_at = mg_core::now_secs() + expires_in / 1000.0;
-        }
+            .map(str::to_string);
+        let expires_at = if is_device {
+            Some(
+                data.get("expires_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+                    .map(|timestamp| timestamp.timestamp() as f64)
+                    .or_else(|| {
+                        data.get("expires_in")
+                            .and_then(qoder_number)
+                            .map(|millis| mg_core::now_secs() + millis / 1000.0)
+                    })
+                    .unwrap_or_else(|| mg_core::now_secs() + 30.0 * 86400.0),
+            )
+        } else {
+            data.get("expires_in")
+                .and_then(qoder_number)
+                .map(|millis| mg_core::now_secs() + millis / 1000.0)
+        };
         let pool = Arc::clone(&self.pool);
-        let saved = account.clone();
-        tokio::task::spawn_blocking(move || pool.save(saved))
-            .await
-            .map_err(|error| MgError::Io(error.to_string()))??;
+        let account_id = account.id.clone();
+        tokio::task::spawn_blocking(move || {
+            pool.update(&account_id, |current| {
+                current.access_token = access_token;
+                if let Some(refresh_token) = refresh_token {
+                    current.refresh_token = refresh_token;
+                }
+                if let Some(expires_at) = expires_at {
+                    current.expires_at = expires_at;
+                }
+                current.credential_invalid = false;
+                current.error.clear();
+            })
+        })
+        .await
+        .map_err(|error| MgError::Io(error.to_string()))??;
         Ok(serde_json::json!({"ok": true, "message": "Qoder 凭证已刷新"}))
     }
 

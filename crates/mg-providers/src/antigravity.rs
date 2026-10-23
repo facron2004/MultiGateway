@@ -706,10 +706,17 @@ impl AntigravityProvider {
         account.access_token = new_token.clone();
         account.expires_at = now + expires_in;
         let pool = Arc::clone(&self.pool);
-        let snapshot = account.clone();
-        tokio::task::spawn_blocking(move || pool.save(snapshot))
-            .await
-            .map_err(|error| MgError::Io(error.to_string()))??;
+        let account_id = account.id.clone();
+        let access_token = new_token.clone();
+        let expires_at = account.expires_at;
+        tokio::task::spawn_blocking(move || {
+            pool.update(&account_id, |current| {
+                current.access_token = access_token;
+                current.expires_at = expires_at;
+            })
+        })
+        .await
+        .map_err(|error| MgError::Io(error.to_string()))??;
 
         Ok(new_token)
     }
@@ -756,9 +763,18 @@ impl AntigravityProvider {
                             .extra
                             .insert("project_id".to_string(), serde_json::json!(pid));
                         let pool = Arc::clone(&self.pool);
-                        let snapshot = account.clone();
-                        let _ = tokio::task::spawn_blocking(move || pool.save(snapshot)).await;
-                        return Ok(pid.to_string());
+                        let account_id = account.id.clone();
+                        let pid = pid.to_string();
+                        let saved_pid = pid.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            pool.update(&account_id, |current| {
+                                current
+                                    .extra
+                                    .insert("project_id".to_string(), serde_json::json!(saved_pid));
+                            })
+                        })
+                        .await;
+                        return Ok(pid);
                     }
                 }
             }
