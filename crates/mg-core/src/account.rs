@@ -510,6 +510,18 @@ mod tests {
         assert_eq!(merged.checkin, Some(json!({"today_checked_in": true})));
 
         let ids = pool
+            .import_values(
+                &json!({"id": "qoder-personal", "extra": {"personal_token": "p"}}),
+                "cn",
+            )
+            .unwrap();
+        assert_eq!(ids, vec!["qoder-personal".to_string()]);
+        assert_eq!(
+            pool.get("qoder-personal").unwrap().extra["personal_token"],
+            json!("p")
+        );
+
+        let ids = pool
             .import_values(&json!({"id": "../../evil", "access_token": "x"}), "cn")
             .unwrap();
         assert!(!ids[0].contains('/') && !ids[0].contains('\\'));
@@ -739,6 +751,21 @@ fn sanitize_account_id(value: &str) -> String {
     } else {
         trimmed
     }
+}
+
+fn has_importable_credential(account: &Account) -> bool {
+    if !account.access_token.is_empty() || !account.refresh_token.is_empty() {
+        return true;
+    }
+    // Qoder personal tokens live in `extra` and are exchanged for an access
+    // token on first use, so an import without access/refresh is still usable.
+    ["personal_token", "personalToken"].iter().any(|key| {
+        account
+            .extra
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+    })
 }
 
 fn imported_entries(data: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
@@ -1155,7 +1182,7 @@ impl AccountPool {
                     continue;
                 }
             };
-            if account.access_token.is_empty() && account.refresh_token.is_empty() {
+            if !has_importable_credential(&account) {
                 skipped += 1;
                 continue;
             }
