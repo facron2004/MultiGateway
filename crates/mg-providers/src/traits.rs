@@ -48,5 +48,14 @@ pub trait Provider: Send + Sync {
     }
 
     async fn start_login(&self, redirect_url: Option<&str>) -> Result<serde_json::Value>;
+    /// Region-aware variant used by providers whose login endpoint differs per
+    /// realm. The default keeps the region-less behavior.
+    async fn start_login_region(
+        &self,
+        _region: Option<&str>,
+        redirect_url: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.start_login(redirect_url).await
+    }
     async fn poll_login(&self, login_id: &str) -> Result<serde_json::Value>;
 }

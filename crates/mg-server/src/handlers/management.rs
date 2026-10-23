@@ -166,6 +166,7 @@ pub async fn provider_snapshot(
                 "remaining": acc.remaining(),
                 "expires_at": acc.expires_at,
                 "error": acc.error,
+                "credential_invalid": acc.credential_invalid,
                 "quota": acc.quota,
                 "daily_tokens": daily_tokens,
                 "daily_tokens_complete": daily_tokens_complete,
@@ -276,7 +277,10 @@ pub async fn provider_login(
         }
     };
 
-    match provider.start_login(payload.redirect_url.as_deref()).await {
+    match provider
+        .start_login_region(payload.region.as_deref(), payload.redirect_url.as_deref())
+        .await
+    {
         Ok(res) => Json(res).into_response(),
         Err(e) => (
             StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::BAD_REQUEST),

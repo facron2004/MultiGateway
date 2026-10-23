@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod copilot;
 pub mod grok;
 pub mod minimax;
+mod model_limits;
 mod model_metadata;
 pub mod qoder;
 pub mod trae;

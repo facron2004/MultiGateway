@@ -790,9 +790,11 @@ body.sidebar-expanded .rail-bottom small {
   min-width: 200px;
 }
 main {
-  max-width: 960px;
+  width: 100%;
+  max-width: none;
   margin: 0 auto;
-  padding: 10px 16px 20px;
+  padding: 10px clamp(16px, 2.2vw, 44px) 20px;
+  box-sizing: border-box;
 }
 .region-switch {
   display: flex;
@@ -1587,7 +1589,9 @@ td .empty {
 }
 .chart-col b > i {
   display: block;
-  width: min(100%, 22px);
+  /* Grow with the column: a few early-hour buckets get wide columns and
+     therefore thicker bars, while a 30-day view still stays readable. */
+  width: min(60%, 72px);
   border-radius: 3px 3px 0 0;
   background: var(--teal);
 }

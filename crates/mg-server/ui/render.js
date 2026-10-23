@@ -207,17 +207,19 @@ function accountQuota(row, provider) {
 }
 function accountRowHtml(row, data, busy) {
   const current = row.region === data.region;
-  const active = current && row.enabled && row.ready;
+  const active = current && row.enabled && row.ready && !row.credential_invalid;
   const cooling = (row.cooldown_until || 0) > Date.now() / 1000;
   const status = !row.enabled
     ? "已停用"
     : !current
       ? "其他区域"
-      : cooling
-        ? "冷却中"
-        : row.ready
-          ? "可用"
-          : "暂不可用";
+      : row.credential_invalid
+        ? "需重新登录"
+        : cooling
+          ? "冷却中"
+          : row.ready
+            ? "可用"
+            : "暂不可用";
   const checkin = !row.checkin?.supported
     ? "不支持"
     : row.checkin.done === true
@@ -236,10 +238,9 @@ function accountRowHtml(row, data, busy) {
       <td><div class="account-actions">
         <button class="action-icon-btn ${row.enabled ? "btn-pause" : "btn-play"}" data-account-action="enable" data-id="${escape(row.id)}" aria-label="${row.enabled ? "停用账号" : "启用账号"}" title="${row.enabled ? "停用账号" : "启用账号"}" ${busy ? "disabled" : ""}>${icon(row.enabled ? "pause" : "play")}</button>
         <button class="action-icon-btn" data-row-action="credits" data-id="${escape(row.id)}" aria-label="刷新${usageUnit(data.provider)}" title="${!data.capabilities.credits ? "不支持刷新" : "刷新"}${usageUnit(data.provider)}" ${busy || !data.capabilities.credits ? "disabled" : ""}>${icon("refresh")}</button>
-        <button class="action-icon-btn" data-row-action="credentials" data-id="${escape(row.id)}" aria-label="刷新凭证" title="${!data.capabilities.credentials ? "不支持刷新凭证" : "刷新凭证"}" ${busy || !data.capabilities.credentials ? "disabled" : ""}>${icon("key")}</button>
+        <button class="action-icon-btn" data-row-action="credentials" data-id="${escape(row.id)}" aria-label="刷新凭证" title="${data.capabilities.credentials === false ? "不支持刷新凭证" : "刷新凭证"}" ${busy || data.capabilities.credentials === false ? "disabled" : ""}>${icon("key")}</button>
         <button class="action-icon-btn" data-row-action="checkin" data-id="${escape(row.id)}" aria-label="完成签到" title="${!data.capabilities.checkin || !row.checkin?.supported ? "不支持签到" : "完成签到"}" ${busy || !data.capabilities.checkin || !row.checkin?.supported ? "disabled" : ""}>${icon("checkin")}</button>
-        <button class="action-icon-btn danger" data-row-action="delete" data-id="${escape(row.id)}" aria-label="移除账号" title="移除账号（删除本机凭证）" ${busy ? "disabled" : ""}>${icon("delete")}</button>
-        <button class="action-icon-btn btn-delete" data-row-action="delete" data-id="${escape(row.id)}" aria-label="移除账号" title="移除账号" ${busy ? "disabled" : ""}>${icon("delete")}</button>
+        <button class="action-icon-btn btn-delete" data-row-action="delete" data-id="${escape(row.id)}" aria-label="移除账号" title="移除账号（删除本机凭证）" ${busy ? "disabled" : ""}>${icon("delete")}</button>
       </div></td>
     </tr>`;
 }
@@ -347,7 +348,20 @@ function formatTokens(n) {
     if (Number.isFinite(num)) n = num;
     else return escape(n);
   }
-  return n >= 1000000 ? (Math.round(n / 100000) / 10) + "M" : Math.round(n / 1000) + "K";
+  // Context/output limits are published in either base-1000 (200000, 128000)
+  // or base-1024 (131072, 65535). Pick whichever renders as the rounder
+  // number: 131072 is "128K", not "131K", and 65535 is "64K", not "66K".
+  const units = n >= 1000000
+    ? [["M", 1000000], ["M", 1048576]]
+    : [["K", 1000], ["K", 1024]];
+  let best = null;
+  for (const [suffix, divisor] of units) {
+    const scaled = n / divisor;
+    const rounded = Math.round(scaled * 10) / 10;
+    const error = Math.abs(scaled - rounded);
+    if (!best || error < best.error - 1e-9) best = { suffix, rounded, error };
+  }
+  return String(best.rounded).replace(/\.0$/, "") + best.suffix;
 }
 
 function modelRowHtml(provider, row) {

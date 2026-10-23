@@ -674,6 +674,7 @@ impl Provider for CopilotProvider {
             weight: 1,
             daily_tokens: 0,
             error: String::new(),
+            credential_invalid: false,
             quota: None,
             credits: None,
             checkin: None,

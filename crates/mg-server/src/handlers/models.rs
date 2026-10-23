@@ -471,9 +471,12 @@ mod tests {
         let data = body(response).await;
         assert_eq!(data["data"][0]["id"], "cn-model");
         // The management route publishes the same capability envelope as the
-        // inference route, so the dashboard can show what a model can do.
+        // inference route, so the dashboard can show what a model can do. A
+        // catalog entry that declares no reasoning stays unknown: provider
+        // defaults must not invent a tier ladder.
         assert_eq!(data["data"][0]["supports_tool_calls"], true);
-        assert_eq!(data["data"][0]["thinking"]["supported"], true);
+        assert_eq!(data["data"][0]["thinking"]["supported"], false);
+        assert!(data["data"][0]["supports_reasoning"].is_null());
 
         drop(state);
         let _ = std::fs::remove_dir_all(dir);

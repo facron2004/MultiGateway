@@ -14,8 +14,9 @@ body.settings-open:not(.sidebar-expanded) {
   height: 30px;
 }
 .settings-open main {
-  max-width: 1150px;
-  padding: 34px 48px 48px;
+  max-width: none;
+  padding: 34px clamp(24px, 3vw, 56px) 48px;
+  box-sizing: border-box;
 }
 .settings-open .agent-title > .settings-page-icon {
   display: flex;
@@ -69,7 +70,7 @@ body.settings-open:not(.sidebar-expanded) {
   display: inline;
 }
 .settings-page {
-  max-width: 1020px;
+  max-width: 1280px;
   margin: 0 auto;
 }
 .settings-section + .settings-section {

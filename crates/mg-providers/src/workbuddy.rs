@@ -7,12 +7,13 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use md5::{Digest, Md5};
-use mg_core::account::AccountQuota;
+use mg_core::account::{Account, AccountQuota};
 use mg_core::error::{MgError, Result};
 use mg_core::AccountPool;
 use mg_protocols::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatMessage, ModelEntry, ToolCall,
 };
+use parking_lot::RwLock;
 use reqwest::Client;
 use tracing::{info, warn};
 
@@ -27,6 +28,11 @@ const WORKBUDDY_REQUEST_BLOCKED_CODE: i64 = 11128;
 /// (`tool_call_sequence_broken`): every retry replays the same history.
 const WORKBUDDY_TOOL_MISMATCH_CODE: i64 = 11148;
 const WORKBUDDY_BLOCK_ATTEMPTS: u32 = 3;
+const WORKBUDDY_AUTH_STATE_PATH: &str = "/v2/plugin/auth/state";
+const WORKBUDDY_AUTH_TOKEN_PATH: &str = "/v2/plugin/auth/token";
+const WORKBUDDY_LOGIN_ACCOUNT_PATH: &str = "/v2/plugin/login/account";
+const WORKBUDDY_LOGIN_PENDING_CODE: i64 = 11217;
+const WORKBUDDY_LOGIN_TTL_SECS: f64 = 600.0;
 const WORKBUDDY_TEXT_REWRITES: &[(&str, &str)] = &[
     (
         "You are Claude Code, Anthropic's official CLI for Claude",
@@ -177,6 +183,32 @@ fn is_workbuddy_chat_model(id: &str) -> bool {
         && !id.ends_with("-x")
 }
 
+#[derive(Debug, Clone)]
+struct WorkBuddyLogin {
+    created_at: f64,
+    realm: String,
+    platform: String,
+}
+
+fn workbuddy_outbound_proxy() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub struct WorkBuddyProvider {
     /// Client for short non-streaming calls (catalog fetch, quota summary,
     /// checkin, credential refresh). Keeps a total timeout so a trickling
@@ -189,6 +221,8 @@ pub struct WorkBuddyProvider {
     intl_model_path: Option<PathBuf>,
     cn_model_path: Option<PathBuf>,
     legacy_model_path: Option<PathBuf>,
+    /// OAuth states started from the dashboard, keyed by the upstream `state`.
+    logins: RwLock<HashMap<String, WorkBuddyLogin>>,
 }
 
 impl WorkBuddyProvider {
@@ -198,16 +232,38 @@ impl WorkBuddyProvider {
         cn_model_path: Option<PathBuf>,
         legacy_model_path: Option<PathBuf>,
     ) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .connect_timeout(Duration::from_secs(5))
+        // reqwest on Windows reads the registry proxy, which is often disabled
+        // while the user still exports HTTPS_PROXY for the international host.
+        let proxy = workbuddy_outbound_proxy();
+        let mut client_builder = Client::builder().timeout(Duration::from_secs(600));
+        let mut stream_builder = Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(120));
+        if let Some(proxy) = proxy.as_deref() {
+            if let Ok(proxy) = reqwest::Proxy::all(proxy) {
+                client_builder = client_builder.proxy(proxy.clone());
+                stream_builder = stream_builder.proxy(proxy);
+            }
+        }
+        let client = match client_builder
+            // A CONNECT tunnel through a local proxy can take longer than a
+            // direct TLS handshake; 5s was short enough to time out reliably.
+            .connect_timeout(Duration::from_secs(20))
             .build()
-            .unwrap_or_default();
-        let stream_client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(120))
-            .build()
-            .unwrap_or_default();
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "WorkBuddy client build failed; falling back to defaults");
+                Client::new()
+            }
+        };
+        let stream_client = match stream_builder.build() {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "WorkBuddy stream client build failed; falling back to defaults");
+                Client::new()
+            }
+        };
 
         Self {
             client,
@@ -216,11 +272,56 @@ impl WorkBuddyProvider {
             intl_model_path,
             cn_model_path,
             legacy_model_path,
+            logins: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn pool(&self) -> &Arc<AccountPool> {
         &self.pool
+    }
+
+    async fn calibrate_models(&self, mut models: Vec<ModelEntry>) -> Vec<ModelEntry> {
+        let cache = match self.legacy_model_path.clone() {
+            Some(path) => {
+                tokio::task::spawn_blocking(move || crate::model_limits::read_limit_cache(&path))
+                    .await
+                    .unwrap_or_default()
+            }
+            None => HashMap::new(),
+        };
+        crate::model_limits::apply_known_limits(&mut models, &cache);
+        models
+    }
+
+    fn token_needs_refresh(account: &Account) -> bool {
+        account.access_token.is_empty()
+            || (account.expires_at > 0.0 && account.expires_at <= mg_core::now_secs() + 300.0)
+    }
+
+    /// Refresh before the request when the local expiry says the token is old.
+    /// A rejected refresh means the account must be signed in again, so the
+    /// caller stops instead of forwarding a request that is certain to 401.
+    async fn ensure_fresh_account(&self, account: Account) -> Result<Account> {
+        if !Self::token_needs_refresh(&account) || account.refresh_token.is_empty() {
+            return Ok(account);
+        }
+        match self.refresh_credentials(&account.id).await {
+            Ok(_) => self
+                .pool
+                .get(&account.id)
+                .ok_or_else(|| MgError::not_found("Account not found")),
+            Err(error) => {
+                if matches!(error.status_code(), 401 | 403) {
+                    self.pool.set_credential_invalid(
+                        &account.id,
+                        "凭证已失效，请重新登录 WorkBuddy 账号",
+                    );
+                } else {
+                    self.pool.set_error(&account.id, &error.message());
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -422,6 +523,53 @@ fn workbuddy_token_expiry(token: &str) -> Option<f64> {
     let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     let expiry = claims.get("exp")?.as_f64()?;
     (expiry > 0.0).then_some(expiry)
+}
+
+fn workbuddy_token_uid(token: &str) -> Option<String> {
+    use base64::Engine;
+    let token_body = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token_body)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(token_body))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("sub")
+        .or_else(|| claims.get("uid"))
+        .or_else(|| claims.get("user_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn workbuddy_timestamp(value: Option<&serde_json::Value>) -> Option<f64> {
+    let value = value?;
+    let mut number = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))?;
+    if number > 1e11 {
+        number /= 1000.0;
+    }
+    (number > 0.0).then_some(number)
+}
+
+fn workbuddy_auth_config(realm: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    if realm == "intl" {
+        (
+            "https://www.workbuddy.ai",
+            "https://www.workbuddy.ai",
+            "WorkBuddy/5.5.2",
+            "www.workbuddy.ai",
+        )
+    } else {
+        (
+            "https://copilot.tencent.com",
+            "https://www.codebuddy.cn",
+            "WorkBuddy/5.5.6",
+            "copilot.tencent.com",
+        )
+    }
 }
 
 fn parse_workbuddy_quota(payload: &serde_json::Value, checked_at: f64) -> Result<AccountQuota> {
@@ -1168,7 +1316,7 @@ impl Provider for WorkBuddyProvider {
             }
         }
         if !models.is_empty() {
-            return Ok(models);
+            return Ok(self.calibrate_models(models).await);
         }
 
         let local_paths: Vec<Option<&PathBuf>> = match selected_region {
@@ -1192,11 +1340,11 @@ impl Provider for WorkBuddyProvider {
                 .flatten();
             if let Some(models) = models {
                 if !models.is_empty() {
-                    return Ok(models);
+                    return Ok(self.calibrate_models(models).await);
                 }
             }
         }
-        Ok(fallback)
+        Ok(self.calibrate_models(fallback).await)
     }
 
     async fn chat(
@@ -1211,8 +1359,9 @@ impl Provider for WorkBuddyProvider {
         let account = self
             .pool
             .choose_in_region(session_id, None, Some(&region))?;
+        let mut account = self.ensure_fresh_account(account).await?;
 
-        let account_id = account.id.clone();
+        let mut account_id = account.id.clone();
         let is_cn = mg_core::account::regions_match(&account.region, "cn");
         let url = if is_cn {
             "https://copilot.tencent.com/v2/chat/completions"
@@ -1235,6 +1384,8 @@ impl Provider for WorkBuddyProvider {
         );
 
         let mut attempt: u32 = 0;
+        let mut refreshed_after_401 = false;
+        let mut account_switches: u32 = 0;
 
         let upstream_res = loop {
             attempt += 1;
@@ -1268,6 +1419,70 @@ impl Provider for WorkBuddyProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown upstream error".to_string());
+
+            // A 401 usually means the locally cached access token was revoked
+            // or expired early. Refresh once and resend before declaring the
+            // account dead; when the refresh token is also rejected the user
+            // has to sign in again.
+            if matches!(status.as_u16(), 401 | 403) {
+                if !refreshed_after_401 && !account.refresh_token.is_empty() {
+                    refreshed_after_401 = true;
+                    match self.refresh_credentials(&account_id).await {
+                        Ok(_) => {
+                            if let Some(updated) = self.pool.get(&account_id) {
+                                account = updated;
+                            }
+                            warn!(
+                                provider = "workbuddy",
+                                model = %req.model,
+                                account = %account_id,
+                                "WorkBuddy rejected the access token; refreshed and retrying"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            if !matches!(error.status_code(), 401 | 403) {
+                                self.pool.set_error(&account_id, &error.message());
+                                return Err(error);
+                            }
+                            self.pool.set_credential_invalid(
+                                &account_id,
+                                "凭证已失效，请重新登录 WorkBuddy 账号",
+                            );
+                        }
+                    }
+                } else {
+                    self.pool.set_credential_invalid(
+                        &account_id,
+                        "凭证已失效，请重新登录 WorkBuddy 账号",
+                    );
+                }
+
+                // Fail over to a healthy account in the same region instead
+                // of failing every request that the dead account happened to
+                // receive from the rotation.
+                if account_switches < 2 {
+                    account_switches += 1;
+                    if let Ok(next) = self.pool.choose_in_region(session_id, None, Some(&region)) {
+                        account = self.ensure_fresh_account(next).await?;
+                        account_id = account.id.clone();
+                        refreshed_after_401 = false;
+                        warn!(
+                            provider = "workbuddy",
+                            model = %req.model,
+                            account = %account_id,
+                            "failed over to another WorkBuddy account after 401"
+                        );
+                        continue;
+                    }
+                }
+                return Err(MgError::provider(
+                    401,
+                    "WorkBuddy 账号凭证已失效，请重新登录后再试",
+                    "credential_invalid",
+                ));
+            }
+
             if workbuddy_upstream_code(&err_text) == Some(WORKBUDDY_REQUEST_BLOCKED_CODE)
                 && attempt < WORKBUDDY_BLOCK_ATTEMPTS
             {
@@ -1348,7 +1563,7 @@ impl Provider for WorkBuddyProvider {
             .pool
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
-        if account.expires_at <= mg_core::now_secs() + 300.0 && !account.refresh_token.is_empty() {
+        if Self::token_needs_refresh(&account) && !account.refresh_token.is_empty() {
             self.refresh_credentials(account_id).await?;
             account = self
                 .pool
@@ -1377,30 +1592,60 @@ impl Provider for WorkBuddyProvider {
             "/billing/meter/get-user-resource-summary"
         };
 
-        let response = self
-            .client
-            .post(format!("{base}{usage_path}"))
-            .bearer_auth(&account.access_token)
-            .header("User-Agent", user_agent)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/plain, */*")
-            .header("Origin", base)
-            .header("Referer", format!("{base}/"))
-            .header("X-User-Id", &account.id)
-            .header("X-Client-Platform", "web")
-            .body("{}");
-        let response = if let Some(enterprise_id) = enterprise_id {
-            response
-                .header("X-Enterprise-Id", enterprise_id)
-                .send()
-                .await
-        } else {
-            response.send().await
-        }
-        .map_err(|error| MgError::provider(502, error.to_string(), "network_error"))?;
+        let mut refreshed = false;
+        let response = loop {
+            let response = self
+                .client
+                .post(format!("{base}{usage_path}"))
+                .bearer_auth(&account.access_token)
+                .header("User-Agent", user_agent)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Origin", base)
+                .header("Referer", format!("{base}/"))
+                .header("X-User-Id", &account.id)
+                .header("X-Client-Platform", "web")
+                .body("{}");
+            let response = if let Some(enterprise_id) = enterprise_id.clone() {
+                response
+                    .header("X-Enterprise-Id", enterprise_id)
+                    .send()
+                    .await
+            } else {
+                response.send().await
+            }
+            .map_err(|error| MgError::provider(502, error.to_string(), "network_error"))?;
+            if matches!(response.status().as_u16(), 401 | 403)
+                && !refreshed
+                && !account.refresh_token.is_empty()
+            {
+                refreshed = true;
+                if let Err(error) = self.refresh_credentials(account_id).await {
+                    if matches!(error.status_code(), 401 | 403) {
+                        self.pool.set_credential_invalid(
+                            account_id,
+                            "凭证已失效，请重新登录 WorkBuddy 账号",
+                        );
+                    } else {
+                        self.pool.set_error(account_id, &error.message());
+                    }
+                    return Err(error);
+                }
+                account = self
+                    .pool
+                    .get(account_id)
+                    .ok_or_else(|| MgError::not_found("Account not found"))?;
+                continue;
+            }
+            break response;
+        };
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 401 | 403) {
+                self.pool
+                    .set_credential_invalid(account_id, "凭证已失效，请重新登录 WorkBuddy 账号");
+            }
             return Err(MgError::provider(
                 status.as_u16(),
                 format!(
@@ -1575,6 +1820,10 @@ impl Provider for WorkBuddyProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 401 | 403) {
+                self.pool
+                    .set_credential_invalid(account_id, "凭证已失效，请重新登录 WorkBuddy 账号");
+            }
             return Err(MgError::provider(
                 status.as_u16(),
                 format!(
@@ -1609,6 +1858,8 @@ impl Provider for WorkBuddyProvider {
         if let Some(refresh_token) = data.get("refreshToken").and_then(serde_json::Value::as_str) {
             updated.refresh_token = refresh_token.to_string();
         }
+        updated.credential_invalid = false;
+        updated.error.clear();
         updated.expires_at = workbuddy_token_expiry(access_token)
             .or_else(|| {
                 data.get("expires_in")
@@ -1624,16 +1875,338 @@ impl Provider for WorkBuddyProvider {
         Ok(serde_json::json!({ "ok": true, "message": "WorkBuddy 凭证已刷新" }))
     }
 
-    async fn start_login(&self, _redirect_url: Option<&str>) -> Result<serde_json::Value> {
+    async fn start_login(&self, redirect_url: Option<&str>) -> Result<serde_json::Value> {
+        self.start_login_region(None, redirect_url).await
+    }
+
+    async fn start_login_region(
+        &self,
+        region: Option<&str>,
+        _redirect_url: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let realm = region
+            .and_then(|value| workbuddy_region(Some(value)))
+            .map(str::to_string)
+            .unwrap_or_else(|| self.active_region().unwrap_or_else(|| "cn".to_string()));
+        let (base, origin, user_agent, _) = workbuddy_auth_config(&realm);
+        let url = format!("{base}{WORKBUDDY_AUTH_STATE_PATH}?platform=CLI");
+        // The edge routinely drops the first TLS handshake, especially on the
+        // international host; a couple of retries are required for reliability.
+        let mut last_error = None;
+        let mut response = None;
+        for attempt in 1..=3u32 {
+            match self
+                .client
+                .post(&url)
+                .timeout(Duration::from_secs(30))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/plain, */*")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("User-Agent", user_agent)
+                .header("Origin", origin)
+                .header("Referer", format!("{origin}/"))
+                .body("{}")
+                .send()
+                .await
+            {
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
+                    }
+                }
+            }
+        }
+        let response = response.ok_or_else(|| {
+            MgError::provider(
+                502,
+                format!(
+                    "WorkBuddy login failed: {}",
+                    last_error
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| "network error".to_string())
+                ),
+                "network_error",
+            )
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(MgError::provider(
+                status.as_u16(),
+                format!(
+                    "WorkBuddy login failed: {}",
+                    crate::upstream_error_body(status.as_u16(), &body)
+                ),
+                "upstream_error",
+            ));
+        }
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| MgError::provider(502, error.to_string(), "invalid_response"))?;
+        let code = payload
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        if code != 0 {
+            return Err(MgError::provider(
+                502,
+                format!(
+                    "WorkBuddy login failed: {}",
+                    payload
+                        .get("msg")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("upstream rejected the login request")
+                ),
+                "upstream_error",
+            ));
+        }
+        let data = payload
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                MgError::provider(502, "WorkBuddy returned no login data", "invalid_response")
+            })?;
+        let state = data
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .filter(|state| !state.is_empty())
+            .ok_or_else(|| {
+                MgError::provider(502, "WorkBuddy returned no login state", "invalid_response")
+            })?
+            .to_string();
+        let auth_url = data
+            .get("authUrl")
+            .or_else(|| data.get("auth_url"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|url| url.starts_with("http"))
+            .ok_or_else(|| {
+                MgError::provider(
+                    502,
+                    "WorkBuddy returned no authorization URL",
+                    "invalid_response",
+                )
+            })?
+            .to_string();
+
+        let now = mg_core::now_secs();
+        {
+            let mut logins = self.logins.write();
+            logins.retain(|_, login| now - login.created_at <= WORKBUDDY_LOGIN_TTL_SECS);
+            logins.insert(
+                state.clone(),
+                WorkBuddyLogin {
+                    created_at: now,
+                    realm: realm.clone(),
+                    platform: "CLI".to_string(),
+                },
+            );
+        }
         Ok(serde_json::json!({
-            "status": "manual",
-            "message": "请在本地账号池配置文件添加凭据"
+            "status": "pending",
+            "state": state,
+            "login_id": state,
+            "url": auth_url,
+            "authUrl": auth_url,
+            "realm": realm,
+            "platform": "CLI",
+            "interval": 3
         }))
     }
 
-    async fn poll_login(&self, _login_id: &str) -> Result<serde_json::Value> {
+    async fn poll_login(&self, login_id: &str) -> Result<serde_json::Value> {
+        let state = login_id.trim();
+        let pending = self.logins.read().get(state).cloned();
+        let Some(pending) = pending else {
+            return Ok(serde_json::json!({
+                "status": "unknown",
+                "message": "登录状态已失效，请重新开始授权"
+            }));
+        };
+        if mg_core::now_secs() - pending.created_at > WORKBUDDY_LOGIN_TTL_SECS {
+            self.logins.write().remove(state);
+            return Ok(serde_json::json!({
+                "status": "expired",
+                "message": "登录窗口已过期，请重新开始授权"
+            }));
+        }
+
+        let (base, origin, user_agent, domain) = workbuddy_auth_config(&pending.realm);
+        let url = format!("{base}{WORKBUDDY_AUTH_TOKEN_PATH}?state={state}");
+        let response = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(30))
+            .header("Accept", "application/json, text/plain, */*")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("User-Agent", user_agent)
+            .header("Origin", origin)
+            .header("Referer", format!("{origin}/"))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Ok(serde_json::json!({
+                    "status": "pending",
+                    "message": format!(
+                        "等待授权（上游 {}）：{}",
+                        status.as_u16(),
+                        crate::upstream_error_body(status.as_u16(), &body)
+                    )
+                }));
+            }
+            Err(error) => {
+                return Ok(serde_json::json!({
+                    "status": "pending",
+                    "message": format!("等待授权：{error}")
+                }));
+            }
+        };
+        let payload = match response.json::<serde_json::Value>().await {
+            Ok(payload) => payload,
+            Err(_) => {
+                return Ok(serde_json::json!({
+                    "status": "pending",
+                    "message": "等待授权"
+                }));
+            }
+        };
+        let code = payload
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        if code == WORKBUDDY_LOGIN_PENDING_CODE {
+            return Ok(serde_json::json!({
+                "status": "pending",
+                "message": payload
+                    .get("msg")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("等待浏览器完成授权")
+            }));
+        }
+        if code != 0 {
+            self.logins.write().remove(state);
+            return Ok(serde_json::json!({
+                "status": "error",
+                "message": format!(
+                    "授权失败：{}",
+                    payload
+                        .get("msg")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("上游返回错误")
+                )
+            }));
+        }
+        let data = payload
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let access_token = data
+            .get("accessToken")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        let Some(access_token) = access_token else {
+            return Ok(serde_json::json!({
+                "status": "pending",
+                "message": "等待授权令牌"
+            }));
+        };
+        let refresh_token = data
+            .get("refreshToken")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let expires_at = workbuddy_timestamp(
+            data.get("expiresAt")
+                .or_else(|| data.get("expires_at")),
+        )
+        .or_else(|| workbuddy_token_expiry(&access_token))
+        .unwrap_or_else(|| mg_core::now_secs() + 3600.0);
+        let uid = workbuddy_token_uid(&access_token)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let mut nickname = String::new();
+        let profile_url = format!("{base}{WORKBUDDY_LOGIN_ACCOUNT_PATH}?state={state}");
+        if let Ok(response) = self
+            .client
+            .get(&profile_url)
+            .timeout(Duration::from_secs(15))
+            .header("Accept", "application/json, text/plain, */*")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("User-Agent", user_agent)
+            .header("Origin", origin)
+            .header("Referer", format!("{origin}/"))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .await
+        {
+            if let Ok(profile) = response.json::<serde_json::Value>().await {
+                nickname = profile
+                    .pointer("/data/nickname")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+
+        let mut extra = HashMap::new();
+        extra.insert("source".to_string(), serde_json::json!("oauth"));
+        extra.insert("domain".to_string(), serde_json::json!(domain));
+        extra.insert(
+            "platform".to_string(),
+            serde_json::json!(pending.platform.clone()),
+        );
+        let account = Account {
+            id: uid.clone(),
+            label: if nickname.is_empty() {
+                uid.chars().take(8).collect()
+            } else {
+                nickname.clone()
+            },
+            email: String::new(),
+            access_token,
+            refresh_token,
+            expires_at,
+            region: pending.realm.clone(),
+            enabled: true,
+            weight: 1,
+            daily_tokens: 0,
+            error: String::new(),
+            credential_invalid: false,
+            quota: None,
+            credits: None,
+            checkin: None,
+            extra,
+            provider_specific: None,
+            user_type: None,
+            organization_id: None,
+            organization_name: None,
+        };
+        let account_id = account.id.clone();
+        let account_name = account.display_name().to_string();
+        let pool = Arc::clone(&self.pool);
+        let snapshot = account.clone();
+        tokio::task::spawn_blocking(move || pool.save(snapshot))
+            .await
+            .map_err(|error| MgError::Io(error.to_string()))??;
+        self.logins.write().remove(state);
         Ok(serde_json::json!({
-            "status": "pending"
+            "status": "ok",
+            "account": {
+                "id": account_id,
+                "name": account_name,
+                "region": pending.realm
+            }
         }))
     }
 }
@@ -1643,7 +2216,8 @@ mod tests {
     use super::{
         normalize_workbuddy_request, parse_workbuddy_catalog, parse_workbuddy_enterprise_quota,
         parse_workbuddy_quota, read_product_catalog, with_workbuddy_desktop_identity,
-        workbuddy_fallback_models, workbuddy_fingerprint_id, workbuddy_upstream_code,
+        workbuddy_fallback_models, workbuddy_fingerprint_id, workbuddy_timestamp,
+        workbuddy_token_expiry, workbuddy_token_uid, workbuddy_upstream_code,
         ChatCompletionRequest, WORKBUDDY_REQUEST_BLOCKED_CODE,
     };
     use std::fs;
@@ -1662,6 +2236,18 @@ mod tests {
             workbuddy_fingerprint_id("", "machine"),
             workbuddy_fingerprint_id("anonymous", "machine")
         );
+    }
+
+    #[test]
+    fn reads_the_account_id_and_expiry_from_the_oauth_access_token() {
+        use base64::Engine;
+        let claims = serde_json::json!({"sub":"user-123","exp":1794879465});
+        let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let token = format!("e30.{body}.signature");
+        assert_eq!(workbuddy_token_uid(&token).as_deref(), Some("user-123"));
+        assert_eq!(workbuddy_token_expiry(&token), Some(1_794_879_465.0));
+        assert_eq!(workbuddy_timestamp(Some(&serde_json::json!(1_794_879_465_000i64))), Some(1_794_879_465.0));
     }
 
     #[test]

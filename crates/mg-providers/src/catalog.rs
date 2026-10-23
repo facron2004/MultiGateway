@@ -101,7 +101,14 @@ fn model_entry(value: &Value, map_id: Option<&str>, owner: &str) -> Option<Model
         return None;
     }
 
-    if value.get("model_picker_enabled") == Some(&Value::Bool(false)) {
+    let policy_state = value.pointer("/policy/state").and_then(Value::as_str);
+    // Copilot marks every entry `model_picker_enabled = false` on plans where
+    // the picker hides it, including models the API still serves (the actual
+    // decision is `policy.state`). Dropping on the picker flag alone made the
+    // whole live catalog look empty and the dashboard fall back to the four
+    // bare ids below, losing output limits and reasoning tiers.
+    let picker_disabled = value.get("model_picker_enabled") == Some(&Value::Bool(false));
+    if policy_state == Some("disabled") || (picker_disabled && policy_state.is_none()) {
         return None;
     }
     if value
@@ -199,6 +206,25 @@ mod tests {
         assert_eq!(
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["m1"]
+        );
+    }
+
+    #[test]
+    fn keeps_policy_enabled_models_even_when_the_picker_hides_them() {
+        let rows = parse_model_entries(
+            &json!({"data": [
+                {"id": "enabled", "model_picker_enabled": false,
+                 "policy": {"state": "enabled"}, "capabilities": {"type": "chat"}},
+                {"id": "disabled", "model_picker_enabled": false,
+                 "policy": {"state": "disabled"}, "capabilities": {"type": "chat"}},
+                {"id": "hidden", "model_picker_enabled": false,
+                 "capabilities": {"type": "chat"}}
+            ]}),
+            "copilot",
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["enabled"]
         );
     }
 }

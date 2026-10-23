@@ -87,6 +87,12 @@ pub struct Account {
     pub daily_tokens: u64,
     #[serde(default, alias = "lastError")]
     pub error: String,
+    /// Set when the upstream rejected the account's credentials and a refresh
+    /// could not recover them. Such an account is excluded from rotation until
+    /// the user signs in again, instead of being reported "ready" and failing
+    /// every request with 401.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub credential_invalid: bool,
     #[serde(default)]
     pub quota: Option<serde_json::Value>,
     #[serde(default)]
@@ -132,6 +138,9 @@ fn default_true() -> bool {
 }
 fn default_one() -> u32 {
     1
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -380,7 +389,7 @@ mod tests {
 
 impl Account {
     pub fn is_ready(&self) -> bool {
-        if !self.enabled {
+        if !self.enabled || self.credential_invalid {
             return false;
         }
         let now = now_secs();
@@ -523,6 +532,7 @@ fn merge_account_json(existing: serde_json::Value, account: &Account) -> Result<
         "daily_tokens",
         "error",
         "lastError",
+        "credential_invalid",
         "quota",
         "credits",
         "checkin",
@@ -1022,6 +1032,24 @@ impl AccountPool {
             let mut accounts = self.accounts.write();
             match accounts.get_mut(account_id) {
                 Some(acc) => {
+                    acc.error = err_msg.to_string();
+                    acc.clone()
+                }
+                None => return,
+            }
+        };
+        let _ = self.persist(&updated);
+    }
+
+    /// Marks the stored credentials as unusable (upstream rejected them and the
+    /// refresh token could not recover them). The account stops being selected
+    /// until a successful sign-in or credential refresh clears the flag.
+    pub fn set_credential_invalid(&self, account_id: &str, err_msg: &str) {
+        let updated = {
+            let mut accounts = self.accounts.write();
+            match accounts.get_mut(account_id) {
+                Some(acc) => {
+                    acc.credential_invalid = true;
                     acc.error = err_msg.to_string();
                     acc.clone()
                 }

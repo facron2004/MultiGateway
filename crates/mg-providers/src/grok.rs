@@ -63,8 +63,61 @@ fn quota_number(value: &serde_json::Value) -> Option<f64> {
     number.is_finite().then_some(number)
 }
 
-fn parse_grok_quota(payload: &serde_json::Value, checked_at: f64) -> Result<AccountQuota> {
-    let config = payload
+/// Grok publishes the standard window in `context_window` and the selectable
+/// long-context versions in `context_windows` (256K and 500K for 4.5/4.6/4.7).
+/// Keep the base window for the dashboard, but expose the largest window as
+/// `max_context`/`context_length` so clients do not truncate at 256K.
+fn enrich_grok_context(model: &mut ModelEntry) {
+    let windows: Vec<u64> = model
+        .extra
+        .get("context_windows")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .filter(|value| *value > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    let base = model
+        .extra
+        .get("context_window")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .or_else(|| windows.iter().copied().min());
+    let Some(base) = base else {
+        return;
+    };
+    model
+        .extra
+        .insert("context_window".to_string(), serde_json::json!(base));
+    model
+        .extra
+        .insert("context".to_string(), serde_json::json!(base));
+    model
+        .extra
+        .insert("context_length".to_string(), serde_json::json!(base));
+    model
+        .extra
+        .insert("max_input_tokens".to_string(), serde_json::json!(base));
+    if let Some(max) = windows.iter().copied().max().filter(|max| *max > base) {
+        model
+            .extra
+            .insert("max_context".to_string(), serde_json::json!(max));
+        model
+            .extra
+            .insert("context_length".to_string(), serde_json::json!(max));
+        model
+            .extra
+            .insert("max_input_tokens".to_string(), serde_json::json!(max));
+        model
+            .extra
+            .insert("context_windows".to_string(), serde_json::json!(windows));
+    }
+}
+
+fn parse_grok_quota(payload: &serde_json::Value, checked_at: f64) -> Result<AccountQuota> {    let config = payload
         .get("config")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| {
@@ -305,7 +358,10 @@ impl Provider for GrokProvider {
         };
         match response.json::<serde_json::Value>().await {
             Ok(data) => {
-                let models = parse_model_entries(&data, "xai");
+                let mut models = parse_model_entries(&data, "xai");
+                for model in &mut models {
+                    enrich_grok_context(model);
+                }
                 Ok(if models.is_empty() { fallback } else { models })
             }
             Err(_) => Ok(fallback),
@@ -575,8 +631,23 @@ impl Provider for GrokProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_grok_quota;
+    use super::{enrich_grok_context, parse_grok_quota, ModelEntry};
     use serde_json::json;
+
+    #[test]
+    fn exposes_the_long_context_window_as_the_client_limit() {
+        let mut model: ModelEntry = serde_json::from_value(json!({
+            "id": "grok-4.7",
+            "context_window": 256000,
+            "context_windows": [256000, 500000]
+        }))
+        .unwrap();
+        enrich_grok_context(&mut model);
+        assert_eq!(model.extra["context_window"], 256000);
+        assert_eq!(model.extra["max_context"], 500000);
+        assert_eq!(model.extra["context_length"], 500000);
+        assert_eq!(model.extra["context_windows"], json!([256000, 500000]));
+    }
 
     #[test]
     fn parses_grok_usage_as_remaining_percentage() {

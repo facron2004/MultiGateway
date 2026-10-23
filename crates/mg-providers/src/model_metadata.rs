@@ -32,15 +32,17 @@ pub const EFFORT_LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh
 
 /// Tier spellings folded onto [`EFFORT_LEVELS`].
 fn canonical_effort(name: &str) -> Option<&'static str> {
-    Some(match name.trim().to_ascii_lowercase().replace(' ', "_").as_str() {
-        "minimal" | "min" => "minimal",
-        "light" | "low" => "low",
-        "medium" | "mid" | "normal" | "default" | "balanced" => "medium",
-        "high" => "high",
-        "extra_high" | "extra-high" | "x-high" | "xhigh" | "very_high" => "xhigh",
-        "max" | "maximum" | "ultimate" | "ultra" => "max",
-        _ => return None,
-    })
+    Some(
+        match name.trim().to_ascii_lowercase().replace(' ', "_").as_str() {
+            "minimal" | "min" => "minimal",
+            "light" | "low" => "low",
+            "medium" | "mid" | "normal" | "default" | "balanced" => "medium",
+            "high" => "high",
+            "extra_high" | "extra-high" | "x-high" | "xhigh" | "very_high" => "xhigh",
+            "max" | "maximum" | "ultimate" | "ultra" => "max",
+            _ => return None,
+        },
+    )
 }
 
 /// Tier spellings that mean "thinking off". They are advertised under
@@ -113,7 +115,7 @@ impl ProviderDefaults {
                 default_effort: Some("medium"),
                 can_disable: true,
                 vision_families: &[],
-                plain_families: &["gpt-4", "gpt-3", "o3-mini"],
+                plain_families: &["gpt-3.5", "gpt-4-0613", "gpt-4-0125-preview"],
             },
             // MiniMax's agent models speak the Anthropic protocol (images and
             // tool calls) and reason with an xhigh top tier.
@@ -263,7 +265,7 @@ impl Thinking {
 
 /// Collect the raw effort labels a catalog publishes (before normalisation).
 fn raw_efforts(fields: &Fields<'_>, features: &Value) -> Vec<String> {
-    let sources: [Option<&Value>; 7] = [
+    let sources: [Option<&Value>; 8] = [
         fields.field("supported_reasoning_efforts"),
         fields.field("reasoning_efforts"),
         fields.pointer("reasoning_effort_config", &["options"]),
@@ -271,6 +273,8 @@ fn raw_efforts(fields: &Fields<'_>, features: &Value) -> Vec<String> {
         fields.pointer("thinking", &["efforts"]),
         fields.field("supported_reasoning_levels"),
         features.pointer("/reasoning/efforts"),
+        // Copilot publishes its ladder under `capabilities.supports`.
+        fields.pointer("capabilities", &["supports", "reasoning_effort"]),
     ];
     for source in sources.into_iter().flatten() {
         let names = effort_names(Some(source));
@@ -296,9 +300,12 @@ fn normalize_thinking(names: &[String]) -> Thinking {
             }
         }
     }
-    thinking
-        .tiers
-        .sort_by_key(|tier| EFFORT_LEVELS.iter().position(|level| level == tier).unwrap_or(usize::MAX));
+    thinking.tiers.sort_by_key(|tier| {
+        EFFORT_LEVELS
+            .iter()
+            .position(|level| level == tier)
+            .unwrap_or(usize::MAX)
+    });
     thinking
 }
 
@@ -327,9 +334,7 @@ fn default_from_map(value: Option<&Value>) -> Option<String> {
 /// see `-low` described as `high`.
 fn tier_from_id(id: &str) -> Option<&'static str> {
     let lower = id.to_ascii_lowercase();
-    let tail = lower
-        .rsplit(['-', '_'])
-        .next()?;
+    let tail = lower.rsplit(['-', '_']).next()?;
     if tail.is_empty() || tail.len() > 3 && tail != "medium" {
         return None;
     }
@@ -355,17 +360,32 @@ fn limits(fields: &Fields<'_>) -> (Option<u64>, Option<u64>) {
         .or_else(|| positive(fields.field("maxInputTokens")))
         .or_else(|| positive(fields.field("context_window")))
         .or_else(|| positive(fields.pointer("context_window", &["defaultLength"])))
-        .or_else(|| positive(fields.pointer("capabilities", &["limits", "max_context_window_tokens"])));
+        .or_else(|| {
+            positive(fields.pointer("capabilities", &["limits", "max_context_window_tokens"]))
+        });
     let output = positive(fields.field("max_output_tokens"))
         .or_else(|| positive(fields.field("max_completion_tokens")))
         .or_else(|| positive(fields.field("maxOutputTokens")))
         .or_else(|| positive(fields.pointer("capabilities", &["limits", "max_output_tokens"])))
         .or_else(|| {
-            positive(
-                fields.pointer("capabilities", &["limits", "max_non_streaming_output_tokens"]),
-            )
+            positive(fields.pointer(
+                "capabilities",
+                &["limits", "max_non_streaming_output_tokens"],
+            ))
         });
     (context, output)
+}
+
+/// Model families that are text-only even though some gateways publish a
+/// blanket `supportsImages: true` for every model they host. Sourced from the
+/// vendor-official models.dev entries (zai / deepseek / tencent / openai).
+fn is_known_text_only(id: &str) -> bool {
+    let id = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+    matches!(id.as_str(), "glm-5.1" | "glm-5.2" | "glm-5.3")
+        || id.starts_with("deepseek-v4-pro")
+        || id.starts_with("hy3")
+        || id.starts_with("hy4-preview")
+        || id.starts_with("gpt-oss-120b")
 }
 
 fn id_matches(id: &str, families: &[&str]) -> bool {
@@ -410,10 +430,21 @@ pub fn with_provider_metadata(mut model: ModelEntry, defaults: ProviderDefaults)
             thinking = normalize_thinking(&[fixed]);
         }
     }
-    if thinking.tiers.is_empty() && !is_plain {
+    let reasoning_explicitly_off = bool_field(fields.field("supports_reasoning")) == Some(false)
+        || bool_field(fields.field("supportsReasoning")) == Some(false)
+        || bool_field(fields.field("is_reasoning")) == Some(false)
+        || bool_field(fields.pointer("capabilities", &["supports", "reasoning"])) == Some(false);
+    if thinking.tiers.is_empty()
+        && !is_plain
+        && defaults.reasoning == Some(true)
+        && !reasoning_explicitly_off
+    {
         if let Some(efforts) = defaults.efforts {
             thinking = normalize_thinking(
-                &efforts.iter().map(|tier| tier.to_string()).collect::<Vec<_>>(),
+                &efforts
+                    .iter()
+                    .map(|tier| tier.to_string())
+                    .collect::<Vec<_>>(),
             );
         }
     }
@@ -424,11 +455,7 @@ pub fn with_provider_metadata(mut model: ModelEntry, defaults: ProviderDefaults)
         fields.pointer("reasoning", &["defaultEffort"]),
         fields.pointer("thinking", &["default_effort"]),
     ])
-    .map(|name| {
-        canonical_effort(&name)
-            .map(str::to_string)
-            .unwrap_or(name)
-    })
+    .map(|name| canonical_effort(&name).map(str::to_string).unwrap_or(name))
     .filter(|name| thinking.tiers.contains(name))
     .or_else(|| default_from_map(fields.pointer("thinking_config", &["enabled", "efforts"])))
     .filter(|name| thinking.tiers.contains(name))
@@ -448,9 +475,17 @@ pub fn with_provider_metadata(mut model: ModelEntry, defaults: ProviderDefaults)
     .unwrap_or_default();
     thinking.default_effort = default_effort;
 
+    let reasoning_budget_declared = fields
+        .pointer("capabilities", &["supports", "max_thinking_budget"])
+        .and_then(Value::as_u64)
+        .is_some_and(|budget| budget > 0);
     let reasoning = first_bool(&[
         bool_field(fields.field("supports_reasoning")),
         bool_field(fields.field("supportsReasoning")),
+        // Copilot marks reasoning-capable models only with
+        // `capabilities.supports.adaptive_thinking`.
+        bool_field(fields.pointer("capabilities", &["supports", "adaptive_thinking"])),
+        reasoning_budget_declared.then_some(true),
         // `thinking_config` is a structured declaration of a toggle and a tier
         // ladder; Qoder sets `is_reasoning: false` on models that still carry it,
         // so the richer field has to win over the flat legacy flag.
@@ -495,7 +530,12 @@ pub fn with_provider_metadata(mut model: ModelEntry, defaults: ProviderDefaults)
     });
 
     // ---- image input ----
-    let vision = if bool_field(fields.field("disabledMultimodal")) == Some(true) {
+    // A known text-only family outranks a provider's blanket flag: WorkBuddy
+    // and Qoder both mark every hosted model as image-capable, including GLM,
+    // DeepSeek-Pro and Hunyuan text models.
+    let vision = if is_known_text_only(fields.id) {
+        Some(false)
+    } else if bool_field(fields.field("disabledMultimodal")) == Some(true) {
         Some(false)
     } else {
         first_bool(&[
@@ -515,11 +555,7 @@ pub fn with_provider_metadata(mut model: ModelEntry, defaults: ProviderDefaults)
                 .or_else(|| fields.pointer("modalities", &["input"]))
                 .or_else(|| fields.pointer("architecture", &["input_modalities"]))
                 .and_then(Value::as_array)
-                .map(|inputs| {
-                    inputs
-                        .iter()
-                        .any(|input| input.as_str() == Some("image"))
-                })
+                .map(|inputs| inputs.iter().any(|input| input.as_str() == Some("image")))
         })
         .or_else(|| {
             // A family the provider knows to be text-only is a fact, not a gap,
@@ -571,7 +607,11 @@ pub fn with_provider_metadata(mut model: ModelEntry, defaults: ProviderDefaults)
             (None, false) => None,
         }
     })
-    .or(if thinking.can_disable { Some(true) } else { None });
+    .or(if thinking.can_disable {
+        Some(true)
+    } else {
+        None
+    });
     thinking.can_disable = can_disable.unwrap_or(false) && reasoning == Some(true);
 
     // ---- audio / video ----
@@ -732,10 +772,7 @@ mod tests {
         let model = normalize(json!({"id":"seed", "multimodal":true,
             "reasoning_effort_config":{"support_thinking":true,"options":["light","high"],"default_level":"high"},
             "features":"{\"reasoning\":{\"enable\":true}}"}));
-        assert_eq!(
-            model["capabilities"]["reasoning"],
-            json!(true)
-        );
+        assert_eq!(model["capabilities"]["reasoning"], json!(true));
         assert_eq!(model["capabilities"]["vision"], json!(true));
         // Trae's `light` is the gateway's `low`: one ladder for every provider.
         assert_eq!(model["reasoning_efforts"], json!(["low", "high"]));
@@ -805,7 +842,10 @@ mod tests {
         assert_eq!(model["supports_reasoning"], true);
         assert_eq!(model["reasoning_efforts"], json!(["low", "high", "max"]));
         assert_eq!(model["reasoning_default_effort"], "max");
-        assert_eq!(model["supports_reasoning"], model["capabilities"]["reasoning"]);
+        assert_eq!(
+            model["supports_reasoning"],
+            model["capabilities"]["reasoning"]
+        );
         assert_eq!(model["thinking"]["supported"], true);
         assert_eq!(model["reasoning_can_disable"], true);
     }
@@ -815,7 +855,10 @@ mod tests {
         // The coding build is a variant of grok-4.7, not the plain grok-build line.
         let variant = normalize_for(json!({"id": "grok-4.7-build-fast"}), "grok");
         assert_eq!(variant["supports_reasoning"], true);
-        assert_eq!(variant["reasoning_efforts"], json!(["low", "medium", "high", "xhigh"]));
+        assert_eq!(
+            variant["reasoning_efforts"],
+            json!(["low", "medium", "high", "xhigh"])
+        );
         // The plain family id still has its own, narrower answer.
         let family = normalize_for(json!({"id": "grok-build-0.1"}), "grok");
         assert_eq!(family["supports_reasoning"], false);
@@ -850,7 +893,10 @@ mod tests {
         let antigravity = normalize_for(json!({"id": "gemini-3-flash"}), "antigravity");
         assert_eq!(antigravity["supports_vision"], true);
         assert_eq!(antigravity["supports_tool_calls"], true);
-        assert_eq!(antigravity["reasoning_efforts"], json!(["low", "medium", "high"]));
+        assert_eq!(
+            antigravity["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
         assert_eq!(antigravity["reasoning_default_effort"], "high");
 
         // An explicit upstream answer wins over the provider default.
@@ -866,6 +912,75 @@ mod tests {
         assert_eq!(plain["supports_reasoning"], false);
         assert_eq!(plain["thinking"]["supported"], false);
         assert_eq!(plain["reasoning_efforts"], json!([]));
+    }
+
+    #[test]
+    fn reads_copilot_reasoning_ladder_and_keeps_gpt_41_multimodal() {
+        let claude = normalize_for(
+            json!({"id": "claude-sonnet-x", "capabilities": {
+                "type": "chat",
+                "supports": {
+                    "adaptive_thinking": true,
+                    "reasoning_effort": ["low", "medium", "high"],
+                    "vision": true,
+                    "tool_calls": true
+                },
+                "limits": {"max_context_window_tokens": 264000, "max_output_tokens": 64000}
+            }}),
+            "copilot",
+        );
+        assert_eq!(claude["supports_reasoning"], true);
+        assert_eq!(
+            claude["reasoning_efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert_eq!(claude["reasoning_default_effort"], "medium");
+        assert_eq!(claude["max_output_tokens"], 64000);
+        assert_eq!(claude["context_length"], 264000);
+        assert_eq!(claude["supports_vision"], true);
+
+        // `gpt-4` used to be matched as a plain prefix family, which also
+        // caught gpt-4.1/gpt-4o and erased their vision capability and the
+        // provider's reasoning ladder.
+        let gpt = normalize_for(
+            json!({"id": "gpt-4.1", "capabilities": {
+                "type": "chat",
+                "supports": {"vision": true, "tool_calls": true},
+                "limits": {"max_context_window_tokens": 128000, "max_output_tokens": 16384}
+            }}),
+            "copilot",
+        );
+        assert_eq!(gpt["supports_vision"], true);
+        assert_eq!(gpt["max_output_tokens"], 16384);
+        // No reasoning declaration means no invented tier ladder.
+        assert_eq!(gpt["reasoning_efforts"], json!([]));
+        assert!(gpt["supports_reasoning"].is_null());
+    }
+
+    #[test]
+    fn known_text_only_families_override_blanket_vision_flags() {
+        for id in [
+            "glm-5.1",
+            "glm-5.2",
+            "glm-5.3",
+            "deepseek-v4-pro",
+            "deepseek-v4-pro-official",
+            "hy3",
+            "hy3-x",
+            "hy4-preview",
+            "gpt-oss-120b-medium",
+        ] {
+            let model = normalize_for(json!({"id": id, "supportsImages": true}), "workbuddy");
+            assert_eq!(model["supports_vision"], false, "{id}");
+            assert_eq!(model["input_modalities"], json!(["text"]), "{id}");
+        }
+        // The Flash line really is multimodal; do not let the GLM-5.3
+        // text-only rule swallow it.
+        let flash = normalize_for(
+            json!({"id": "glm-5.3-flash", "supportsImages": true}),
+            "workbuddy",
+        );
+        assert_eq!(flash["supports_vision"], true);
     }
 
     #[test]
@@ -894,11 +1009,16 @@ mod tests {
         assert_eq!(toggle["thinking"]["supported"], true);
         assert_eq!(toggle["thinking"]["can_disable"], true);
         assert_eq!(toggle["reasoning_can_disable"], true);
-        assert_eq!(toggle["thinking"]["levels"], json!(["none", "low", "high", "max"]));
+        assert_eq!(
+            toggle["thinking"]["levels"],
+            json!(["none", "low", "high", "max"])
+        );
 
         // onlyReasoning=true means thinking cannot be switched off at all.
-        let forced = normalize(json!({"id":"Hy","supportsReasoning":true,"onlyReasoning":true,
-            "reasoning":{"supportedEfforts":["high"]}}));
+        let forced = normalize(
+            json!({"id":"Hy","supportsReasoning":true,"onlyReasoning":true,
+            "reasoning":{"supportedEfforts":["high"]}}),
+        );
         assert_eq!(forced["reasoning_can_disable"], false);
         assert_eq!(forced["thinking"]["levels"], json!(["high"]));
 
