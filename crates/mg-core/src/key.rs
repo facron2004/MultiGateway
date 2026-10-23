@@ -109,6 +109,9 @@ pub struct KeyManager {
 impl KeyManager {
     pub fn new(data_dir: impl AsRef<Path>, master_key: Option<String>) -> io::Result<Self> {
         let path = data_dir.as_ref().join("api_keys.json");
+        let master_key = master_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
         let (mut keys, imported) = match read_json(&path)? {
             Some(value) => (
                 serde_json::from_value::<Vec<ApiKeyEntry>>(value).map_err(io::Error::other)?,
@@ -203,7 +206,15 @@ impl KeyManager {
     }
 
     pub fn is_authorized(&self, token: &str) -> bool {
-        // If master key set
+        // Keyless desktop mode intentionally accepts anonymous requests.
+        if !self.auth_required() {
+            return true;
+        }
+        // An empty configured key must never turn an unauthenticated request
+        // into an authorized one.
+        if token.is_empty() {
+            return false;
+        }
         if let Some(master) = &self.master_key {
             if master == token {
                 return true;
@@ -211,16 +222,17 @@ impl KeyManager {
         }
 
         let keys = self.keys.read();
-        // If no keys configured at all, open access is allowed (same as MultiGateway desktop mode)
-        if keys.is_empty() && self.master_key.is_none() {
-            return true;
-        }
-
-        // Check if token matches any enabled key
-        keys.iter().any(|k| k.enabled && k.key == token)
+        keys.iter()
+            .any(|k| k.enabled && !k.key.is_empty() && k.key == token)
     }
 
     pub fn check_model_allowed(&self, token: &str, model: &str) -> bool {
+        if !self.auth_required() {
+            return true;
+        }
+        if token.is_empty() {
+            return false;
+        }
         if let Some(master) = &self.master_key {
             if master == token {
                 return true;
@@ -228,14 +240,14 @@ impl KeyManager {
         }
 
         let keys = self.keys.read();
-        if let Some(entry) = keys.iter().find(|k| k.key == token) {
+        if let Some(entry) = keys.iter().find(|k| k.enabled && k.key == token) {
             if entry.models.is_empty() {
                 return true; // No restrictions
             }
             return entry.models.iter().any(|m| m == model);
         }
 
-        true
+        false
     }
 }
 
@@ -321,5 +333,29 @@ mod tests {
         assert_eq!(keys.list().len(), 1);
         assert_eq!(KeyManager::new(&dir, None).unwrap().list().len(), 1);
         assert!(keys.is_authorized(&existing.key));
+    }
+
+    #[test]
+    fn empty_configured_keys_never_authorize_anonymous_requests() {
+        let dir = directory();
+        let keyless = KeyManager::new(&dir, Some("   ".to_string())).unwrap();
+        assert!(!keyless.auth_required());
+        assert!(keyless.is_authorized(""));
+
+        let trimmed = KeyManager::new(&dir, Some(" secret ".to_string())).unwrap();
+        assert!(trimmed.auth_required());
+        assert!(!trimmed.is_authorized(""));
+        assert!(!trimmed.is_authorized("secret "));
+        assert!(trimmed.is_authorized("secret"));
+
+        let empty_entry_dir = directory();
+        fs::write(empty_entry_dir.join("api_keys.json"), r#"[{"key":""}]"#).unwrap();
+        let with_entry = KeyManager::new(&empty_entry_dir, None).unwrap();
+        assert!(with_entry.auth_required());
+        assert!(!with_entry.is_authorized(""));
+        assert!(!with_entry.check_model_allowed("", "any-model"));
+
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(empty_entry_dir);
     }
 }

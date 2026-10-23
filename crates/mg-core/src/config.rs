@@ -74,7 +74,10 @@ impl Config {
                 .unwrap_or(8791)
         });
 
-        let api_key = api_key.or_else(|| std::env::var("MG_API_KEY").ok());
+        let api_key = api_key
+            .or_else(|| std::env::var("MG_API_KEY").ok())
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
 
         let antigravity_client_id = std::env::var("ANTIGRAVITY_OAUTH_CLIENT_ID")
             .unwrap_or_default();
