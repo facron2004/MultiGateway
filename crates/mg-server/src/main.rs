@@ -68,6 +68,26 @@ fn is_local_management_request(headers: &HeaderMap, port: u16) -> bool {
     }
 }
 
+/// Whether a browser `Origin` points into the local machine. Used to keep
+/// keyless loopback inference usable for native clients and local web apps
+/// while rejecting arbitrary websites that script the gateway.
+fn is_loopback_origin(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    let Some(rest) = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        after_bracket.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// The desktop window talks to Tauri IPC; HTTP management is for the local
 /// dashboard only. Keeping it loopback-only prevents `--host 0.0.0.0` from
 /// exposing account credentials and plaintext API keys to the LAN.
@@ -96,7 +116,9 @@ async fn local_management_only(
 /// `KeyManager` intentionally allows keyless access before the first API key is
 /// created, which is convenient on loopback but turns a `0.0.0.0` listener into
 /// an open proxy. Remote inference therefore requires at least one configured
-/// key; `/health` stays public for monitoring.
+/// key; `/health` stays public for monitoring. Keyless loopback inference also
+/// rejects web origins, because the API advertises permissive CORS and otherwise
+/// any visited website could spend the operator's accounts from the browser.
 async fn inference_remote_auth(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -104,15 +126,35 @@ async fn inference_remote_auth(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if !peer.ip().is_loopback()
-        && path != "/health"
-        && !state.key_manager.auth_required()
-    {
+    if path == "/health" || state.key_manager.auth_required() {
+        return next.run(request).await;
+    }
+    if !peer.ip().is_loopback() {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": {
                     "message": "Create an API key before exposing inference to the network"
+                }
+            })),
+        )
+            .into_response();
+    }
+    let from_web_origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|origin| {
+            origin
+                .to_str()
+                .map(|origin| !is_loopback_origin(origin))
+                .unwrap_or(true)
+        });
+    if from_web_origin {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Create an API key before calling the gateway from a web page"
                 }
             })),
         )
@@ -491,7 +533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_local_management_request, local_management_origin};
+    use super::{is_local_management_request, is_loopback_origin, local_management_origin};
     use axum::http::{header, HeaderMap, HeaderValue};
 
     fn headers(host: &str, origin: Option<&str>) -> HeaderMap {
@@ -536,5 +578,17 @@ mod tests {
             8791
         ));
         assert!(local_management_origin("HTTP://LOCALHOST:8791", 8791));
+    }
+
+    #[test]
+    fn keyless_inference_allows_native_clients_but_rejects_web_origins() {
+        assert!(is_loopback_origin("http://localhost:3000"));
+        assert!(is_loopback_origin("http://127.0.0.1:8791"));
+        assert!(is_loopback_origin("https://[::1]:5173"));
+        assert!(!is_loopback_origin("http://localhost.evil.example"));
+        assert!(!is_loopback_origin("https://evil.example"));
+        // Sandboxed/filed pages send an opaque origin that cannot be trusted.
+        assert!(!is_loopback_origin("null"));
+        assert!(!is_loopback_origin("file:///tmp/page.html"));
     }
 }

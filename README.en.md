@@ -128,7 +128,8 @@ GitHub Actions tests, builds, and checks release packages on native Windows x64/
 Management endpoints (`/gateway/*`, `/settings*` and dashboard assets) accept loopback requests
 only. Binding the gateway to `0.0.0.0` exposes the inference API to the LAN without exposing
 account management, API keys or settings. Remote inference is rejected until at least one API key
-exists; loopback clients can still use the gateway without one.
+exists; loopback clients can still use the gateway without one. Browser requests carrying a
+non-loopback `Origin` are rejected too, so create an API key before calling the gateway from a web page.
 
 The combined `/v1/models` list returns provider-prefixed ids only. Each model carries the capabilities the upstream actually reported, published under the same field set for every provider:
 
