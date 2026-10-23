@@ -1483,6 +1483,171 @@ impl QoderProvider {
         let text = response.text().await.unwrap_or_default();
         Ok((status, text))
     }
+
+    async fn exchange_credentials(&self, account: mg_core::Account) -> Result<serde_json::Value> {
+        let base = qoder_openapi(&account.region);
+        let personal_token = account
+            .extra
+            .get("personal_token")
+            .or_else(|| account.extra.get("personalToken"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        let (path, body, is_device) = if account.refresh_token.starts_with("drt-") {
+            (
+                QODER_DEVICE_REFRESH_PATH,
+                serde_json::json!({"refresh_token": account.refresh_token}),
+                true,
+            )
+        } else if account.refresh_token.starts_with("jrt-") {
+            (
+                QODER_JOB_REFRESH_PATH,
+                serde_json::json!({"refresh_token": account.refresh_token}),
+                false,
+            )
+        } else if !personal_token.is_empty() {
+            (
+                QODER_JOB_EXCHANGE_PATH,
+                serde_json::json!({"personal_token": personal_token}),
+                false,
+            )
+        } else if account.expires_at > mg_core::now_secs() && !account.access_token.is_empty() {
+            return Ok(serde_json::json!({"ok": true, "message": "当前凭证仍有效"}));
+        } else {
+            return Err(MgError::unauthorized(
+                "Qoder account has no refresh credential",
+            ));
+        };
+
+        let grant = match self.token_grant(&format!("{base}{path}"), body).await {
+            Ok(grant) => grant,
+            Err(error) if path == QODER_JOB_REFRESH_PATH && !personal_token.is_empty() => self
+                .token_grant(
+                    &format!("{base}{QODER_JOB_EXCHANGE_PATH}"),
+                    serde_json::json!({"personal_token": personal_token}),
+                )
+                .await
+                .map_err(|_| error)?,
+            Err(error) => return Err(error),
+        };
+        let data = grant.get("data").unwrap_or(&grant);
+        let token = data
+            .get("token")
+            .or_else(|| data.get("device_token"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                MgError::provider(
+                    502,
+                    "Qoder refresh response has no token",
+                    "invalid_response",
+                )
+            })?;
+        let access_token = token.to_string();
+        let refresh_token = data
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let expires_at = if is_device {
+            Some(
+                data.get("expires_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+                    .map(|timestamp| timestamp.timestamp() as f64)
+                    .or_else(|| {
+                        data.get("expires_in")
+                            .and_then(qoder_number)
+                            .map(|millis| mg_core::now_secs() + millis / 1000.0)
+                    })
+                    .unwrap_or_else(|| mg_core::now_secs() + 30.0 * 86400.0),
+            )
+        } else {
+            data.get("expires_in")
+                .and_then(qoder_number)
+                .map(|millis| mg_core::now_secs() + millis / 1000.0)
+        };
+        let pool = Arc::clone(&self.pool);
+        let account_id = account.id.clone();
+        tokio::task::spawn_blocking(move || {
+            pool.update(&account_id, |current| {
+                current.access_token = access_token;
+                if let Some(refresh_token) = refresh_token {
+                    current.refresh_token = refresh_token;
+                }
+                if let Some(expires_at) = expires_at {
+                    current.expires_at = expires_at;
+                }
+                current.credential_invalid = false;
+                current.error.clear();
+            })
+        })
+        .await
+        .map_err(|error| MgError::Io(error.to_string()))??;
+        Ok(serde_json::json!({"ok": true, "message": "Qoder 凭证已刷新"}))
+    }
+
+    fn token_needs_refresh(account: &mg_core::Account) -> bool {
+        account.access_token.is_empty()
+            || (account.expires_at > 0.0 && account.expires_at <= mg_core::now_secs() + 300.0)
+    }
+
+    fn has_refresh_credential(account: &mg_core::Account) -> bool {
+        if !account.refresh_token.is_empty() {
+            return true;
+        }
+        account
+            .extra
+            .get("personal_token")
+            .or_else(|| account.extra.get("personalToken"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+    }
+
+    /// Serialize refreshes per account: Qoder rotates refresh tokens, so a
+    /// second exchange with the pre-rotation token would fail and could
+    /// invalidate the account even though the first refresh succeeded.
+    async fn refresh_after_401(&self, account_id: &str, failed_token: &str) -> Result<()> {
+        let lock = self.pool.refresh_lock(account_id);
+        let _guard = lock.lock().await;
+        if let Some(current) = self.pool.get(account_id) {
+            if current.access_token != failed_token && !Self::token_needs_refresh(&current) {
+                return Ok(());
+            }
+        }
+        let account = self
+            .pool
+            .get(account_id)
+            .ok_or_else(|| MgError::not_found("Account not found"))?;
+        self.exchange_credentials(account).await?;
+        Ok(())
+    }
+
+    async fn ensure_fresh_account(&self, account: mg_core::Account) -> Result<mg_core::Account> {
+        if !Self::token_needs_refresh(&account) || !Self::has_refresh_credential(&account) {
+            return Ok(account);
+        }
+        let lock = self.pool.refresh_lock(&account.id);
+        let _guard = lock.lock().await;
+        let account = self.pool.get(&account.id).unwrap_or(account);
+        if !Self::token_needs_refresh(&account) {
+            return Ok(account);
+        }
+        let account_id = account.id.clone();
+        match self.exchange_credentials(account).await {
+            Ok(_) => self
+                .pool
+                .get(&account_id)
+                .ok_or_else(|| MgError::not_found("Account not found")),
+            Err(error) => {
+                if matches!(error.status_code(), 401 | 403) {
+                    self.pool
+                        .set_credential_invalid(&account_id, "凭证已失效，请重新登录 Qoder 账号");
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 fn qoder_china_date(now: i64) -> String {
@@ -1582,6 +1747,10 @@ impl Provider for QoderProvider {
         let Some(account) = representative_account(&self.pool, Some(realm)) else {
             return Ok(fallback);
         };
+        let account = match self.ensure_fresh_account(account).await {
+            Ok(account) => account,
+            Err(_) => return Ok(fallback),
+        };
         let body = qoder_encode(b"{}");
         for host in qoder_gateway_candidates(realm) {
             let url = format!("{host}{QODER_MODEL_PATH}");
@@ -1636,96 +1805,132 @@ impl Provider for QoderProvider {
         let mut account = self
             .pool
             .choose_in_region(session_id, None, Some(&region))?;
-        if account.expires_at <= mg_core::now_secs() + 300.0 && !account.refresh_token.is_empty() {
-            self.refresh_credentials(&account.id).await?;
-            account = self
-                .pool
-                .get(&account.id)
-                .ok_or_else(|| MgError::not_found("Account not found"))?;
-        }
+        account = self.ensure_fresh_account(account).await?;
         let requested_model = req.model.clone();
         let model_key = canonical_qoder_model_key(&requested_model, &self.model_keys.read());
-        let account_id = account.id.clone();
-        let realm = if matches!(account.region.as_str(), "intl" | "global") {
-            "intl"
-        } else {
-            "cn"
-        };
-        let body = qoder_chat_body(&req, &account, &model_key, &requested_model)?;
 
         info!(
             provider = "qoder",
             model = %requested_model,
-            account = %account_id,
+            account = %account.id,
             stream = req.stream,
             "Forwarding chat completion to Qoder"
         );
 
-        let mut last_error = None;
-        let mut upstream_res = None;
-        for host in qoder_gateway_candidates(realm) {
-            let url = format!("{host}{QODER_CHAT_PATH}");
-            let mut headers = match qoder_cosy_headers(&account, &url, &body) {
-                Ok(headers) => headers,
-                Err(error) => {
-                    return Err(MgError::provider(500, error, "invalid_request"));
-                }
+        let mut refreshed_after_401 = false;
+        let (upstream_res, account_id) = 'request: loop {
+            let account_id = account.id.clone();
+            let realm = if matches!(account.region.as_str(), "intl" | "global") {
+                "intl"
+            } else {
+                "cn"
             };
-            for (name, value) in &mut headers {
-                if *name == "accept" {
-                    *value = "text/event-stream".to_string();
-                }
-            }
-            let mut request = self.stream_client.post(&url).body(body.clone());
-            for (name, value) in headers {
-                request = request.header(name, value);
-            }
-            request = request
-                .header("cache-control", "no-cache")
-                .header("x-model-key", &model_key)
-                .header("x-model-source", "system");
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    upstream_res = Some(response);
-                    break;
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let err_text = response.text().await.unwrap_or_default();
-                    if crate::is_account_level_failure(status.as_u16()) {
-                        self.pool
-                            .mark_cooldown(&account_id, crate::ACCOUNT_COOLDOWN_SECS);
-                        self.pool
-                            .set_error(&account_id, &format!("upstream HTTP {}", status.as_u16()));
+            let body = qoder_chat_body(&req, &account, &model_key, &requested_model)?;
+
+            let mut last_error = None;
+            let mut upstream_res = None;
+            for host in qoder_gateway_candidates(realm) {
+                let url = format!("{host}{QODER_CHAT_PATH}");
+                let mut headers = match qoder_cosy_headers(&account, &url, &body) {
+                    Ok(headers) => headers,
+                    Err(error) => {
+                        return Err(MgError::provider(500, error, "invalid_request"));
                     }
-                    last_error = Some(MgError::provider(
-                        status.as_u16(),
-                        format!(
-                            "Qoder request failed: {}",
-                            crate::upstream_error_body(status.as_u16(), &err_text)
-                        ),
-                        "upstream_error",
-                    ));
-                    if crate::is_account_level_failure(status.as_u16()) || status.as_u16() < 500 {
+                };
+                for (name, value) in &mut headers {
+                    if *name == "accept" {
+                        *value = "text/event-stream".to_string();
+                    }
+                }
+                let mut request = self.stream_client.post(&url).body(body.clone());
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                request = request
+                    .header("cache-control", "no-cache")
+                    .header("x-model-key", &model_key)
+                    .header("x-model-source", "system");
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => {
+                        upstream_res = Some(response);
                         break;
                     }
-                }
-                Err(error) => {
-                    last_error = Some(MgError::provider(
-                        502,
-                        format!("Qoder connection failed: {}", error_chain(&error)),
-                        "network_error",
-                    ));
+                    Ok(response) => {
+                        let status = response.status();
+                        let err_text = response.text().await.unwrap_or_default();
+                        if matches!(status.as_u16(), 401 | 403) {
+                            // The cached access token was revoked or expired early.
+                            // Refresh once and resend instead of declaring the
+                            // account dead on the first rejection.
+                            if !refreshed_after_401 && Self::has_refresh_credential(&account) {
+                                refreshed_after_401 = true;
+                                let failed_token = account.access_token.clone();
+                                match self.refresh_after_401(&account_id, &failed_token).await {
+                                    Ok(_) => {
+                                        if let Some(updated) = self.pool.get(&account_id) {
+                                            account = updated;
+                                        }
+                                        tracing::warn!(
+                                            provider = "qoder",
+                                            account = %account_id,
+                                            "Qoder rejected the access token; refreshed and retrying"
+                                        );
+                                        continue 'request;
+                                    }
+                                    Err(error) => {
+                                        if !matches!(error.status_code(), 401 | 403) {
+                                            self.pool.set_error(&account_id, &error.message());
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                            }
+                            self.pool.set_credential_invalid(
+                                &account_id,
+                                "凭证已失效，请重新登录 Qoder 账号",
+                            );
+                            return Err(MgError::provider(
+                                401,
+                                "Qoder 账号凭证已失效，请重新登录后再试",
+                                "credential_invalid",
+                            ));
+                        }
+                        if crate::is_account_level_failure(status.as_u16()) {
+                            self.pool
+                                .mark_cooldown(&account_id, crate::ACCOUNT_COOLDOWN_SECS);
+                            self.pool.set_error(
+                                &account_id,
+                                &format!("upstream HTTP {}", status.as_u16()),
+                            );
+                        }
+                        last_error = Some(MgError::provider(
+                            status.as_u16(),
+                            format!(
+                                "Qoder request failed: {}",
+                                crate::upstream_error_body(status.as_u16(), &err_text)
+                            ),
+                            "upstream_error",
+                        ));
+                        if crate::is_account_level_failure(status.as_u16()) || status.as_u16() < 500
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        last_error = Some(MgError::provider(
+                            502,
+                            format!("Qoder connection failed: {}", error_chain(&error)),
+                            "network_error",
+                        ));
+                    }
                 }
             }
-        }
-        let upstream_res = match upstream_res {
-            Some(response) => response,
-            None => {
+            let Some(response) = upstream_res else {
                 return Err(last_error.unwrap_or_else(|| {
                     MgError::provider(502, "Qoder connection failed", "network_error")
-                }))
-            }
+                }));
+            };
+            break (response, account_id);
         };
 
         let stream_req_id: Arc<str> =
@@ -1754,18 +1959,11 @@ impl Provider for QoderProvider {
     }
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota> {
-        let mut account = self
+        let account = self
             .pool
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
-
-        if account.expires_at <= mg_core::now_secs() + 300.0 && !account.refresh_token.is_empty() {
-            self.refresh_credentials(account_id).await?;
-            account = self
-                .pool
-                .get(account_id)
-                .ok_or_else(|| MgError::not_found("Account not found"))?;
-        }
+        let mut account = self.ensure_fresh_account(account).await?;
 
         let url = format!("{}{}", qoder_openapi(&account.region), QODER_QUOTA_PATH);
         let origin = if matches!(account.region.as_str(), "intl" | "global") {
@@ -1773,21 +1971,56 @@ impl Provider for QoderProvider {
         } else {
             "https://qoder.com.cn"
         };
-        let response = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(20))
-            .bearer_auth(&account.access_token)
-            .header("Accept", "application/json")
-            .header("User-Agent", "Go-http-client/2.0")
-            .header("Origin", origin)
-            .header("Referer", format!("{origin}/"))
-            .send()
-            .await
-            .map_err(|error| MgError::provider(502, error.to_string(), "network_error"))?;
+        let mut refreshed = false;
+        let response = loop {
+            let response = self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(20))
+                .bearer_auth(&account.access_token)
+                .header("Accept", "application/json")
+                .header("User-Agent", "Go-http-client/2.0")
+                .header("Origin", origin)
+                .header("Referer", format!("{origin}/"))
+                .send()
+                .await
+                .map_err(|error| MgError::provider(502, error.to_string(), "network_error"))?;
+            if matches!(response.status().as_u16(), 401 | 403)
+                && !refreshed
+                && Self::has_refresh_credential(&account)
+            {
+                refreshed = true;
+                let failed_token = account.access_token.clone();
+                match self.refresh_after_401(account_id, &failed_token).await {
+                    Ok(_) => {
+                        account = self
+                            .pool
+                            .get(account_id)
+                            .ok_or_else(|| MgError::not_found("Account not found"))?;
+                        continue;
+                    }
+                    Err(error) => {
+                        if matches!(error.status_code(), 401 | 403) {
+                            self.pool.set_credential_invalid(
+                                account_id,
+                                "凭证已失效，请重新登录 Qoder 账号",
+                            );
+                        } else {
+                            self.pool.set_error(account_id, &error.message());
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            break response;
+        };
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 401 | 403) {
+                self.pool
+                    .set_credential_invalid(account_id, "凭证已失效，请重新登录 Qoder 账号");
+            }
             return Err(MgError::provider(
                 status.as_u16(),
                 format!(
@@ -1811,6 +2044,7 @@ impl Provider for QoderProvider {
             .pool
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
+        let account = self.ensure_fresh_account(account).await?;
         if account.access_token.is_empty() {
             return Err(MgError::unauthorized("Qoder account has no token"));
         }
@@ -1917,110 +2151,22 @@ impl Provider for QoderProvider {
     }
 
     async fn refresh_credentials(&self, account_id: &str) -> Result<serde_json::Value> {
+        let lock = self.pool.refresh_lock(account_id);
+        let _guard = lock.lock().await;
         let account = self
             .pool
             .get(account_id)
             .ok_or_else(|| MgError::not_found("Account not found"))?;
-        let base = qoder_openapi(&account.region);
-        let personal_token = account
-            .extra
-            .get("personal_token")
-            .or_else(|| account.extra.get("personalToken"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-
-        let (path, body, is_device) = if account.refresh_token.starts_with("drt-") {
-            (
-                QODER_DEVICE_REFRESH_PATH,
-                serde_json::json!({"refresh_token": account.refresh_token}),
-                true,
-            )
-        } else if account.refresh_token.starts_with("jrt-") {
-            (
-                QODER_JOB_REFRESH_PATH,
-                serde_json::json!({"refresh_token": account.refresh_token}),
-                false,
-            )
-        } else if !personal_token.is_empty() {
-            (
-                QODER_JOB_EXCHANGE_PATH,
-                serde_json::json!({"personal_token": personal_token}),
-                false,
-            )
-        } else if account.expires_at > mg_core::now_secs() && !account.access_token.is_empty() {
-            return Ok(serde_json::json!({"ok": true, "message": "当前凭证仍有效"}));
-        } else {
-            return Err(MgError::unauthorized(
-                "Qoder account has no refresh credential",
-            ));
-        };
-
-        let grant = match self.token_grant(&format!("{base}{path}"), body).await {
-            Ok(grant) => grant,
-            Err(error) if path == QODER_JOB_REFRESH_PATH && !personal_token.is_empty() => self
-                .token_grant(
-                    &format!("{base}{QODER_JOB_EXCHANGE_PATH}"),
-                    serde_json::json!({"personal_token": personal_token}),
-                )
-                .await
-                .map_err(|_| error)?,
-            Err(error) => return Err(error),
-        };
-        let data = grant.get("data").unwrap_or(&grant);
-        let token = data
-            .get("token")
-            .or_else(|| data.get("device_token"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| {
-                MgError::provider(
-                    502,
-                    "Qoder refresh response has no token",
-                    "invalid_response",
-                )
-            })?;
-        let access_token = token.to_string();
-        let refresh_token = data
-            .get("refresh_token")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let expires_at = if is_device {
-            Some(
-                data.get("expires_at")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-                    .map(|timestamp| timestamp.timestamp() as f64)
-                    .or_else(|| {
-                        data.get("expires_in")
-                            .and_then(qoder_number)
-                            .map(|millis| mg_core::now_secs() + millis / 1000.0)
-                    })
-                    .unwrap_or_else(|| mg_core::now_secs() + 30.0 * 86400.0),
-            )
-        } else {
-            data.get("expires_in")
-                .and_then(qoder_number)
-                .map(|millis| mg_core::now_secs() + millis / 1000.0)
-        };
-        let pool = Arc::clone(&self.pool);
-        let account_id = account.id.clone();
-        tokio::task::spawn_blocking(move || {
-            pool.update(&account_id, |current| {
-                current.access_token = access_token;
-                if let Some(refresh_token) = refresh_token {
-                    current.refresh_token = refresh_token;
+        match self.exchange_credentials(account).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if matches!(error.status_code(), 401 | 403) {
+                    self.pool
+                        .set_credential_invalid(account_id, "凭证已失效，请重新登录 Qoder 账号");
                 }
-                if let Some(expires_at) = expires_at {
-                    current.expires_at = expires_at;
-                }
-                current.credential_invalid = false;
-                current.error.clear();
-            })
-        })
-        .await
-        .map_err(|error| MgError::Io(error.to_string()))??;
-        Ok(serde_json::json!({"ok": true, "message": "Qoder 凭证已刷新"}))
+                Err(error)
+            }
+        }
     }
 
     async fn start_login(&self, _redirect_url: Option<&str>) -> Result<serde_json::Value> {
@@ -2043,6 +2189,7 @@ mod tests {
         canonical_qoder_model_key, enrich_qoder_model, off_peak_active_now, parse_qoder_catalog,
         parse_qoder_quota, qoder_cosy_headers, qoder_encode, qoder_fallback_models, qoder_identity,
         qoder_model_key_map, qoder_response_json, qoder_stream_event, QODER_CUSTOM_ALPHABET,
+        QoderProvider,
     };
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -2231,6 +2378,29 @@ mod tests {
             .chars()
             .all(|character| QODER_CUSTOM_ALPHABET.contains(character) || character == '$'));
         assert_eq!(qoder_decode(&encoded), b"{}");
+    }
+
+    #[test]
+    fn detects_tokens_that_need_refresh_and_personal_token_credentials() {
+        let mut account: mg_core::Account = serde_json::from_value(json!({
+            "id": "qoder-user",
+            "access_token": "test-access-token",
+            "expires_at": mg_core::now_secs() + 3600.0
+        }))
+        .unwrap();
+        assert!(!QoderProvider::token_needs_refresh(&account));
+        assert!(!QoderProvider::has_refresh_credential(&account));
+
+        account
+            .extra
+            .insert("personal_token".to_string(), json!("personal-token"));
+        assert!(QoderProvider::has_refresh_credential(&account));
+
+        account.expires_at = mg_core::now_secs() + 60.0;
+        assert!(QoderProvider::token_needs_refresh(&account));
+
+        account.access_token.clear();
+        assert!(QoderProvider::token_needs_refresh(&account));
     }
 
     #[test]
