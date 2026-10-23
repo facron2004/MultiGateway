@@ -1358,6 +1358,10 @@ impl Provider for WorkBuddyProvider {
             .unwrap_or("cn");
         let account = representative_account(&self.pool, Some(selected_region));
         let fallback = workbuddy_fallback_models(selected_region);
+        let account = match account {
+            Some(account) => self.ensure_fresh_account(account).await.ok(),
+            None => None,
+        };
         let mut models = Vec::new();
         if let Some(account) = account {
             let realm = selected_region;
@@ -1760,6 +1764,7 @@ impl Provider for WorkBuddyProvider {
             ));
         }
 
+        let mut account = self.ensure_fresh_account(account).await?;
         if account.access_token.is_empty() {
             return Ok(serde_json::json!({
                 "ok": false,
@@ -1767,62 +1772,108 @@ impl Provider for WorkBuddyProvider {
             }));
         }
 
-        let resp = self
-            .client
-            .post("https://www.codebuddy.cn/v2/billing/meter/daily-checkin")
-            .header("Authorization", format!("Bearer {}", account.access_token))
-            .header("User-Agent", "WorkBuddy/5.5.6")
-            .header("Content-Type", "application/json")
-            .header("Origin", "https://www.codebuddy.cn")
-            .body("{}")
-            .send()
-            .await;
-
-        match resp {
-            Ok(res) => {
-                let status = res.status();
-                let text = res.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    // WorkBuddy answers an already-claimed day with HTTP 400
-                    // and "今日已签到"; that is a success state, not a failure.
-                    if crate::is_already_checked_in_message(&text) {
-                        save_workbuddy_checked_in(&self.pool, account.clone()).await?;
-                        return Ok(serde_json::json!({
-                            "ok": true,
-                            "already": true,
-                            "message": "今日已签到"
-                        }));
+        let mut refreshed = false;
+        let resp = loop {
+            let resp = self
+                .client
+                .post("https://www.codebuddy.cn/v2/billing/meter/daily-checkin")
+                .header("Authorization", format!("Bearer {}", account.access_token))
+                .header("User-Agent", "WorkBuddy/5.5.6")
+                .header("Content-Type", "application/json")
+                .header("Origin", "https://www.codebuddy.cn")
+                .body("{}")
+                .send()
+                .await;
+            match resp {
+                Ok(res)
+                    if matches!(res.status().as_u16(), 401 | 403)
+                        && !refreshed
+                        && !account.refresh_token.is_empty() =>
+                {
+                    refreshed = true;
+                    let failed_token = account.access_token.clone();
+                    match self.refresh_after_401(&account.id, &failed_token).await {
+                        Ok(_) => {
+                            if let Some(updated) = self.pool.get(&account.id) {
+                                account = updated;
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            if !matches!(error.status_code(), 401 | 403) {
+                                self.pool.set_error(&account.id, &error.message());
+                                return Err(error);
+                            }
+                            self.pool.set_credential_invalid(
+                                &account.id,
+                                "凭证已失效，请重新登录 WorkBuddy 账号",
+                            );
+                            return Err(MgError::provider(
+                                401,
+                                "WorkBuddy 账号凭证已失效，请重新登录后再试",
+                                "credential_invalid",
+                            ));
+                        }
                     }
-                    return Err(MgError::provider(
-                        status.as_u16(),
-                        format!(
-                            "WorkBuddy check-in failed: {}",
-                            crate::upstream_error_body(status.as_u16(), &text)
-                        ),
-                        "upstream_error",
-                    ));
                 }
-                let v: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
-                    MgError::provider(502, error.to_string(), "invalid_response")
-                })?;
-                let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("未知响应");
-                if code == 0 || code == 10001 {
-                    save_workbuddy_checked_in(&self.pool, account.clone()).await?;
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "code": code,
-                        "message": if code == 10001 { "今日已完成签到" } else { "签到成功" }
-                    }))
-                } else {
-                    Ok(serde_json::json!({
-                        "ok": false,
-                        "code": code,
-                        "message": format!("签到失败: {} ({})", msg, status)
-                    }))
+                Ok(res) => {
+                    if matches!(res.status().as_u16(), 401 | 403) {
+                        self.pool.set_credential_invalid(
+                            &account.id,
+                            "凭证已失效，请重新登录 WorkBuddy 账号",
+                        );
+                    }
+                    break res;
+                }
+                Err(error) => {
+                    return Err(MgError::provider(
+                        502,
+                        error.to_string(),
+                        "network_error",
+                    ))
                 }
             }
-            Err(error) => Err(MgError::provider(502, error.to_string(), "network_error")),
+        };
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            // WorkBuddy answers an already-claimed day with HTTP 400
+            // and "今日已签到"; that is a success state, not a failure.
+            if crate::is_already_checked_in_message(&text) {
+                save_workbuddy_checked_in(&self.pool, account.clone()).await?;
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "already": true,
+                    "message": "今日已签到"
+                }));
+            }
+            return Err(MgError::provider(
+                status.as_u16(),
+                format!(
+                    "WorkBuddy check-in failed: {}",
+                    crate::upstream_error_body(status.as_u16(), &text)
+                ),
+                "upstream_error",
+            ));
+        }
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| MgError::provider(502, error.to_string(), "invalid_response"))?;
+        let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("未知响应");
+        if code == 0 || code == 10001 {
+            save_workbuddy_checked_in(&self.pool, account.clone()).await?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "code": code,
+                "message": if code == 10001 { "今日已完成签到" } else { "签到成功" }
+            }))
+        } else {
+            Ok(serde_json::json!({
+                "ok": false,
+                "code": code,
+                "message": format!("签到失败: {} ({})", msg, status)
+            }))
         }
     }
 
