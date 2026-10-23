@@ -365,6 +365,47 @@ impl GrokProvider {
     }
 }
 
+fn grok_image_url(part: &serde_json::Value) -> Option<String> {
+    part.pointer("/image_url/url")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            part.get("image_url")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| part.get("url").and_then(serde_json::Value::as_str))
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+fn grok_input_content(content: Option<&serde_json::Value>) -> serde_json::Value {
+    match content {
+        Some(serde_json::Value::Array(parts)) => {
+            let converted: Vec<serde_json::Value> = parts
+                .iter()
+                .filter_map(|part| {
+                    match part.get("type").and_then(serde_json::Value::as_str) {
+                        Some("text" | "input_text" | "output_text") => part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|text| serde_json::json!({"type": "input_text", "text": text})),
+                        Some("image_url" | "input_image") => grok_image_url(part)
+                            .map(|url| serde_json::json!({"type": "input_image", "image_url": url})),
+                        _ => None,
+                    }
+                })
+                .collect();
+            if converted.is_empty() {
+                serde_json::Value::String(content.map(|value| value.to_string()).unwrap_or_default())
+            } else {
+                serde_json::Value::Array(converted)
+            }
+        }
+        Some(serde_json::Value::String(text)) => serde_json::Value::String(text.clone()),
+        Some(other) => serde_json::Value::String(other.to_string()),
+        None => serde_json::Value::String(String::new()),
+    }
+}
+
 #[async_trait]
 impl Provider for GrokProvider {
     fn id(&self) -> &'static str {
@@ -449,14 +490,10 @@ impl Provider for GrokProvider {
                 } else {
                     "user"
                 };
-                let text = match msg.content {
-                    Some(serde_json::Value::String(s)) => s,
-                    Some(val) => val.to_string(),
-                    None => String::new(),
-                };
+                let content = grok_input_content(msg.content.as_ref());
                 input.push(serde_json::json!({
                     "role": role,
-                    "content": text
+                    "content": content
                 }));
             }
         }
@@ -761,8 +798,29 @@ impl Provider for GrokProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{enrich_grok_context, parse_grok_quota, GrokProvider, ModelEntry};
+    use super::{
+        enrich_grok_context, grok_input_content, parse_grok_quota, GrokProvider, ModelEntry,
+    };
     use serde_json::json;
+
+    #[test]
+    fn responses_input_keeps_images_and_text_order() {
+        let content = grok_input_content(Some(&json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+        ])));
+        assert_eq!(
+            content,
+            json!([
+                {"type": "input_text", "text": "what is this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,aGk="}
+            ])
+        );
+        assert_eq!(
+            grok_input_content(Some(&json!("plain text"))),
+            json!("plain text")
+        );
+    }
 
     #[test]
     fn refreshes_oauth_tokens_before_they_expire() {
