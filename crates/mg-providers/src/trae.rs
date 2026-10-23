@@ -922,11 +922,17 @@ fn trae_usage(data: &serde_json::Value) -> Option<ChatUsage> {
     let prompt = number(&["prompt_tokens", "input_tokens"]);
     let completion = number(&["completion_tokens", "output_tokens"]);
     let total = number(&["total_tokens"]).max(prompt + completion);
+    let credits = usage
+        .get("credits_consumed")
+        .or_else(|| usage.get("credit"))
+        .or_else(|| usage.get("credits"))
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
     (prompt > 0 || completion > 0 || total > 0).then_some(ChatUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
         prompt_tokens_details: None,
+        credits,
     })
 }
 

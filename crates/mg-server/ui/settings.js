@@ -35,8 +35,8 @@ export function renderDataSettings(settings) {
   lastDataSettings = settings;
   $("settings-data-dir").value = settings.data_dir || "";
   $("settings-copy-folder").disabled = !settings.data_dir;
-  $("settings-open-folder").disabled = !settings.data_dir || !window.pywebview?.api?.open_folder;
-  $("settings-open-folder").title = window.pywebview?.api?.open_folder
+  $("settings-open-folder").disabled = !settings.data_dir || !window.multigateway?.api?.open_folder;
+  $("settings-open-folder").title = window.multigateway?.api?.open_folder
     ? t("openFolder") : t("openFolderDesktop");
   $("settings-key-backup").textContent = settings.key_backup_exists
     ? "api_keys.json.bak" : t("keyBackupPending");
@@ -56,7 +56,7 @@ export function bindSettings() {
       window.scrollTo(0, 0);
     };
   });
-  $("settings-open-folder").onclick = () => window.pywebview?.api?.open_folder?.();
+  $("settings-open-folder").onclick = () => window.multigateway?.api?.open_folder?.();
   $("settings-copy-folder").onclick = async () => {
     try {
       await copy($("settings-data-dir").value);
@@ -69,10 +69,10 @@ export function bindSettings() {
       notice(t("endpointCopied"));
     } catch (error) { notice(error.message, true); }
   };
-  window.addEventListener("pywebviewready", () => {
+  window.addEventListener("multigatewayready", () => {
     if ($("settings-data-dir").value) {
-      $("settings-open-folder").disabled = !window.pywebview?.api?.open_folder;
-      $("settings-open-folder").title = window.pywebview?.api?.open_folder
+      $("settings-open-folder").disabled = !window.multigateway?.api?.open_folder;
+      $("settings-open-folder").title = window.multigateway?.api?.open_folder
         ? t("openFolder") : t("openFolderDesktop");
     }
   });

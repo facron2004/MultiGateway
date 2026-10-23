@@ -42,6 +42,9 @@ pub(crate) fn copy_usage_to_record(record: &mut RequestRecord, usage: &ChatUsage
     if let Some(details) = &usage.prompt_tokens_details {
         record.cached_tokens = Some(details.cached_tokens);
     }
+    if usage.credits.is_some() {
+        record.credits = usage.credits;
+    }
 }
 
 pub async fn chat_completions(
@@ -156,6 +159,7 @@ pub async fn chat_completions(
 
         tokio::spawn(async move {
             let mut first_token = true;
+            let mut first_ttft: Option<u64> = None;
             let mut total_usage = None;
             let mut error_msg = None;
             let mut error_status = 200u16;
@@ -165,7 +169,7 @@ pub async fn chat_completions(
                 match chunk_res {
                     Ok(chunk) => {
                         if first_token {
-                            activity.record_first_token(&record_id);
+                            first_ttft = activity.record_first_token(&record_id);
                             first_token = false;
                         }
 
@@ -200,6 +204,9 @@ pub async fn chat_completions(
 
             let mut final_record = record;
             final_record.account = account_id;
+            if final_record.ttft_ms.is_none() {
+                final_record.ttft_ms = first_ttft;
+            }
             if let Some(usage) = &total_usage {
                 copy_usage_to_record(&mut final_record, usage);
             }
@@ -223,10 +230,16 @@ pub async fn chat_completions(
         let mut usage = None;
         let mut error_msg = None;
         let mut error_status = 200u16;
+        let mut first_token = true;
+        let mut first_ttft: Option<u64> = None;
 
         while let Some(chunk_res) = stream.next().await {
             match chunk_res {
                 Ok(chunk) => {
+                    if first_token {
+                        first_ttft = state.activity.record_first_token(&record_id);
+                        first_token = false;
+                    }
                     for choice in chunk.choices {
                         if let Some(c) = choice.delta.content {
                             full_content.push_str(&c);
@@ -274,6 +287,9 @@ pub async fn chat_completions(
 
         let mut final_record = record;
         final_record.account = account_id;
+        if final_record.ttft_ms.is_none() {
+            final_record.ttft_ms = first_ttft;
+        }
         if let Some(usage) = &usage {
             copy_usage_to_record(&mut final_record, usage);
         }
@@ -434,6 +450,7 @@ mod tests {
                     completion_tokens: 4,
                     total_tokens: 12,
                     prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 3 }),
+                    credits: Some(0.15),
                 }),
             };
             Ok((Box::pin(stream::iter(vec![Ok(chunk)])), "account-1".to_string()))
@@ -471,6 +488,7 @@ mod tests {
                 completion_tokens: 0,
                 total_tokens: 0,
                 prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+                credits: None,
             },
         );
 

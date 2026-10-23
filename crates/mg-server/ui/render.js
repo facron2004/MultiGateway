@@ -136,7 +136,7 @@ export function placeholder(target, columns, message) {
 }
 export function snapshot(data) {
   const { provider, gateway, pool, capabilities } = data;
-  const address = new URL(location.origin);
+  const address = new URL(window.__TAURI__ ? "http://127.0.0.1" : location.origin);
   if (gateway.host !== "0.0.0.0") address.hostname = gateway.host;
   address.port = gateway.port;
   $("unified-endpoint").textContent = address.origin + "/v1";

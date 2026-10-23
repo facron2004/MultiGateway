@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -37,7 +39,16 @@ pub async fn gateway_status(State(state): State<AppState>) -> Response {
 }
 
 pub async fn usage_board(State(state): State<AppState>) -> Response {
-    let board = state.activity.board();
+    let mut account_names = HashMap::new();
+    for (provider_name, pool) in state.pools.iter() {
+        for acc in pool.list() {
+            let name = acc.display_name().to_string();
+            if !name.is_empty() {
+                account_names.insert((provider_name.clone(), acc.id.clone()), name);
+            }
+        }
+    }
+    let board = state.activity.board_with_names(&account_names);
     Json(board).into_response()
 }
 

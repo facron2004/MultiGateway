@@ -10,9 +10,9 @@
 
 <p align="center">
   <a href="#requirements"><img src="https://img.shields.io/badge/Rust-1.90%2B-000000?logo=rust&amp;logoColor=white" alt="Rust 1.90+" /></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.1-2563EB" alt="Version 0.11.1" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.2-2563EB" alt="Version 0.11.2" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT License" /></a>
-  <a href="#build-and-run"><img src="https://img.shields.io/badge/Desktop-Windows-0078D4?logo=windows&amp;logoColor=white" alt="Windows desktop" /></a>
+  <a href="#build-and-run"><img src="https://img.shields.io/badge/Desktop-Windows%20%7C%20macOS-0078D4" alt="Windows and macOS desktop" /></a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 
 MultiGateway is a Rust reverse proxy for several AI account pools. WorkBuddy, Trae, MiniMax, Qoder, Antigravity, Grok, and GitHub Copilot share one desktop app and one set of OpenAI, Anthropic, and Responses endpoints.
 
-Version **0.11.1** is the Rust gateway. The desktop window, tray, and web dashboard are compiled into `MultiGateway.exe`.
+Version **0.11.2** is the Rust gateway. The Tauri 2 desktop window, tray, and web dashboard are compiled into the Windows executable or macOS app.
 
 ---
 
@@ -66,9 +66,9 @@ Request a model with its provider prefix, for example `trae/glm-5.3`, `qoder/Qwe
 
 ## Requirements
 
-- Windows 10/11 x64
-- Rust **1.90+** and the MSVC C++ build tools to build from source
-- WebView2 for the desktop window
+- Windows 10/11 x64 or ARM64, or macOS 11+ on Apple Silicon or Intel
+- Rust **1.90+** to build from source; MSVC C++ build tools on Windows or Xcode command line tools on macOS
+- Tauri 2 uses system WebView2 on Windows and WKWebView on macOS, without a bundled browser runtime
 
 ---
 
@@ -83,10 +83,12 @@ cargo run -p mg-server -- --host 127.0.0.1 --port 8791
 Release build:
 
 ```bash
-cargo build --release -p mg-server
+cargo build --locked --release -p mg-server --bin MultiGateway
 ```
 
 On Windows, use `run_multigateway.bat` to start the app or `build_multigateway.bat` to build the portable executable.
+
+`tauri-build` generates the desktop resources, so Cargo builds the Tauri executable directly. Tauri serves the embedded desktop UI and invokes Rust business functions through IPC. The HTTP gateway serves model APIs for external clients and an optional browser panel. Both panels share one asset bundle and business state, without a Node.js build toolchain or a separate backend process. Tauri uses the system WebView2 runtime on Windows.
 
 The binary is `target/release/MultiGateway.exe`. Run it from a writable directory. Accounts, API keys, and usage default to `gateway-data/` beside the executable. Point it at an existing directory with:
 
@@ -100,6 +102,16 @@ The dashboard is `http://127.0.0.1:8791/`. API keys are stored in `api_keys.json
 
 Exit the app before replacing the executable, and keep the existing `gateway-data/` directory.
 Desktop browser data is stored in `webview2/` inside the selected data directory.
+
+On macOS, build both `dist/MultiGateway-0.11.2-macos-arm64.dmg` and `dist/MultiGateway-0.11.2-macos-x64.dmg` with:
+
+```bash
+bash scripts/build-macos-dmg.sh
+```
+
+To build one architecture on a matching Mac, use `bash scripts/build-macos-dmg.sh aarch64-apple-darwin` or `bash scripts/build-macos-dmg.sh x86_64-apple-darwin`. Drag `MultiGateway.app` from the DMG into Applications. The app is ad-hoc signed and has not been notarized by Apple. macOS data defaults to `~/Library/Application Support/MultiGateway`; an existing `gateway-data/` beside the app takes precedence. Preserve the data directory when upgrading.
+
+GitHub Actions tests, builds, and checks release packages on native Windows x64/ARM64 and macOS Apple Silicon/Intel runners. macOS checks also mount the DMG, verify its signature, and launch the packaged application.
 
 ---
 

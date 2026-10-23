@@ -486,6 +486,7 @@ impl Provider for MiniMaxProvider {
                                                     .and_then(|v| v.as_u64())
                                                     .unwrap_or(0),
                                             prompt_tokens_details: None,
+                                            credits: None,
                                         });
 
                                         return Some(Ok(ChatCompletionChunk {

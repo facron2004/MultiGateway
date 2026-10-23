@@ -111,6 +111,22 @@ pub struct FunctionCallChunk {
     pub arguments: Option<String>,
 }
 
+fn deserialize_flexible_f64_opt<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Deserialize;
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_f64()),
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim().trim_start_matches('x').trim_end_matches("credits").trim();
+            Ok(trimmed.parse::<f64>().ok())
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatUsage {
     pub prompt_tokens: u64,
@@ -118,6 +134,14 @@ pub struct ChatUsage {
     pub total_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(
+        default,
+        alias = "credit",
+        alias = "credits_consumed",
+        deserialize_with = "deserialize_flexible_f64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credits: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

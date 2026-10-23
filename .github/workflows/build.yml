@@ -1,0 +1,79 @@
+name: Build and test desktop packages
+
+on:
+  push:
+    branches: [main, 'codex/release-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - name: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+          - name: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Rust tests
+        run: cargo test --locked --workspace
+      - name: Native IPC and browser transport tests
+        run: node scripts/test-native-api.mjs
+      - name: Build and test DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          bash scripts/build-macos-dmg.sh "${{ matrix.target }}"
+          bash scripts/test-macos-dmg.sh "dist/MultiGateway-${version}-${{ matrix.name }}.dmg" "${{ matrix.arch }}" "$version"
+      - name: Build and test EXE
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked --release -p mg-server --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $binary = "dist/MultiGateway-v$version-${{ matrix.name }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/MultiGateway.exe" $binary
+          python scripts/smoke-package.py $binary $version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error

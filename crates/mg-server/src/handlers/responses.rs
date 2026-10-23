@@ -193,6 +193,7 @@ pub async fn responses(
 
     tokio::spawn(async move {
         let mut first_token = true;
+        let mut first_ttft: Option<u64> = None;
         let mut total_usage: Option<ChatUsage> = None;
         let mut error_msg: Option<String> = None;
         let mut error_status: u16 = 200;
@@ -229,7 +230,7 @@ pub async fn responses(
             match chunk_res {
                 Ok(chunk) => {
                     if first_token {
-                        activity.record_first_token(&record_id);
+                        first_ttft = activity.record_first_token(&record_id);
                         first_token = false;
                     }
                     if let Some(usage) = &chunk.usage {
@@ -423,6 +424,9 @@ pub async fn responses(
 
         let mut final_record = record;
         final_record.account = account_id;
+        if final_record.ttft_ms.is_none() {
+            final_record.ttft_ms = first_ttft;
+        }
         if let Some(usage) = &total_usage {
             copy_usage_to_record(&mut final_record, usage);
         }
@@ -453,6 +457,7 @@ async fn aggregate(
     created_at: i64,
 ) -> Response {
     let mut first_token = true;
+    let mut first_ttft: Option<u64> = None;
     let mut reasoning = String::new();
     let mut text = String::new();
     let mut tools: BTreeMap<u32, FunctionCallBuffer> = BTreeMap::new();
@@ -464,7 +469,7 @@ async fn aggregate(
         match chunk_res {
             Ok(chunk) => {
                 if first_token {
-                    activity.record_first_token(&record_id);
+                    first_ttft = activity.record_first_token(&record_id);
                     first_token = false;
                 }
                 if let Some(usage) = &chunk.usage {
@@ -510,6 +515,9 @@ async fn aggregate(
 
     let mut final_record = record;
     final_record.account = account_id;
+    if final_record.ttft_ms.is_none() {
+        final_record.ttft_ms = first_ttft;
+    }
     if let Some(usage) = &total_usage {
         copy_usage_to_record(&mut final_record, usage);
     }
@@ -749,6 +757,7 @@ mod tests {
             completion_tokens: 7,
             total_tokens: 18,
             prompt_tokens_details: None,
+            credits: None,
         }
     }
 
@@ -768,6 +777,7 @@ mod tests {
                         total_tokens: 10007,
                         prompt_tokens_details: cached_tokens
                             .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
+                        credits: None,
                     }),
                 )];
                 let (state, _) = state(&dir, chunks, None);

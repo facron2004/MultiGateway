@@ -449,6 +449,7 @@ impl Provider for GrokProvider {
                                                 completion_tokens: response.usage.output_tokens,
                                                 total_tokens: response.usage.total_tokens,
                                                 prompt_tokens_details: None,
+                                                credits: None,
                                             }),
                                         }));
                                     }

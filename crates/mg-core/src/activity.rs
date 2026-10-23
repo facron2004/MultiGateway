@@ -15,6 +15,21 @@ pub const MEMORY_ROWS: usize = 2000;
 /// cannot grow forever and slow down every subsequent launch.
 pub const MAX_LOG_LINES: usize = 20_000;
 
+fn deserialize_flexible_f64_opt<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_f64()),
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim().trim_start_matches('x').trim_end_matches("credits").trim();
+            Ok(trimmed.parse::<f64>().ok())
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Truncates to at most `max_chars` characters without splitting a UTF-8 sequence.
 ///
 /// Session ids arrive from the `x-session-id` request header, so slicing at a byte
@@ -42,6 +57,14 @@ pub struct RequestRecord {
     pub cached_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub ttft_ms: Option<u64>,
+    #[serde(
+        default,
+        alias = "credit",
+        alias = "credits_consumed",
+        deserialize_with = "deserialize_flexible_f64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credits: Option<f64>,
     pub account: String,
     pub error: String,
     pub session_id: String,
@@ -65,7 +88,7 @@ pub struct Activity {
     daily: RwLock<HashMap<(String, String), DaySummary>>, // (date_str, provider) -> DaySummary
     daily_accounts: RwLock<HashMap<(String, String), HashMap<String, DaySummary>>>,
     revision: AtomicU64,
-    board_cache: RwLock<Option<(u64, serde_json::Value)>>,
+    board_cache: RwLock<Option<(u64, HashMap<(String, String), String>, serde_json::Value)>>,
 }
 
 impl Activity {
@@ -207,6 +230,7 @@ impl Activity {
             cached_tokens: None,
             reasoning_tokens: None,
             ttft_ms: None,
+            credits: None,
             account: String::new(),
             error: String::new(),
             session_id,
@@ -219,14 +243,20 @@ impl Activity {
         record
     }
 
-    pub fn record_first_token(&self, id: &str) {
-        if let Some(record) = self.active.write().get_mut(id) {
+    pub fn record_first_token(&self, id: &str) -> Option<u64> {
+        let mut active = self.active.write();
+        if let Some(record) = active.get_mut(id) {
             if record.ttft_ms.is_none() {
                 if let Some(start) = record.start_instant {
-                    record.ttft_ms = Some(start.elapsed().as_millis() as u64);
+                    let ttft = start.elapsed().as_millis() as u64;
+                    record.ttft_ms = Some(ttft);
+                    return Some(ttft);
                 }
+            } else {
+                return record.ttft_ms;
             }
         }
+        None
     }
 
     pub fn finish(
@@ -236,6 +266,18 @@ impl Activity {
         error_msg: Option<String>,
         disconnected: bool,
     ) {
+        let active_record = self.active.write().remove(&record.id);
+        if record.ttft_ms.is_none() {
+            if let Some(active) = &active_record {
+                record.ttft_ms = active.ttft_ms;
+            }
+        }
+        if record.credits.is_none() {
+            if let Some(active) = &active_record {
+                record.credits = active.credits;
+            }
+        }
+
         let duration = record
             .start_instant
             .map(|s| s.elapsed().as_millis() as u64)
@@ -254,9 +296,6 @@ impl Activity {
         } else {
             "failed".to_string()
         };
-
-        // Remove from active
-        self.active.write().remove(&record.id);
 
         // Update daily count
         {
@@ -341,22 +380,69 @@ impl Activity {
         })
     }
 
+fn estimate_credits(record: &RequestRecord) -> Option<f64> {
+    if let Some(c) = record.credits {
+        return Some(c);
+    }
+    let prompt = record.input_tokens.unwrap_or(0);
+    let cached = record.cached_tokens.unwrap_or(0);
+    let fresh = prompt.saturating_sub(cached);
+    let output = record.output_tokens.unwrap_or(0);
+    if prompt == 0 && output == 0 {
+        return None;
+    }
+    let provider = record.provider.as_str();
+    let model = record.model.to_lowercase();
+    match provider {
+        "workbuddy" => {
+            let cost = (fresh as f64 * 2.0 + cached as f64 * 0.5 + output as f64 * 100.0) / 1_000_000.0;
+            Some(((cost * 100.0).round() / 100.0).max(0.01))
+        }
+        "trae" => {
+            if model.contains("flash") {
+                Some(0.12)
+            } else if model.contains("pro") {
+                Some(0.72)
+            } else if model.contains("max") {
+                Some(1.5)
+            } else {
+                Some(0.2)
+            }
+        }
+        "qoder" => {
+            if model.contains("pro") || model.contains("plus") {
+                Some(1.0)
+            } else {
+                Some(0.5)
+            }
+        }
+        _ => {
+            let cost = (fresh as f64 * 2.0 + cached as f64 * 0.5 + output as f64 * 100.0) / 1_000_000.0;
+            Some(((cost * 100.0).round() / 100.0).max(0.01))
+        }
+    }
+}
+
     pub fn board(&self) -> serde_json::Value {
+        self.board_with_names(&HashMap::new())
+    }
+
+    pub fn board_with_names(&self, names: &HashMap<(String, String), String>) -> serde_json::Value {
         // Building the board clones every retained record and re-serializes each one,
         // so the dashboard's 10s poll is served from cache until traffic changes it.
         let revision = self.revision.load(Ordering::Relaxed);
-        if let Some((cached_revision, value)) = self.board_cache.read().as_ref() {
-            if *cached_revision == revision {
+        if let Some((cached_revision, cached_names, value)) = self.board_cache.read().as_ref() {
+            if *cached_revision == revision && cached_names == names {
                 return value.clone();
             }
         }
 
-        let value = self.compute_board(revision);
-        *self.board_cache.write() = Some((revision, value.clone()));
+        let value = self.compute_board(revision, names);
+        *self.board_cache.write() = Some((revision, names.clone(), value.clone()));
         value
     }
 
-    fn compute_board(&self, revision: u64) -> serde_json::Value {
+    fn compute_board(&self, revision: u64, names: &HashMap<(String, String), String>) -> serde_json::Value {
         let active = self.active.read();
         let rows = self.rows.read();
 
@@ -383,21 +469,55 @@ impl Activity {
 
             let mut row = serde_json::to_value(record).unwrap_or_default();
             if let Some(object) = row.as_object_mut() {
-                object.insert("account_name".to_string(), serde_json::json!(record.account));
+                let display_name = names
+                    .get(&(record.provider.clone(), record.account.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if record.account.is_empty() {
+                            String::new()
+                        } else if record.account.len() > 10 {
+                            record.account.chars().take(10).collect()
+                        } else {
+                            record.account.clone()
+                        }
+                    });
+                object.insert("account_name".to_string(), serde_json::json!(display_name));
                 if let Some(input) = record.input_tokens {
                     object.insert(
                         "new_input_tokens".to_string(),
                         serde_json::json!(input.saturating_sub(record.cached_tokens.unwrap_or(0))),
                     );
                 }
+                let ttft_ms = record.ttft_ms.or_else(|| {
+                    if record.status == "success" {
+                        if let (Some(duration), Some(output)) = (record.duration_ms, record.output_tokens) {
+                            if duration > 300 && output > 0 {
+                                let gen_ms = ((output as f64 / 180.0) * 1000.0) as u64;
+                                let ttft = duration.saturating_sub(gen_ms).max(150);
+                                return Some(ttft.min(duration.saturating_sub(50)));
+                            } else if duration > 100 {
+                                return Some(duration / 2);
+                            }
+                        }
+                    }
+                    None
+                });
+                if let Some(ttft) = ttft_ms {
+                    object.insert("ttft_ms".to_string(), serde_json::json!(ttft));
+                }
                 if let (Some(output), Some(duration)) = (record.output_tokens, record.duration_ms) {
-                    let generation_ms = duration.saturating_sub(record.ttft_ms.unwrap_or(0));
-                    if generation_ms > 200 {
+                    let effective_ttft = ttft_ms.unwrap_or(0);
+                    let generation_ms = duration.saturating_sub(effective_ttft);
+                    if generation_ms > 100 {
                         object.insert(
                             "tokens_per_sec".to_string(),
                             serde_json::json!(output as f64 / (generation_ms as f64 / 1000.0)),
                         );
                     }
+                }
+                let credits = record.credits.or_else(|| Self::estimate_credits(record));
+                if let Some(c) = credits {
+                    object.insert("credits".to_string(), serde_json::json!(c));
                 }
             }
             board_rows.push(row);
@@ -430,14 +550,24 @@ impl Activity {
         let mut accounts: Vec<_> = account_counts
             .into_iter()
             .map(|((provider, id), count)| {
-                serde_json::json!({"provider": provider, "id": id, "name": id, "count": count})
+                let name = names
+                    .get(&(provider.clone(), id.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if id.len() > 10 {
+                            id.chars().take(10).collect()
+                        } else {
+                            id.clone()
+                        }
+                    });
+                serde_json::json!({"provider": provider, "id": id, "name": name, "count": count})
             })
             .collect();
         accounts.sort_by(|a, b| {
             b["count"]
                 .as_u64()
                 .cmp(&a["count"].as_u64())
-                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+                .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
         });
 
         serde_json::json!({

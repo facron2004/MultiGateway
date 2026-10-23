@@ -169,6 +169,7 @@ pub async fn messages(
 
     tokio::spawn(async move {
         let mut first_token = true;
+        let mut first_ttft: Option<u64> = None;
         let mut total_completion_tokens = 0;
         let mut total_input_tokens = 0;
         let mut total_usage = None;
@@ -218,7 +219,7 @@ pub async fn messages(
             };
 
             if first_token {
-                activity.record_first_token(&record_id);
+                first_ttft = activity.record_first_token(&record_id);
                 first_token = false;
             }
 
@@ -410,6 +411,9 @@ pub async fn messages(
 
         let mut final_record = record;
         final_record.account = account_id;
+        if final_record.ttft_ms.is_none() {
+            final_record.ttft_ms = first_ttft;
+        }
         if let Some(usage) = &total_usage {
             copy_usage_to_record(&mut final_record, usage);
         }
@@ -453,6 +457,7 @@ async fn aggregate(
     model: String,
 ) -> Response {
     let mut first_token = true;
+    let mut first_ttft: Option<u64> = None;
     let mut thinking = String::new();
     let mut text = String::new();
     let mut tools: BTreeMap<u32, ToolCallBuffer> = BTreeMap::new();
@@ -464,7 +469,7 @@ async fn aggregate(
         match chunk_res {
             Ok(chunk) => {
                 if first_token {
-                    activity.record_first_token(&record_id);
+                    first_ttft = activity.record_first_token(&record_id);
                     first_token = false;
                 }
                 if let Some(usage) = &chunk.usage {
@@ -510,6 +515,9 @@ async fn aggregate(
 
     let mut final_record = record;
     final_record.account = account_id;
+    if final_record.ttft_ms.is_none() {
+        final_record.ttft_ms = first_ttft;
+    }
     if let Some(usage) = &total_usage {
         copy_usage_to_record(&mut final_record, usage);
     }
@@ -755,6 +763,7 @@ mod tests {
             completion_tokens: 7,
             total_tokens: 18,
             prompt_tokens_details: None,
+            credits: None,
         }
     }
 

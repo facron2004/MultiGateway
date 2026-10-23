@@ -1,4 +1,14 @@
+import { nativeApi } from "./native-api.js";
+
 export async function api(path, payload, signal) {
+  if (window.__TAURI__?.core) {
+    try {
+      return checked(await nativeApi(path, payload, signal));
+    } catch (error) {
+      if (error instanceof Error || error?.name === "AbortError") throw error;
+      throw new Error(error?.message || String(error));
+    }
+  }
   const headers =
     payload === undefined ? {} : { "Content-Type": "application/json" };
   let response;
@@ -35,6 +45,10 @@ export async function api(path, payload, signal) {
         `请求失败 (${response.status})`,
     );
   }
+  return checked(data);
+}
+
+function checked(data) {
   if (data.success === false || data.ok === false)
     throw new Error(data.error || data.msg || "操作失败");
   return data;
@@ -46,7 +60,7 @@ export function providerApi(name, resource, payload, signal) {
 
 export function external(url) {
   if (!/^https?:\/\//.test(url)) throw new Error("授权地址不受支持");
-  if (window.pywebview?.api) return window.pywebview.api.open_external(url);
+  if (window.multigateway?.api) return window.multigateway.api.open_external(url);
   window.open(url, "_blank", "noopener,noreferrer");
 }
 

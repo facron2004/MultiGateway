@@ -2,6 +2,7 @@
 
 mod appearance;
 mod handlers;
+mod native_commands;
 mod state;
 mod static_assets;
 mod window;
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::{DefaultBodyLimit, Path},
+    extract::{DefaultBodyLimit, Extension, Path},
     http::HeaderMap,
     routing::{get, post},
     Json, Router,
@@ -31,7 +32,7 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::state::AppState;
-use crate::static_assets::{if_none_match, serve_asset};
+use crate::static_assets::{if_none_match, serve_asset, UiAssets};
 
 /// Agent conversation histories and base64 image inputs routinely exceed Axum's
 /// 2MB default, which surfaced to clients as an opaque 413.
@@ -167,6 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         providers: Arc::new(RwLock::new(providers)),
         pools: Arc::new(pools),
     };
+    let context = tauri::generate_context!();
+    let assets = Arc::new(UiAssets::new(&context));
 
     // Permissive CORS is confined to the key-authenticated inference API, which
     // browser-based clients legitimately call cross-origin. The management surface
@@ -202,15 +205,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dashboard = Router::new()
         // Dashboard and static assets
-        .route("/", get(|headers: HeaderMap| async move {
-            serve_asset("index.html", if_none_match(&headers)).await
-        }))
-        .route("/favicon.ico", get(|headers: HeaderMap| async move {
-            serve_asset("favicon.ico", if_none_match(&headers)).await
-        }))
-        .route("/gateway/ui/*path", get(|headers: HeaderMap, Path(path): Path<String>| async move {
-            serve_asset(&path, if_none_match(&headers)).await
-        }))
+        .route("/", get(
+            |Extension(assets): Extension<Arc<UiAssets>>, headers: HeaderMap| async move {
+                serve_asset(&assets, "index.html", if_none_match(&headers)).await
+            },
+        ))
+        .route("/favicon.ico", get(
+            |Extension(assets): Extension<Arc<UiAssets>>, headers: HeaderMap| async move {
+                serve_asset(&assets, "favicon.ico", if_none_match(&headers)).await
+            },
+        ))
+        .route("/gateway/ui/*path", get(
+            |Extension(assets): Extension<Arc<UiAssets>>,
+             headers: HeaderMap,
+             Path(path): Path<String>| async move {
+                serve_asset(&assets, &path, if_none_match(&headers)).await
+            },
+        ))
         // Gateway management APIs
         .route("/gateway/status", get(handlers::gateway_status))
         .route("/gateway/usage/board", get(handlers::usage_board))
@@ -282,8 +293,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .merge(dashboard)
         .merge(inference)
-        .fallback(handlers::fallback_404)
-        .with_state(state);
+        .fallback(static_assets::fallback)
+        .layer(Extension(assets))
+        .with_state(state.clone());
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 
@@ -291,6 +303,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // Share the gateway runtime so Tauri commands do not create another worker pool.
+    tauri::async_runtime::set(rt.handle().clone());
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
     // The desktop window signals this when the user quits so in-flight streams can
@@ -363,8 +377,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             desktop::DesktopSettings::default()
         });
         window::run_desktop_window(
-            config.port,
-            config.data_dir,
+            context,
+            state,
             args.silent || settings.start_silently,
             quit,
         )?;

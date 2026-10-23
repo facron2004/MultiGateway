@@ -211,7 +211,7 @@ export function bindAccounts(state, refresh, mutate, closeMenus) {
     }
   };
   $("authorize-link").onclick = (event) => {
-    if (window.pywebview?.api) {
+    if (window.multigateway?.api) {
       event.preventDefault();
       external(event.currentTarget.href);
     }

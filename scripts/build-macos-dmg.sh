@@ -123,8 +123,10 @@ package_one() {
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
   cp "$bin" "$app/Contents/MacOS/MultiGateway"
   chmod 755 "$app/Contents/MacOS/MultiGateway"
-  # Zig's linker signature is not 16KB aligned, so Apple Silicon rejects it.
-  python3 "$root/scripts/fix-macos-macho.py" "$app/Contents/MacOS/MultiGateway"
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    # Repair Zig's deployment target/signature only for cross-compiled binaries.
+    python3 "$root/scripts/fix-macos-macho.py" "$app/Contents/MacOS/MultiGateway"
+  fi
   sed "s/__VERSION__/${version}/g" "$plist_template" > "$app/Contents/Info.plist"
   cp "$work/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
   printf 'APPL????' > "$app/Contents/PkgInfo"
@@ -147,7 +149,9 @@ MultiGateway ${version}（macOS ${label}）
 需要 macOS 11 或更新版本。
 EOF
   sign_app "$app"
-  if [[ "$label" == "arm64" ]]; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    codesign --verify --deep --strict "$app"
+  elif [[ "$label" == "arm64" ]]; then
     python3 "$root/scripts/fix-macos-macho.py" --check "$app/Contents/MacOS/MultiGateway"
   fi
   mkdir -p "$dist"
@@ -160,7 +164,7 @@ EOF
 build_target() {
   local target="$1"
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    cargo build --release -p mg-server --target "$target" --manifest-path "$root/Cargo.toml"
+    cargo build --locked --release -p mg-server --target "$target" --manifest-path "$root/Cargo.toml"
   else
     if [[ -z "${SDKROOT:-}" && -d "${HOME}/.cache/multigateway/MacOSX15.5.sdk" ]]; then
     export SDKROOT="${HOME}/.cache/multigateway/MacOSX15.5.sdk"
@@ -171,7 +175,7 @@ build_target() {
     }
     need cargo
     need zig
-    cargo zigbuild --release -p mg-server --target "$target" --manifest-path "$root/Cargo.toml"
+    cargo zigbuild --locked --release -p mg-server --target "$target" --manifest-path "$root/Cargo.toml"
   fi
 }
 
@@ -182,20 +186,21 @@ else
   make_icns "$work/AppIcon.icns"
 fi
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  rustup target add aarch64-apple-darwin x86_64-apple-darwin
-else
-  rustup target add aarch64-apple-darwin x86_64-apple-darwin
-fi
+case "${1:-all}" in
+  all) targets=(aarch64-apple-darwin x86_64-apple-darwin) ;;
+  aarch64-apple-darwin|x86_64-apple-darwin) targets=("$1") ;;
+  *) echo "Usage: $0 [aarch64-apple-darwin|x86_64-apple-darwin|all]" >&2; exit 1 ;;
+esac
+rustup target add "${targets[@]}"
+for target in "${targets[@]}"; do
+  if [[ "${MG_PACKAGE_ONLY:-}" != "1" ]]; then
+    build_target "$target"
+  fi
+  if [[ "$target" == "aarch64-apple-darwin" ]]; then
+    package_one "$target" arm64 0x0100000c "Apple 芯片（M 系列）"
+  else
+    package_one "$target" x64 0x01000007 "Intel 芯片"
+  fi
+done
 
-if [[ "${MG_PACKAGE_ONLY:-}" != "1" ]]; then
-  build_target aarch64-apple-darwin
-fi
-package_one aarch64-apple-darwin arm64 0x0100000c "Apple 芯片（M 系列）"
-
-if [[ "${MG_PACKAGE_ONLY:-}" != "1" ]]; then
-  build_target x86_64-apple-darwin
-fi
-package_one x86_64-apple-darwin intel 0x01000007 "Intel 芯片"
-
-echo "Done: ARM and Intel DMGs are in $dist"
+echo "Done: DMGs are in $dist"

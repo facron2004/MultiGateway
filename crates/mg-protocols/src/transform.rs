@@ -582,6 +582,7 @@ pub fn gemini_to_chat_chunk(
         prompt_tokens_details: Some(PromptTokensDetails {
             cached_tokens: u.cached_content_token_count,
         }),
+        credits: None,
     });
 
     if delta.content.is_none()

@@ -10,9 +10,9 @@
 
 <p align="center">
   <a href="#环境要求"><img src="https://img.shields.io/badge/Rust-1.90%2B-000000?logo=rust&amp;logoColor=white" alt="Rust 1.90+" /></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.1-2563EB" alt="版本 0.11.1" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.2-2563EB" alt="版本 0.11.2" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT 协议" /></a>
-  <a href="#构建与运行"><img src="https://img.shields.io/badge/Desktop-Windows-0078D4?logo=windows&amp;logoColor=white" alt="Windows 桌面版" /></a>
+  <a href="#构建与运行"><img src="https://img.shields.io/badge/Desktop-Windows%20%7C%20macOS-0078D4" alt="Windows 和 macOS 桌面版" /></a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 
 MultiGateway 是一个用 Rust 编写的多账号反向代理网关。它把 **WorkBuddy**、**Trae**、**MiniMax**、**Qoder**、**Antigravity**、**Grok** 和 **GitHub Copilot** 收进同一个桌面面板，并用 OpenAI、Anthropic 和 Responses 兼容接口对外提供模型。
 
-当前版本 **0.11.1**。账号池、协议转换和各厂商适配都在本仓库的 Rust 代码里，桌面窗口、托盘和 Web 面板一起编进 `MultiGateway.exe`。
+当前版本 **0.11.2**。账号池、协议转换和各厂商适配都在本仓库的 Rust 代码里，Tauri 2 桌面窗口、托盘和 Web 面板一起编进 Windows EXE 或 macOS 应用。
 
 ---
 
@@ -66,9 +66,9 @@ MultiGateway 是一个用 Rust 编写的多账号反向代理网关。它把 **W
 
 ## 环境要求
 
-- Windows 10/11 x64
-- 从源码构建需要 Rust **1.90+** 和 MSVC C++ 生成工具
-- 桌面窗口使用系统里的 WebView2
+- Windows 10/11 x64、ARM64，或 macOS 11+ Apple Silicon、Intel
+- 从源码构建需要 Rust **1.90+**；Windows 需要 MSVC C++ 生成工具，macOS 需要 Xcode 命令行工具
+- Tauri 2 使用系统 WebView2（Windows）或 WKWebView（macOS），无需捆绑浏览器运行时
 
 ---
 
@@ -83,10 +83,12 @@ cargo run -p mg-server -- --host 127.0.0.1 --port 8791
 发布版：
 
 ```bash
-cargo build --release -p mg-server
+cargo build --locked --release -p mg-server --bin MultiGateway
 ```
 
 Windows 也可以使用 `run_multigateway.bat` 启动，或用 `build_multigateway.bat` 构建便携版。
+
+构建由 `tauri-build` 生成桌面资源，直接使用 Cargo 即可产出 Tauri EXE。桌面面板由 Tauri 内嵌资源加载，账号、设置和用量管理通过 Tauri IPC 直接调用 Rust 业务函数。HTTP 网关负责向外部客户端提供模型 API，也提供浏览器面板；两种面板共用一份资源和业务状态，无需 Node.js 构建工具或额外的后端进程。Windows 上 Tauri 使用系统 WebView2 渲染界面。
 
 生成的程序在 `target/release/MultiGateway.exe`。把它放到一个可写目录再运行。账号、API Key 和用量默认写在程序旁的 `gateway-data/`。已有数据目录可以用参数指过去：
 
@@ -100,6 +102,16 @@ MultiGateway.exe --host 127.0.0.1 --port 8791 --data-dir "D:\MultiGateway-data"
 
 升级时先退出程序，再替换 exe，并保留原来的 `gateway-data/`。
 桌面浏览器数据保存在所选数据目录的 `webview2/` 中。
+
+macOS 上运行以下命令，分别生成 `dist/MultiGateway-0.11.2-macos-arm64.dmg` 和 `dist/MultiGateway-0.11.2-macos-x64.dmg`：
+
+```bash
+bash scripts/build-macos-dmg.sh
+```
+
+也可以在对应架构的 Mac 上单独构建：`bash scripts/build-macos-dmg.sh aarch64-apple-darwin` 或 `bash scripts/build-macos-dmg.sh x86_64-apple-darwin`。将 DMG 中的 `MultiGateway.app` 拖到「应用程序」后打开；应用使用本机临时签名，尚未进行 Apple 公证。macOS 账号和配置默认保存在 `~/Library/Application Support/MultiGateway`，应用旁已有 `gateway-data/` 时优先使用该目录。升级时保留数据目录。
+
+GitHub Actions 分别在 Windows x64、ARM64 和 macOS Apple Silicon、Intel 上运行 Rust 测试、构建并检查发布包；macOS 还会挂载 DMG，验证签名并启动包内程序。
 
 ---
 

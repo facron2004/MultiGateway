@@ -1,0 +1,29 @@
+[[permission]]
+identifier = "desktop"
+description = "Allow the local MultiGateway desktop panel to manage the gateway."
+commands.allow = [
+  "desktop_action",
+  "gateway_health",
+  "gateway_status",
+  "usage_board",
+  "provider_snapshot",
+  "provider_models",
+  "provider_login",
+  "provider_poll",
+  "provider_enable_account",
+  "provider_delete_account",
+  "provider_credits",
+  "provider_credentials_action",
+  "provider_checkin_action",
+  "provider_batch",
+  "provider_region",
+  "provider_import",
+  "gateway_configure",
+  "settings_view",
+  "desktop_settings_save",
+  "appearance_settings_save",
+  "settings_reveal",
+  "api_key_generate",
+  "api_key_delete",
+  "api_key_list",
+]

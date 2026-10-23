@@ -621,26 +621,26 @@ function initWindowControls() {
   const reveal = () => {
     winControls.hidden = false;
   };
-  if (window.pywebview?.api) reveal();
-  else window.addEventListener("pywebviewready", reveal);
+  if (window.multigateway?.api) reveal();
+  else window.addEventListener("multigatewayready", reveal);
 
   $("win-min")?.addEventListener("click", (e) => {
     e.stopPropagation();
-    window.pywebview?.api?.window_minimize?.();
+    window.multigateway?.api?.window_minimize?.();
   });
   $("win-max")?.addEventListener("click", (e) => {
     e.stopPropagation();
-    window.pywebview?.api?.window_maximize?.();
+    window.multigateway?.api?.window_maximize?.();
   });
   $("win-close")?.addEventListener("click", (e) => {
     e.stopPropagation();
-    window.pywebview?.api?.window_close?.();
+    window.multigateway?.api?.window_close?.();
   });
 
   const topbar = document.querySelector(".topbar");
   topbar?.addEventListener("dblclick", (e) => {
     if (e.target.closest("button, a, input, select, textarea, .dropdown, [role='menuitem']")) return;
-    window.pywebview?.api?.window_maximize?.();
+    window.multigateway?.api?.window_maximize?.();
   });
 
   topbar?.addEventListener(
@@ -648,6 +648,8 @@ function initWindowControls() {
     (e) => {
       if (e.target.closest("button, a, input, select, textarea, .dropdown, [role='menuitem']")) {
         e.stopPropagation();
+      } else if (e.button === 0 && e.detail === 1) {
+        window.multigateway?.api?.window_drag?.();
       }
     },
     true,

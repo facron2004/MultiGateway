@@ -208,11 +208,11 @@ export function bindAccess(state, callbacks) {
   };
 
   function folder() {
-    if (window.pywebview?.api) {
+    if (window.multigateway?.api) {
       $("folder").hidden = false;
-      $("folder").onclick = () => window.pywebview.api.open_folder();
+      $("folder").onclick = () => window.multigateway.api.open_folder();
     }
   }
-  window.addEventListener("pywebviewready", folder);
+  window.addEventListener("multigatewayready", folder);
   folder();
 }

@@ -55,7 +55,14 @@ where
 pub struct Account {
     #[serde(alias = "uid", alias = "user_id")]
     pub id: String,
-    #[serde(default, alias = "nickname", alias = "name")]
+    #[serde(
+        default,
+        alias = "nickname",
+        alias = "name",
+        alias = "username",
+        alias = "preferred_username",
+        alias = "account_name"
+    )]
     pub label: String,
     #[serde(default)]
     pub email: String,

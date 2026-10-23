@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MultiGateway",
+  "identifier": "com.multigateway.desktop",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [
+        {
+          "identifier": "desktop",
+          "windows": ["main"],
+          "permissions": ["desktop"]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "icon": ["ui/favicon.ico"],
+    "shortDescription": "Multi-Account AI Reverse Proxy Gateway",
+    "copyright": "Copyright (c) 2026 MultiGateway Authors"
+  }
+}

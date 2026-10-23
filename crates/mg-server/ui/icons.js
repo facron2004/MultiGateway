@@ -49,7 +49,7 @@ export function icon(name) {
   const body = paths[name] || paths.accounts;
   return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
 }
-export const logo = (name) => `/gateway/ui/icons/${name}.svg`;
+export const logo = (name) => `./icons/${name}.svg`;
 export function mountIcons() {
   document.querySelectorAll("[data-icon]").forEach((node) => {
     node.innerHTML = icon(node.dataset.icon);
