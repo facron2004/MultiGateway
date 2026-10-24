@@ -393,6 +393,43 @@ impl Activity {
             .unwrap_or_default()
     }
 
+    pub fn active_count(&self) -> usize {
+        self.active.read().len()
+    }
+
+    /// Per-day totals across every provider, oldest first, always returning
+    /// `days` entries so the tray chart keeps a stable shape on quiet days.
+    pub fn daily_totals(&self, days: usize) -> Vec<(String, DaySummary)> {
+        let today = Local::now().date_naive();
+        let daily = self.daily.read();
+        (0..days)
+            .rev()
+            .map(|offset| {
+                let date = (today - chrono::Duration::days(offset as i64))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                let mut total = DaySummary::default();
+                for ((day, _), summary) in daily.iter() {
+                    if day == &date {
+                        total.requests += summary.requests;
+                        total.failed += summary.failed;
+                        total.tokens += summary.tokens;
+                        total.metered += summary.metered;
+                    }
+                }
+                (date, total)
+            })
+            .collect()
+    }
+
+    pub fn recent(&self, limit: usize) -> Vec<RequestRecord> {
+        let active = self.active.read();
+        let rows = self.rows.read();
+        let mut records: Vec<&RequestRecord> = active.values().chain(rows.iter()).collect();
+        records.sort_by(|a, b| b.timestamp.total_cmp(&a.timestamp));
+        records.into_iter().take(limit).cloned().collect()
+    }
+
     pub fn view(&self, provider: &str) -> serde_json::Value {
         let active = self.active.read();
         let rows = self.rows.read();
@@ -659,6 +696,32 @@ mod tests {
         assert_eq!(today, 0);
         assert!(activity.account_usage("grok").is_empty());
 
+        drop(activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tray_aggregates_daily_totals_and_recent_requests() {
+        let dir = temp_dir();
+        let activity = Activity::new(&dir);
+        let mut record = activity.begin("grok", "grok-test", "chat", 8791, None);
+        record.account = "account-1".to_string();
+        record.input_tokens = Some(12);
+        record.output_tokens = Some(5);
+        activity.finish(record, 200, None, false);
+
+        let days = activity.daily_totals(7);
+        assert_eq!(days.len(), 7);
+        let (_, today) = days.last().unwrap();
+        assert_eq!(today.requests, 1);
+        assert_eq!(today.failed, 0);
+        assert_eq!(today.tokens, 17);
+
+        let recent = activity.recent(5);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].provider, "grok");
+        assert_eq!(recent[0].status, "success");
+        assert_eq!(activity.active_count(), 0);
         drop(activity);
         let _ = std::fs::remove_dir_all(dir);
     }

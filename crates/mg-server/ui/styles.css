@@ -1732,10 +1732,11 @@ td .empty {
      therefore thicker bars, while a 30-day view still stays readable. */
   width: min(60%, 72px);
   border-radius: 3px 3px 0 0;
-  background: var(--teal);
+  background: var(--orange);
+  transition: background 0.15s;
 }
 .chart-col:hover b > i {
-  background: var(--orange);
+  background: var(--orange-hover);
 }
 .chart-col > span {
   height: 13px;

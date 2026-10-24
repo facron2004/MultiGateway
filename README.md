@@ -44,7 +44,7 @@ MultiGateway 是一个用 Rust 编写的多账号反向代理网关。它把 **W
 - **签到**：WorkBuddy 国内个人账号、Trae，以及开放了每日签到接口的 Qoder 区域，可以在账号表里签到。
 - **协议兼容**：`/v1/chat/completions`、`/v1/models`、`/v1/responses` 和 `/v1/messages`。流式响应逐块转发，工具调用和推理内容会保留。
 - **用量看板**：按服务、模型和账号查看请求、Token 和积分 / 额度。
-- **桌面与托盘**：WebView2 窗口，支持开机启动、静默启动，以及关闭时留在托盘。也可以只跑 HTTP 服务。
+- **桌面与托盘**：WebView2 窗口，支持开机启动、静默启动，以及关闭时留在托盘；左键单击托盘图标打开主窗口，右键打开快捷面板，查看今日用量、账号就绪情况和最近请求。也可以只跑 HTTP 服务。
 
 ---
 
@@ -96,7 +96,7 @@ Windows 也可以使用 `run_multigateway.bat` 启动，或用 `build_multigatew
 MultiGateway.exe --host 127.0.0.1 --port 8791 --data-dir "D:\MultiGateway-data"
 ```
 
-`--silent` 启动服务但不弹出窗口。`--headless` 只运行 HTTP 服务。托盘里的「退出网关」会结束程序。
+`--silent` 启动服务但不弹出窗口。`--headless` 只运行 HTTP 服务。托盘面板里的「退出网关」会结束程序。
 
 面板地址是 `http://127.0.0.1:8791/`。API Key 保存在数据目录的 `api_keys.json`，修改前会留下一份 `api_keys.json.bak`。
 

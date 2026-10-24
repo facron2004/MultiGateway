@@ -12,7 +12,7 @@
       "capabilities": [
         {
           "identifier": "desktop",
-          "windows": ["main"],
+          "windows": ["main", "tray"],
           "permissions": ["desktop"]
         }
       ]

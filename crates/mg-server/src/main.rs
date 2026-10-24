@@ -5,6 +5,7 @@ mod handlers;
 mod native_commands;
 mod state;
 mod static_assets;
+mod tray;
 mod window;
 mod desktop;
 
@@ -354,6 +355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Gateway management APIs
         .route("/gateway/status", get(handlers::gateway_status))
         .route("/gateway/usage/board", get(handlers::usage_board))
+        .route("/gateway/tray/summary", get(crate::tray::http_summary))
         .route(
             "/gateway/providers/:provider/snapshot",
             get(handlers::provider_snapshot),

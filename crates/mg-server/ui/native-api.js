@@ -2,6 +2,7 @@ const reads = {
   "/health": "gateway_health",
   "/gateway/status": "gateway_status",
   "/gateway/usage/board": "usage_board",
+  "/gateway/tray/summary": "tray_summary",
   "/settings": "settings_view",
   "/settings/reveal": "settings_reveal",
   "/gateway/api-keys": "api_key_list",

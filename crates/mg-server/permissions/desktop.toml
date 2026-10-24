@@ -3,6 +3,8 @@ identifier = "desktop"
 description = "Allow the local MultiGateway desktop panel to manage the gateway."
 commands.allow = [
   "desktop_action",
+  "tray_summary",
+  "tray_action",
   "gateway_health",
   "gateway_status",
   "usage_board",

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script>
+      (function () {
+        try {
+          var saved = JSON.parse(localStorage.getItem("mg-appearance") || "null") || {};
+          var theme = saved.theme === "light" || saved.theme === "dark" ? saved.theme : "system";
+          var dark =
+            theme === "dark" ||
+            (theme === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.dataset.theme = dark ? "dark" : "light";
+          var accent =
+            typeof saved.accent === "string" && /^#[0-9a-fA-F]{6}$/.test(saved.accent)
+              ? saved.accent
+              : "#fa751b";
+          document.documentElement.style.setProperty("--orange", accent);
+          var language = saved.language === "en" || saved.language === "zh-CN" ? saved.language : "system";
+          var resolved =
+            language === "system"
+              ? String(navigator.language || "").toLowerCase().indexOf("zh") === 0
+                ? "zh-CN"
+                : "en"
+              : language;
+          document.documentElement.lang = resolved === "en" ? "en" : "zh-CN";
+        } catch (e) {}
+      })();
+    </script>
+    <title>MultiGateway</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./tray.css" />
+    <script type="module" src="./tray.js"></script>
+  </head>
+  <body>
+    <main class="tray-panel" aria-label="MultiGateway 快捷面板">
+      <header class="tray-head">
+        <div class="brand">
+          <img class="brand-mark" src="./icons/multigateway.svg" alt="" />
+          <div class="brand-copy">
+            <div class="brand-line">
+              <span class="brand-name">MultiGateway</span>
+              <span class="version" id="version"></span>
+            </div>
+            <button
+              type="button"
+              class="endpoint"
+              id="endpoint"
+              title="复制接口地址"
+              aria-label="复制接口地址"
+            >
+              <span class="endpoint-dot"></span>
+              <span class="endpoint-text" id="endpoint-text">127.0.0.1:8791</span>
+              <svg
+                class="endpoint-copy"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <rect x="8" y="8" width="12" height="12" rx="2" />
+                <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <button
+          type="button"
+          class="icon-button"
+          id="open-main"
+          data-i18n-title="trayOpenMain"
+          data-i18n-aria="trayOpenMain"
+          title="打开主面板"
+          aria-label="打开主面板"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M7 17 17 7M9 7h8v8" />
+          </svg>
+        </button>
+      </header>
+
+      <section class="hero" aria-label="今日概览">
+        <div class="hero-head">
+          <span class="live">
+            <i class="live-dot"></i>
+            <span data-i18n="trayRunning">网关运行中</span>
+          </span>
+          <span class="hero-pills">
+            <span class="pill active-pill" id="active-pill" hidden>
+              <b id="active-count">0</b>
+              <span data-i18n="trayInFlight">进行中</span>
+            </span>
+            <span class="pill subtle-pill" id="key-pill"></span>
+          </span>
+        </div>
+        <div class="metrics">
+          <div class="metric">
+            <strong id="m-requests">0</strong>
+            <span data-i18n="trayTodayRequests">今日请求</span>
+          </div>
+          <div class="metric">
+            <strong id="m-tokens">0</strong>
+            <span data-i18n="trayTodayTokens">Token 用量</span>
+          </div>
+          <div class="metric">
+            <strong id="m-success">—</strong>
+            <span data-i18n="traySuccessRate">成功率</span>
+          </div>
+        </div>
+        <div class="spark-wrap">
+          <div class="spark" id="spark" aria-hidden="true"></div>
+          <div class="spark-labels" id="spark-labels" aria-hidden="true"></div>
+        </div>
+      </section>
+
+      <section class="section providers-section">
+        <div class="section-head">
+          <h2 data-i18n="trayAccounts">账号池</h2>
+          <span class="section-meta" id="pool-summary"></span>
+        </div>
+        <div class="provider-list" id="providers"></div>
+      </section>
+
+      <section class="section recent-section">
+        <div class="section-head">
+          <h2 data-i18n="trayRecent">最近活动</h2>
+          <button type="button" class="link-button" id="view-logs" data-i18n="trayViewAll">
+            查看全部
+          </button>
+        </div>
+        <div class="recent-list" id="recent"></div>
+      </section>
+
+      <footer class="tray-foot">
+        <div class="foot-actions">
+          <button
+            type="button"
+            class="action primary"
+            data-action="main"
+            data-i18n-title="trayOpenMain"
+            data-i18n-aria="trayOpenMain"
+            title="打开主面板"
+            aria-label="打开主面板"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.5" y="4" width="17" height="16" rx="3" />
+              <path d="M3.5 9h17M9 9v11" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="action"
+            data-action="logs"
+            data-i18n-title="trayLogsAction"
+            data-i18n-aria="trayLogsAction"
+            title="日志"
+            aria-label="日志"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 20h16M7 16v4M12 11v9M17 5v15" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="action"
+            data-action="settings"
+            data-i18n-title="traySettingsAction"
+            data-i18n-aria="traySettingsAction"
+            title="设置"
+            aria-label="设置"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 7h5M15 7h5M4 12h10M18 12h2M4 17h2M10 17h10" />
+              <circle cx="12" cy="7" r="2.25" />
+              <circle cx="16" cy="12" r="2.25" />
+              <circle cx="8" cy="17" r="2.25" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="action danger"
+            data-action="quit"
+            data-i18n-title="trayQuitAction"
+            data-i18n-aria="trayQuitAction"
+            title="退出"
+            aria-label="退出"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3v9" />
+              <path d="M6.5 6.5a8 8 0 1 0 11 0" />
+            </svg>
+          </button>
+        </div>
+      </footer>
+
+      <div class="toast" id="toast" role="status" hidden></div>
+    </main>
+  </body>
+</html>

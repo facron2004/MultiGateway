@@ -538,15 +538,15 @@
                   <input id="desktop-auto-start" class="setting-switch" type="checkbox" role="switch" disabled />
                 </label>
                 <label class="setting-row" for="desktop-start-silently">
-                  <span class="setting-label"><span data-i18n="startSilently">静默启动</span> <span class="setting-help" data-i18n-title="startSilentlyHelp" title="启动后网关正常运行，窗口不弹出，可通过托盘图标打开。" aria-hidden="true">?</span></span>
+                  <span class="setting-label"><span data-i18n="startSilently">静默启动</span> <span class="setting-help" data-i18n-title="startSilentlyHelp" title="启动后网关正常运行，窗口不弹出；左键单击托盘图标可打开主窗口。" aria-hidden="true">?</span></span>
                   <input id="desktop-start-silently" class="setting-switch" type="checkbox" role="switch" aria-describedby="desktop-save-state" disabled />
                 </label>
                 <label class="setting-row" for="desktop-close-to-tray">
-                  <span class="setting-label"><span data-i18n="closeToTray">关闭时最小化到托盘</span> <span class="setting-help" data-i18n-title="closeToTrayHelp" title="关闭窗口后保持网关运行，选择托盘菜单中的“退出网关”可完全退出。" aria-hidden="true">?</span></span>
+                  <span class="setting-label"><span data-i18n="closeToTray">关闭时最小化到托盘</span> <span class="setting-help" data-i18n-title="closeToTrayHelp" title="关闭窗口后保持网关运行，可在托盘面板中退出。" aria-hidden="true">?</span></span>
                   <input id="desktop-close-to-tray" class="setting-switch" type="checkbox" role="switch" disabled />
                 </label>
-                <div class="setting-row"><span class="setting-label" data-i18n="openWindow">打开窗口</span><span class="setting-value" data-i18n="openWindowValue">单击托盘图标</span></div>
-                <div class="setting-row"><span class="setting-label" data-i18n="quitGateway">退出网关</span><span class="setting-value" data-i18n="quitGatewayValue">托盘右键菜单 → 退出网关</span></div>
+                <div class="setting-row"><span class="setting-label" data-i18n="openWindow">打开窗口</span><span class="setting-value" data-i18n="openWindowValue">左键单击托盘图标打开主窗口</span></div>
+                <div class="setting-row"><span class="setting-label" data-i18n="quitGateway">退出网关</span><span class="setting-value" data-i18n="quitGatewayValue">右键托盘图标 → 快捷面板 → 退出网关</span></div>
               </form>
               <p id="desktop-save-state" class="settings-caption" data-i18n="desktopHint" role="status" aria-live="polite">开关修改后自动保存，静默启动将在下次启动时生效。</p>
             </section>

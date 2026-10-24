@@ -44,7 +44,7 @@ Version **0.11.2** is the Rust gateway. The Tauri 2 desktop window, tray, and we
 - **Check-in** for WorkBuddy personal accounts in China, for Trae, and for Qoder regions that expose the daily check-in API.
 - **Compatible APIs**: `/v1/chat/completions`, `/v1/models`, `/v1/responses`, and `/v1/messages`. Streams are forwarded chunk by chunk, including tool calls and reasoning.
 - **Usage board** by provider, model, and account.
-- **Desktop shell** with WebView2, optional launch at login, silent start, and close-to-tray. A headless HTTP process is also available.
+- **Desktop shell** with WebView2, optional launch at login, silent start, and close-to-tray. Left-click the tray icon for the main window, right-click for a quick panel with today's usage, account readiness, and recent requests. A headless HTTP process is also available.
 
 ---
 
@@ -96,7 +96,7 @@ The binary is `target/release/MultiGateway.exe`. Run it from a writable director
 MultiGateway.exe --host 127.0.0.1 --port 8791 --data-dir "D:\MultiGateway-data"
 ```
 
-`--silent` starts the gateway without showing the window. `--headless` runs only the HTTP service. Quit from the tray menu to stop the process.
+`--silent` starts the gateway without showing the window. `--headless` runs only the HTTP service. Quit from the tray panel to stop the process.
 
 The dashboard is `http://127.0.0.1:8791/`. API keys are stored in `api_keys.json` inside the data directory, and the previous file is kept as `api_keys.json.bak`.
 
