@@ -62,10 +62,21 @@ def smoke(binary, version, headless):
                 _, headers = request("/favicon.ico")
                 request("/favicon.ico", 304, {"If-None-Match": headers["ETag"]})
                 request("/v1/models", 401, {"Authorization": "Bearer wrong-package-key"})
-                _, headers = request("/gateway/status", headers={"Origin": "https://example.com"})
+                # Management routes reject arbitrary web origins, so this must
+                # fail closed rather than answer with permissive CORS headers.
+                _, headers = request(
+                    "/gateway/status", 403, headers={"Origin": "https://example.com"}
+                )
                 assert headers.get("Access-Control-Allow-Origin") is None
                 duplicate = subprocess.run(command, capture_output=True, timeout=20)
-                assert duplicate.returncode != 0, "Duplicate instance acquired the same port"
+                # A second launch now defers to the running instance and exits
+                # cleanly after asking it to reveal the window; the original
+                # must still own the port.
+                assert duplicate.returncode == 0, (
+                    "duplicate instance did not defer to the running gateway",
+                    duplicate.returncode,
+                    duplicate.stderr.decode(errors="replace"),
+                )
                 request("/health")
                 # Health starts before Tauri creates its window; allow setup to finish.
                 time.sleep(3)
