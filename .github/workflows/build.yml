@@ -54,13 +54,20 @@ jobs:
         run: cargo test --locked --workspace
       - name: Native IPC and browser transport tests
         run: node scripts/test-native-api.mjs
-      - name: Build and test DMG
+      - name: DMG layout regression tests
+        shell: bash
+        run: python3 scripts/test-macos-dmg-layout.py
+      - name: Build and verify DMG
         if: runner.os == 'macOS'
         shell: bash
         run: |
           version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          dmg="dist/MultiGateway-${version}-${{ matrix.name }}.dmg"
           bash scripts/build-macos-dmg.sh "${{ matrix.target }}"
-          bash scripts/test-macos-dmg.sh "dist/MultiGateway-${version}-${{ matrix.name }}.dmg" "${{ matrix.arch }}" "$version"
+          # Layout and bundle checks that do not need the Apple toolchain, so a
+          # broken container fails here instead of on a user's Mac.
+          python3 scripts/verify-macos-dmg.py "$dmg"
+          bash scripts/test-macos-dmg.sh "$dmg" "${{ matrix.arch }}" "$version"
       - name: Build and test EXE
         if: runner.os == 'Windows'
         shell: pwsh

@@ -135,11 +135,12 @@ pub async fn list_models(
                 // The provider's own known facts describe models whose catalog
                 // entry leaves a capability out; see `ProviderDefaults`.
                 let defaults = ProviderDefaults::for_provider(&name);
-                for m in models {
+                for mut m in models {
                     let prefixed_id = format!("{}/{}", name, m.id);
                     if state.key_manager.check_model_allowed(token, &prefixed_id)
                         || state.key_manager.check_model_allowed(token, &m.id)
                     {
+                        mg_providers::calibrate_model_limits(&mut m);
                         let mut prefixed = with_provider_metadata(m, defaults);
                         prefixed.id = prefixed_id;
                         prefixed.owned_by = name.clone();
@@ -208,7 +209,10 @@ pub async fn list_provider_models(
                     state.key_manager.check_model_allowed(token, &model.id)
                         || state.key_manager.check_model_allowed(token, &prefixed_id)
                 })
-                .map(|model| with_provider_metadata(model, defaults))
+                .map(|mut model| {
+                    mg_providers::calibrate_model_limits(&mut model);
+                    with_provider_metadata(model, defaults)
+                })
                 .collect();
             Json(ModelList {
                 object: "list".to_string(),
@@ -477,6 +481,53 @@ mod tests {
         assert_eq!(data["data"][0]["supports_tool_calls"], true);
         assert_eq!(data["data"][0]["thinking"]["supported"], false);
         assert!(data["data"][0]["supports_reasoning"].is_null());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_advertises_the_model_output_spec_not_the_product_cap() {
+        let dir = temp_dir();
+        let mut state = state(&dir);
+        state.key_manager = Arc::new(KeyManager::new(&dir, Some("admin-key".into())).unwrap());
+        {
+            let mut spec_capped = model("glm-5.3");
+            spec_capped.extra.insert("maxOutputTokens".into(), json!(64000));
+            spec_capped.extra.insert("context_length".into(), json!(1000000));
+            let mut silent = model("kimi-k3");
+            silent.extra.insert("context_length".into(), json!(1048576));
+            let mut providers = state.providers.write();
+            providers.insert(
+                "workbuddy".to_string(),
+                Arc::new(MockProvider {
+                    id: "workbuddy",
+                    models: vec![spec_capped, silent],
+                }),
+            );
+        }
+        let headers = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            "Bearer admin-key".parse().unwrap(),
+        )]);
+
+        let response = list_provider_models(
+            axum::extract::Path("workbuddy".to_string()),
+            Query(ModelQuery::default()),
+            State(state.clone()),
+            headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = body(response).await;
+        let entries = data["data"].as_array().unwrap();
+        let capped = entries.iter().find(|m| m["id"] == "glm-5.3").unwrap();
+        assert_eq!(capped["max_output_tokens"], 131_072);
+        assert_eq!(capped["maxOutputTokens"], 131_072);
+        assert_eq!(capped["output_clamp"], 64_000);
+        // A catalog that omits the field still gets the model's known spec.
+        let silent = entries.iter().find(|m| m["id"] == "kimi-k3").unwrap();
+        assert_eq!(silent["max_output_tokens"], 1_048_576);
 
         drop(state);
         let _ = std::fs::remove_dir_all(dir);

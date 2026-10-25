@@ -234,10 +234,13 @@ pub async fn provider_models(
             // limit and thinking fields the inference API publishes.
             "data": models
                 .into_iter()
-                .map(|model| mg_providers::with_provider_metadata(
-                    model,
-                    mg_providers::ProviderDefaults::for_provider(&provider_name),
-                ))
+                .map(|mut model| {
+                    mg_providers::calibrate_model_limits(&mut model);
+                    mg_providers::with_provider_metadata(
+                        model,
+                        mg_providers::ProviderDefaults::for_provider(&provider_name),
+                    )
+                })
                 .collect::<Vec<_>>()
         }))
         .into_response(),
@@ -1008,6 +1011,21 @@ pub async fn settings_reveal(
         )
             .into_response()
     }
+}
+
+pub async fn reveal_window(
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if !crate::is_local_management_request(&headers, state.config.port) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(MgError::unauthorized("Local management requests only").to_openai_json()),
+        )
+            .into_response();
+    }
+    let ok = crate::window::reveal_main_window();
+    Json(serde_json::json!({ "ok": ok })).into_response()
 }
 
 #[cfg(test)]

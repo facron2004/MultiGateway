@@ -398,10 +398,17 @@ function capabilityHtml(row) {
   const badges = [];
   if (row.supports_vision) badges.push('<span class="cap-chip">识图</span>');
   if (row.supports_tool_calls) badges.push('<span class="cap-chip">工具</span>');
-  if (row.max_output_tokens)
+  if (row.max_output_tokens) {
+    const clamp = Number(row.output_clamp);
+    const clampLabel = clamp > 0 && clamp < row.max_output_tokens ? formatTokens(clamp) : "";
+    const note =
+      clampLabel && clampLabel !== formatTokens(row.max_output_tokens)
+        ? `最大输出（上游限制 ${clampLabel}）`
+        : "最大输出";
     badges.push(
-      `<span class="cap-chip" title="最大输出">出 ${formatTokens(row.max_output_tokens)}</span>`,
+      `<span class="cap-chip" title="${note}">出 ${formatTokens(row.max_output_tokens)}</span>`,
     );
+  }
   if (row.supports_reasoning) {
     const efforts = row.reasoning_efforts || [];
     const def = row.reasoning_default_effort;

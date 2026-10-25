@@ -56,6 +56,23 @@ fn open_external(value: &str) -> Result<(), String> {
     open::that_detached(url.as_str()).map_err(|error| error.to_string())
 }
 
+static MAIN_APP_HANDLE: parking_lot::Mutex<Option<tauri::AppHandle>> =
+    parking_lot::Mutex::new(None);
+
+pub fn set_main_app_handle(handle: tauri::AppHandle) {
+    *MAIN_APP_HANDLE.lock() = Some(handle);
+}
+
+pub fn reveal_main_window() -> bool {
+    let handle = MAIN_APP_HANDLE.lock().clone();
+    if let Some(app) = handle {
+        crate::tray::show_main(&app, None, None);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn run_desktop_window(
     context: tauri::Context<tauri::Wry>,
     state: AppState,
@@ -97,6 +114,7 @@ pub fn run_desktop_window(
             native::api_key_list,
         ])
         .setup(move |app| {
+            set_main_app_handle(app.handle().clone());
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title(concat!("MultiGateway · ", env!("CARGO_PKG_VERSION")))
                 .inner_size(980.0, 640.0)

@@ -14,6 +14,7 @@ pub use antigravity::AntigravityProvider;
 pub use copilot::CopilotProvider;
 pub use grok::GrokProvider;
 pub use minimax::MiniMaxProvider;
+pub use model_limits::calibrate_model_limits;
 pub use model_metadata::{
     with_agent_metadata, with_provider_metadata, ProviderDefaults, EFFORT_LEVELS,
 };

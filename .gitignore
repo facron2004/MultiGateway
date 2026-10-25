@@ -8,6 +8,9 @@
 *.pdb
 *.dll
 *.dmg
+.dmg-scratch/
+__pycache__/
+*.pyc
 
 # Desktop runtime profile and local backups
 *.WebView2/

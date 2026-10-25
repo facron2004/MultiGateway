@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="mg-tile" x1="120" y1="56" x2="900" y2="968" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3D6BFF"/>
+      <stop offset="0.52" stop-color="#2545D8"/>
+      <stop offset="1" stop-color="#09164E"/>
+    </linearGradient>
+    <linearGradient id="mg-sheen" x1="512" y1="56" x2="512" y2="430" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="mg-tile-clip">
+      <rect x="56" y="56" width="912" height="912" rx="220"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#mg-tile-clip)">
+    <rect x="56" y="56" width="912" height="912" fill="url(#mg-tile)"/>
+    <rect x="56" y="56" width="912" height="374" fill="url(#mg-sheen)"/>
+  </g>
+  <rect x="57" y="57" width="910" height="910" rx="219" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="2"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="132" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M232 748V418A140 140 0 0 1 512 418V748"/>
+    <path d="M512 418A140 140 0 0 1 792 418V748"/>
+  </g>
+  <rect x="446" y="418" width="132" height="330" fill="#3DDCFF"/>
+  <circle cx="512" cy="748" r="66" fill="#3DDCFF"/>
+</svg>

@@ -22,11 +22,15 @@ pub const REGION_GLOBAL_AGENT: &str = "https://agent.minimax.io";
 
 pub const CLIENT_ID: &str = "mcode-public";
 
-/// Output ceiling used when the caller asks for none. MiniMax's agent models
-/// write long answers (and reasoning tokens count against the same budget), so
-/// the old 8192 silently truncated them mid-sentence. This is the value the
-/// model list advertises as `max_output_tokens` when the catalog is silent.
+/// Completion budget used when the caller asks for none. MiniMax's agent
+/// models write long answers (and reasoning tokens count against the same
+/// budget), so the old 8192 silently truncated them mid-sentence.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32768;
+
+/// Published output ceiling for the M3 family. The request default above is a
+/// budget, not the model's maximum; advertising it as `max_output_tokens` made
+/// the catalog show 32K for models that can emit 512K.
+const MODEL_MAX_OUTPUT_TOKENS: u64 = 524_288;
 
 /// The completion budget for one request: the caller's value when it gave one,
 /// their `max_completion_tokens` alias otherwise, else the provider default.
@@ -89,14 +93,14 @@ fn minimax_model_entries(data: &Value) -> Vec<ModelEntry> {
             let metadata = model_map.get(&id)?;
             // MiniMax's catalog ships no limits or modality list, so the
             // provider's own facts (images, tools, the reasoning ladder) and the
-            // output ceiling this adapter actually sends are attached here; the
-            // shared envelope then publishes them in every client spelling.
+            // model's published output ceiling are attached here; the shared
+            // envelope then publishes them in every client spelling.
             let mut extra = serde_json::Map::new();
             extra.insert("supports_vision".to_string(), Value::Bool(true));
             extra.insert("supports_tool_calls".to_string(), Value::Bool(true));
             extra.insert(
                 "max_output_tokens".to_string(),
-                Value::from(DEFAULT_MAX_OUTPUT_TOKENS),
+                Value::from(MODEL_MAX_OUTPUT_TOKENS),
             );
             extra.insert(
                 "reasoning_efforts".to_string(),

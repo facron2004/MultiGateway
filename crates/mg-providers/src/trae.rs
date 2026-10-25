@@ -777,11 +777,195 @@ fn trae_query(messages: &[ChatMessage]) -> String {
     .to_string()
 }
 
-fn trae_content(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
-    trae_history_blocks(messages)
-        .into_iter()
-        .map(|block| serde_json::json!({"type": "text", "data": {"content": block}}))
-        .collect()
+const DEFAULT_TRAE_QUERY_MAX_CHARS: usize = 400_000;
+
+fn trae_query_max_chars() -> usize {
+    std::env::var("TRAE_REMOTE_QUERY_MAX_CHARS")
+        .ok()
+        .and_then(|val| val.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_TRAE_QUERY_MAX_CHARS)
+}
+
+fn is_continuation_turn(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "继续"
+            | "继续执行"
+            | "继续完成"
+            | "继续处理"
+            | "继续进行"
+            | "接着做"
+            | "接着执行"
+            | "往下继续"
+            | "下一步"
+            | "continue"
+            | "continue working"
+            | "go on"
+            | "proceed"
+            | "keep going"
+            | "resume"
+    )
+}
+
+/// Truncate oldest non-system messages so the flattened query fits upstream.
+/// Trae's remote session silently drops or cancels sessions when initial_message.query
+/// exceeds roughly 480k-500k chars.
+fn bound_trae_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let limit = trae_query_max_chars();
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let latest_user_idx = messages.iter().rposition(|m| m.role == "user");
+    let needs_task_anchor = if let Some(idx) = latest_user_idx {
+        let text = trae_text(&messages[idx].content);
+        is_continuation_turn(&text)
+    } else {
+        false
+    };
+
+    let anchor_prompt = if needs_task_anchor {
+        messages
+            .iter()
+            .take(latest_user_idx.unwrap())
+            .filter(|m| m.role == "user")
+            .filter_map(|m| {
+                let text = trae_text(&m.content).trim().to_string();
+                if !text.is_empty() && !is_continuation_turn(&text) {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .last()
+    } else {
+        None
+    };
+
+    let mut bounded: Vec<ChatMessage> = messages.to_vec();
+
+    loop {
+        let current_chars: usize = bounded
+            .iter()
+            .map(|m| {
+                let mut len = trae_text(&m.content).len();
+                if let Some(calls) = &m.tool_calls {
+                    for c in calls {
+                        len += c.id.len() + c.function.name.len() + c.function.arguments.len() + 30;
+                    }
+                }
+                len
+            })
+            .sum();
+
+        if current_chars <= limit {
+            break;
+        }
+
+        let non_system_indices: Vec<usize> = bounded
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != "system" && m.role != "developer")
+            .map(|(i, _)| i)
+            .collect();
+
+        if non_system_indices.len() <= 1 {
+            if let Some(&last_idx) = non_system_indices.first() {
+                let text = trae_text(&bounded[last_idx].content);
+                if text.len() > limit {
+                    let head_len = limit.min(40_000);
+                    let tail_len = limit.saturating_sub(head_len + 100);
+                    let truncated = format!(
+                        "{}\n\n...[history middle truncated for context window]...\n\n{}",
+                        &text[..text
+                            .char_indices()
+                            .take(head_len)
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)],
+                        &text[text
+                            .char_indices()
+                            .rev()
+                            .take(tail_len)
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(text.len())..]
+                    );
+                    bounded[last_idx].content = Some(serde_json::Value::String(truncated));
+                }
+            }
+            break;
+        }
+
+        let head = non_system_indices[0];
+        let mut drop_indices = std::collections::BTreeSet::new();
+        drop_indices.insert(head);
+
+        if bounded[head].role == "assistant" && bounded[head].tool_calls.is_some() {
+            if head + 1 < bounded.len() && bounded[head + 1].role == "tool" {
+                drop_indices.insert(head + 1);
+            }
+        }
+
+        bounded = bounded
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop_indices.contains(i))
+            .map(|(_, m)| m)
+            .collect();
+    }
+
+    if let Some(anchor) = anchor_prompt {
+        let has_anchor_already = bounded.iter().any(|m| {
+            if m.role == "user" {
+                let text = trae_text(&m.content);
+                text.contains(&anchor)
+            } else {
+                false
+            }
+        });
+        if !has_anchor_already {
+            let max_anchor_len = 16_000;
+            let anchor_text = if anchor.len() > max_anchor_len {
+                format!(
+                    "{}...",
+                    &anchor[..anchor
+                        .char_indices()
+                        .take(max_anchor_len)
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(anchor.len())]
+                )
+            } else {
+                anchor
+            };
+            let insert_pos = bounded
+                .iter()
+                .position(|m| m.role == "system" || m.role == "developer")
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            bounded.insert(
+                insert_pos,
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(serde_json::Value::String(format!(
+                        "[Task Anchor - User Request]\n{anchor_text}"
+                    ))),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            );
+        }
+    }
+
+    bounded
 }
 
 fn trae_resolve_mode(model: &str) -> (&'static str, &'static str, String, &'static str) {
@@ -837,15 +1021,40 @@ fn trae_session_body(
     custom_model: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let mut initial = serde_json::json!({
+        "agent_id": agent_type,
+        "agent_type": agent_type,
         "chat_session_id": "",
-        "content": trae_content(messages),
+        "content": serde_json::json!([]),
         "query": trae_query(messages),
         "model_name": model_name,
-        "agent_type": agent_type,
         "model_selection_strategy": strategy,
         "common_params": trae_common_params(account, surface, mode)
     });
     if let Some(custom_model) = custom_model {
+        let bound_model_name = custom_model
+            .get("name")
+            .or_else(|| custom_model.get("config_name"))
+            .or_else(|| custom_model.get("model_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(model_name);
+        if strategy == "manual" {
+            initial["model_name"] = serde_json::json!(bound_model_name);
+            let config_source = custom_model
+                .get("config_source")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1);
+            initial["model_config_source"] = serde_json::json!(config_source);
+            let is_preset = custom_model
+                .get("is_preset")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            initial["model_is_preset"] = serde_json::json!(is_preset);
+            let provider = custom_model
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            initial["model_provider"] = serde_json::json!(provider);
+        }
         initial["custom_model"] = custom_model;
     }
     serde_json::json!({
@@ -927,7 +1136,111 @@ fn trae_custom_model(payload: &serde_json::Value, model_name: &str) -> Option<se
     Some(config)
 }
 
-fn trae_visible_text(data: &serde_json::Value) -> String {
+/// Normalize upstream event spellings (`PlanItem`, `ResponseDone`, ...) to the
+/// snake_case names used by the translator.
+fn normalize_trae_event_name(raw: &str) -> String {
+    let text = raw.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut normalized = String::new();
+    for (index, value) in chars.iter().enumerate() {
+        if value.is_ascii_alphanumeric() {
+            let previous = index.checked_sub(1).and_then(|index| chars.get(index));
+            let next = chars.get(index + 1);
+            if value.is_ascii_uppercase()
+                && !normalized.is_empty()
+                && (previous.is_some_and(|value| {
+                    value.is_ascii_lowercase() || value.is_ascii_digit()
+                }) || next.is_some_and(|value| value.is_ascii_lowercase()))
+            {
+                normalized.push('_');
+            }
+            normalized.push(value.to_ascii_lowercase());
+        } else if !normalized.is_empty() && !normalized.ends_with('_') {
+            normalized.push('_');
+        }
+    }
+    let normalized = normalized.trim_matches('_').to_string();
+    let compact: String = normalized.chars().filter(|value| *value != '_').collect();
+    match compact.as_str() {
+        "modelconfig" => "model_config",
+        "planitem" => "plan_item",
+        "requestwaitinqueue" => "request_wait_in_queue",
+        "responsedone" | "streamdone" => "done",
+        "tokenusage" => "token_usage",
+        _ => normalized.as_str(),
+    }
+    .to_string()
+}
+
+fn trae_payload_event_name(payload: &serde_json::Value) -> String {
+    ["event", "event_type", "eventType", "type"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(serde_json::Value::as_str))
+        .map(normalize_trae_event_name)
+        .unwrap_or_default()
+}
+
+fn trae_nested_string(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().filter(|text| !text.is_empty()).or_else(|| {
+        ["content", "text", "summary", "value"]
+            .iter()
+            .find_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+            })
+    })
+}
+
+fn trae_payload_reasoning(data: &serde_json::Value) -> String {
+    for key in [
+        "reasoning_content",
+        "reasoningContent",
+        "reasoning",
+        "thought",
+        "thinking",
+    ] {
+        if let Some(text) = data.get(key).and_then(trae_nested_string) {
+            return text.to_string();
+        }
+    }
+    let Some(message) = data.get("message").filter(|value| value.is_object()) else {
+        return String::new();
+    };
+    let nested = trae_payload_reasoning(message);
+    if !nested.is_empty() {
+        return nested;
+    }
+    let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| {
+            let kind = part
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !matches!(kind.as_str(), "reasoning" | "thinking" | "reasoning_text") {
+                return None;
+            }
+            part.get("text")
+                .or_else(|| part.get("content"))
+                .or_else(|| part.get("value"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Visible assistant text carried by message-like events.
+fn trae_message_text(data: &serde_json::Value) -> String {
     let nested = ["message", "agent_message", "assistant_message"]
         .iter()
         .find_map(|key| data.get(*key).filter(|value| value.is_object()))
@@ -941,14 +1254,20 @@ fn trae_visible_text(data: &serde_json::Value) -> String {
                     let kind = part
                         .get("type")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    if matches!(kind, "reasoning" | "thinking" | "reasoning_text") {
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if matches!(kind.as_str(), "reasoning" | "thinking" | "reasoning_text") {
                         return None;
                     }
-                    part.get("text")
-                        .or_else(|| part.get("content"))
-                        .and_then(serde_json::Value::as_str)
+                    part.as_str()
                         .map(str::to_owned)
+                        .or_else(|| {
+                            part.get("text")
+                                .or_else(|| part.get("content"))
+                                .or_else(|| part.get("value"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
                 })
                 .collect::<String>();
             if !text.is_empty() {
@@ -961,20 +1280,169 @@ fn trae_visible_text(data: &serde_json::Value) -> String {
         if let Some(text) = nested.get(key).and_then(serde_json::Value::as_str) {
             return text.to_string();
         }
+        if let Some(parts) = nested.get(key).and_then(serde_json::Value::as_array) {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.as_str().map(str::to_owned).or_else(|| {
+                        part.get("text")
+                            .or_else(|| part.get("content"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                })
+                .collect::<String>();
+            if !text.is_empty() {
+                return text;
+            }
+        }
     }
     String::new()
 }
 
-fn trae_apply_snapshot(visible: &mut String, next: &str) -> String {
-    if next.is_empty() || next == visible.as_str() || visible.starts_with(next) {
+fn trae_plan_has_split_reasoning(data: &serde_json::Value) -> bool {
+    data.get("reasoning_content").is_some() || data.get("reasoningContent").is_some()
+}
+
+fn trae_plan_visible_text(data: &serde_json::Value) -> String {
+    let content = trae_message_text(data);
+    if !content.is_empty() {
+        return content;
+    }
+    data.get("thought")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Trae's agent reports its final answer through the internal `finish` tool.
+/// Some turns never stream an answer plan item, so this summary is the only
+/// visible output.
+fn trae_finish_summary(data: &serde_json::Value) -> String {
+    let Some(info) = data
+        .get("tool_call_info")
+        .or_else(|| data.get("toolCallInfo"))
+        .filter(|value| value.is_object())
+    else {
+        return String::new();
+    };
+    if info.get("name").and_then(serde_json::Value::as_str) != Some("finish") {
         return String::new();
     }
-    if let Some(delta) = next.strip_prefix(visible.as_str()) {
-        *visible = next.to_string();
+    let params = info.get("params").or_else(|| info.get("paramsJson"));
+    let params = match params {
+        Some(serde_json::Value::String(raw)) => {
+            serde_json::from_str::<serde_json::Value>(raw).unwrap_or(serde_json::Value::Null)
+        }
+        Some(value) => value.clone(),
+        None => return String::new(),
+    };
+    params
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn trae_common_prefix_len(left: &str, right: &str) -> usize {
+    let mut common = left
+        .bytes()
+        .zip(right.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while common > 0 && !left.is_char_boundary(common) {
+        common -= 1;
+    }
+    common
+}
+
+fn trae_text_delta(previous: &str, current: &str) -> String {
+    if current.is_empty() || current == previous {
+        return String::new();
+    }
+    if let Some(delta) = current.strip_prefix(previous) {
         return delta.to_string();
     }
-    visible.push_str(next);
-    next.to_string()
+    if previous.starts_with(current) {
+        return String::new();
+    }
+    let common = trae_common_prefix_len(previous, current);
+    current.get(common..).unwrap_or_default().to_string()
+}
+
+/// Merge a cumulative snapshot into the previous value without replaying or
+/// losing text when snapshots arrive out of order.
+fn merge_trae_snapshot(current: &mut String, next: &str) {
+    if next.is_empty() || next == current.as_str() {
+        return;
+    }
+    if current.starts_with(next) {
+        return;
+    }
+    if next.starts_with(current.as_str()) {
+        *current = next.to_string();
+        return;
+    }
+    if current.ends_with(next) && next.len() < current.len() {
+        return;
+    }
+    let common = trae_common_prefix_len(current, next);
+    let shorter = current.len().min(next.len());
+    if common >= 4 || (shorter > 0 && common * 2 >= shorter) {
+        *current = next.to_string();
+    } else {
+        current.push_str(next);
+    }
+}
+
+fn trae_suffix_prefix_overlap(left: &str, right: &str, minimum: usize) -> usize {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let limit = left.len().min(right.len());
+    (minimum..=limit)
+        .rev()
+        .find(|size| left.ends_with(&right[..*size]))
+        .unwrap_or(0)
+}
+
+fn merge_trae_text(plan: &str, message: &str) -> String {
+    if plan.is_empty() {
+        return message.to_string();
+    }
+    if message.is_empty() {
+        return plan.to_string();
+    }
+    if plan == message || plan.starts_with(message) || plan.ends_with(message) {
+        return plan.to_string();
+    }
+    if message.starts_with(plan) {
+        return message.to_string();
+    }
+    let overlap = trae_suffix_prefix_overlap(plan, message, 4);
+    // The overlap is computed on bytes; keep only a char-boundary suffix.
+    if overlap > 0 && message.is_char_boundary(overlap) {
+        return format!("{plan}{}", &message[overlap..]);
+    }
+    format!("{}\n\n{}", plan.trim_end(), message.trim_start())
+}
+
+fn merge_trae_summary(text: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        return text.to_string();
+    }
+    if text.is_empty() {
+        return summary.to_string();
+    }
+    let text_end = text.trim_end();
+    let summary_end = summary.trim_end();
+    if text_end.ends_with(summary_end) || text_end.starts_with(summary_end) {
+        return text.to_string();
+    }
+    if summary.starts_with(text_end) {
+        return summary.to_string();
+    }
+    format!("{text_end}\n\n{}", summary.trim_start())
 }
 
 fn trae_usage(data: &serde_json::Value) -> Option<ChatUsage> {
@@ -1011,14 +1479,45 @@ fn trae_usage(data: &serde_json::Value) -> Option<ChatUsage> {
     })
 }
 
+fn trae_snapshot_entry<'a>(
+    entries: &'a mut Vec<(String, String)>,
+    key: &str,
+) -> &'a mut String {
+    let index = if let Some(index) = entries.iter().position(|(id, _)| id == key) {
+        index
+    } else {
+        entries.push((key.to_string(), String::new()));
+        entries.len() - 1
+    };
+    &mut entries[index].1
+}
+
+fn trae_join_snapshots(entries: &[(String, String)]) -> String {
+    entries
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 struct TraeTranslator {
     id: String,
     model: String,
     started: bool,
     visible: String,
-    reasoning: String,
+    /// Cumulative visible snapshots keyed by plan-item id.
+    plan_texts: Vec<(String, String)>,
+    message_text: String,
+    /// Final answer reported through the internal `finish` tool.
+    finish_summary: String,
+    /// Cumulative reasoning snapshots keyed by plan-item id.
+    reasoning_texts: Vec<(String, String)>,
+    emitted_reasoning: String,
     usage: Option<ChatUsage>,
+    finish_reason: String,
     finished: bool,
+    completed: bool,
 }
 
 impl TraeTranslator {
@@ -1028,9 +1527,15 @@ impl TraeTranslator {
             model: model.to_string(),
             started: false,
             visible: String::new(),
-            reasoning: String::new(),
+            plan_texts: Vec::new(),
+            message_text: String::new(),
+            finish_summary: String::new(),
+            reasoning_texts: Vec::new(),
+            emitted_reasoning: String::new(),
             usage: None,
+            finish_reason: "stop".to_string(),
             finished: false,
+            completed: false,
         }
     }
 
@@ -1054,19 +1559,67 @@ impl TraeTranslator {
         }
     }
 
+    fn role_chunk(&self) -> ChatCompletionChunk {
+        self.chunk(
+            ChunkDelta {
+                role: Some("assistant".to_string()),
+                ..ChunkDelta::default()
+            },
+            None,
+            None,
+        )
+    }
+
+    fn refresh_visible(&mut self) -> String {
+        let plan_text = self
+            .plan_texts
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<String>();
+        let merged = merge_trae_summary(
+            &merge_trae_text(&plan_text, &self.message_text),
+            &self.finish_summary,
+        );
+        if merged.is_empty() {
+            return String::new();
+        }
+        let delta = trae_text_delta(&self.visible, &merged);
+        self.visible = merged;
+        delta
+    }
+
+    fn refresh_reasoning(&mut self) -> String {
+        let combined = trae_join_snapshots(&self.reasoning_texts);
+        let delta = trae_text_delta(&self.emitted_reasoning, &combined);
+        self.emitted_reasoning = combined;
+        delta
+    }
+
     fn push(&mut self, event: &str, data: &str) -> Vec<Result<ChatCompletionChunk>> {
-        let event = event.trim().to_ascii_lowercase();
-        if matches!(event.as_str(), "heartbeat" | "keepalive" | "ping") {
+        let mut event_name = normalize_trae_event_name(event);
+        let payload = if data.trim() == "[DONE]" {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str::<serde_json::Value>(data).unwrap_or(serde_json::json!({}))
+        };
+        if event_name.is_empty() || event_name == "message" {
+            let embedded = trae_payload_event_name(&payload);
+            if !embedded.is_empty() && embedded != "message" {
+                event_name = embedded;
+            } else if event_name.is_empty() {
+                event_name = "message".to_string();
+            }
+        }
+        if matches!(event_name.as_str(), "heartbeat" | "keepalive" | "ping") {
             return Vec::new();
         }
-        let payload =
-            serde_json::from_str::<serde_json::Value>(data).unwrap_or(serde_json::json!({}));
-        if event == "error" {
+        if event_name == "error" {
             self.finished = true;
+            self.completed = true;
             let message = payload
                 .get("message")
                 .or_else(|| payload.get("error"))
-                .and_then(serde_json::Value::as_str)
+                .and_then(|value| trae_nested_string(value))
                 .unwrap_or("Trae upstream error");
             return vec![Err(MgError::provider(
                 502,
@@ -1074,69 +1627,122 @@ impl TraeTranslator {
                 "upstream_error",
             ))];
         }
-        if event == "token_usage" {
+        if matches!(
+            event_name.as_str(),
+            "status_change" | "status_changed" | "session_status"
+        ) {
+            let status = payload
+                .get("status")
+                .or_else(|| payload.get("new_status"))
+                .or_else(|| payload.get("newStatus"))
+                .and_then(serde_json::Value::as_i64);
+            if let Some(status) = status {
+                if status == 4 || status == 6 {
+                    self.finished = true;
+                    self.completed = true;
+                    let msg = if status == 4 {
+                        "Trae session was canceled upstream"
+                    } else {
+                        "Trae session failed upstream"
+                    };
+                    return vec![Err(MgError::provider(502, msg, "upstream_error"))];
+                }
+            }
+        }
+        if let Some(code) = payload.get("code").and_then(serde_json::Value::as_i64) {
+            if code != 0 && code != 200 && payload.get("data").is_none() {
+                let msg = payload
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("upstream business error");
+                self.finished = true;
+                self.completed = true;
+                return vec![Err(MgError::provider(
+                    502,
+                    format!("Trae error ({code}): {msg}"),
+                    "upstream_error",
+                ))];
+            }
+        }
+        if event_name == "token_usage" {
             self.usage = trae_usage(&payload).or(self.usage.clone());
             return Vec::new();
         }
-        if event == "done" {
+        if event_name == "done" || data.trim() == "[DONE]" {
             self.finished = true;
-            return vec![Ok(self.chunk(
-                ChunkDelta::default(),
-                Some(
-                    payload
-                        .get("finish_reason")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("stop")
-                        .to_string(),
-                ),
-                self.usage.clone(),
-            ))];
-        }
-        let reasoning = if event == "plan_item" {
-            payload
-                .get("reasoning_content")
+            if let Some(reason) = payload
+                .get("finish_reason")
+                .or_else(|| payload.get("stop_reason"))
+                .or_else(|| payload.get("finishReason"))
+                .or_else(|| payload.get("stopReason"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        } else {
-            String::new()
-        };
-        let text = if event == "plan_item" {
-            let thought = payload
-                .get("thought")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if !thought.is_empty() {
-                thought.to_string()
-            } else {
-                trae_visible_text(&serde_json::json!({
-                    "content": payload.get("content").cloned().unwrap_or(serde_json::Value::Null)
-                }))
+                .filter(|reason| !reason.is_empty())
+            {
+                self.finish_reason = reason.to_string();
             }
-        } else if matches!(
-            event.as_str(),
-            "message" | "assistant_message" | "response" | "text" | "output"
-        ) {
-            trae_visible_text(&payload)
-        } else {
-            String::new()
-        };
-        let reasoning_delta = trae_apply_snapshot(&mut self.reasoning, &reasoning);
-        let delta = trae_apply_snapshot(&mut self.visible, &text);
+            return Vec::new();
+        }
+
+        let summary = trae_finish_summary(&payload);
+        if !summary.is_empty() {
+            self.finish_summary = summary;
+        }
+        let mut changed = false;
+        match event_name.as_str() {
+            "plan_item" => {
+                let id = payload
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("plan");
+                let reasoning = if trae_plan_has_split_reasoning(&payload) {
+                    payload
+                        .get("reasoning_content")
+                        .or_else(|| payload.get("reasoningContent"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    trae_payload_reasoning(&payload)
+                };
+                let visible = trae_plan_visible_text(&payload);
+                if !reasoning.is_empty() {
+                    let snapshot = trae_snapshot_entry(&mut self.reasoning_texts, id);
+                    merge_trae_snapshot(snapshot, &reasoning);
+                    changed = true;
+                }
+                if !visible.is_empty() {
+                    let snapshot = trae_snapshot_entry(&mut self.plan_texts, id);
+                    merge_trae_snapshot(snapshot, &visible);
+                    changed = true;
+                }
+            }
+            "message" | "assistant_message" | "agent_message" | "response" | "text" | "output" => {
+                let text = trae_message_text(&payload);
+                let reasoning = trae_payload_reasoning(&payload);
+                if !text.is_empty() {
+                    merge_trae_snapshot(&mut self.message_text, &text);
+                    changed = true;
+                }
+                if !reasoning.is_empty() {
+                    let snapshot = trae_snapshot_entry(&mut self.reasoning_texts, "__message__");
+                    merge_trae_snapshot(snapshot, &reasoning);
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        if !changed && self.finish_summary.is_empty() {
+            return Vec::new();
+        }
+        let reasoning_delta = self.refresh_reasoning();
+        let delta = self.refresh_visible();
         if reasoning_delta.is_empty() && delta.is_empty() {
             return Vec::new();
         }
         let mut chunks = Vec::new();
         if !self.started {
             self.started = true;
-            chunks.push(Ok(self.chunk(
-                ChunkDelta {
-                    role: Some("assistant".to_string()),
-                    ..ChunkDelta::default()
-                },
-                None,
-                None,
-            )));
+            chunks.push(Ok(self.role_chunk()));
         }
         chunks.push(Ok(self.chunk(
             ChunkDelta {
@@ -1150,19 +1756,48 @@ impl TraeTranslator {
         chunks
     }
 
-    fn finish(&mut self) -> Option<ChatCompletionChunk> {
-        if self.finished {
-            return None;
+    fn finish(&mut self) -> Vec<Result<ChatCompletionChunk>> {
+        if self.completed {
+            return Vec::new();
         }
-        self.finished = true;
-        if !self.started && self.visible.is_empty() {
-            return None;
+        self.completed = true;
+        if self.visible.is_empty() {
+            // Some turns only fill the reasoning channel. Prefer a bounded
+            // trace over telling the client the turn completed with no output.
+            let reasoning = trae_join_snapshots(&self.reasoning_texts);
+            if reasoning.is_empty() {
+                return vec![Err(MgError::provider(
+                    502,
+                    "Trae upstream returned an empty response",
+                    "empty_response",
+                ))];
+            }
+            self.visible = reasoning.clone();
+            let mut chunks = Vec::new();
+            if !self.started {
+                self.started = true;
+                chunks.push(Ok(self.role_chunk()));
+            }
+            chunks.push(Ok(self.chunk(
+                ChunkDelta {
+                    content: Some(reasoning),
+                    ..ChunkDelta::default()
+                },
+                None,
+                None,
+            )));
+            chunks.push(Ok(self.chunk(
+                ChunkDelta::default(),
+                Some(self.finish_reason.clone()),
+                self.usage.clone(),
+            )));
+            return chunks;
         }
-        Some(self.chunk(
+        vec![Ok(self.chunk(
             ChunkDelta::default(),
-            Some("stop".to_string()),
+            Some(self.finish_reason.clone()),
             self.usage.clone(),
-        ))
+        ))]
     }
 }
 
@@ -1738,8 +2373,9 @@ impl Provider for TraeProvider {
         } else {
             fetch_trae_custom_model(&self.client, &account, &surface, &model_name).await
         };
+        let bounded_messages = bound_trae_messages(&req.messages);
         let body = trae_session_body(
-            &req.messages,
+            &bounded_messages,
             &account,
             &surface,
             mode,
@@ -1893,8 +2529,10 @@ impl Provider for TraeProvider {
                     }
                 }
             }
-            if let Some(chunk) = translator.finish() {
-                let _ = tx.send(Ok(chunk)).await;
+            for chunk in translator.finish() {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
             }
             stop_trae_session(
                 &client,
@@ -2170,14 +2808,42 @@ impl Provider for TraeProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_trae_model_name, parse_trae_catalog, parse_trae_quota, parse_trae_solo_catalog,
-        trae_custom_model, trae_fallback_models, trae_model_config_names, trae_surface_with,
-        trae_token_needs_refresh, TraeProvider, TraeSurfaceEnv, TraeTranslator,
+        bound_trae_messages, canonical_trae_model_name, parse_trae_catalog, parse_trae_quota,
+        parse_trae_solo_catalog, trae_custom_model, trae_fallback_models, trae_model_config_names,
+        trae_session_body, trae_surface, trae_surface_with, trae_token_needs_refresh,
+        TraeProvider, TraeSurfaceEnv, TraeTranslator,
     };
+    use mg_protocols::openai::{ChatMessage, FunctionCall, ToolCall};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// `TRAE_REMOTE_QUERY_MAX_CHARS` is process-global, so tests that mutate it
+    /// must not overlap; otherwise one test observes the other's limit.
+    static QUERY_LIMIT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn translator_text(
+        chunks: &[mg_core::Result<mg_protocols::openai::ChatCompletionChunk>],
+    ) -> String {
+        chunks
+            .iter()
+            .filter_map(|chunk| chunk.as_ref().ok())
+            .flat_map(|chunk| chunk.choices.iter())
+            .filter_map(|choice| choice.delta.content.clone())
+            .collect()
+    }
+
+    fn translator_reasoning(
+        chunks: &[mg_core::Result<mg_protocols::openai::ChatCompletionChunk>],
+    ) -> String {
+        chunks
+            .iter()
+            .filter_map(|chunk| chunk.as_ref().ok())
+            .flat_map(|chunk| chunk.choices.iter())
+            .filter_map(|choice| choice.delta.reasoning_content.clone())
+            .collect()
+    }
 
     #[test]
     fn refreshes_trae_tokens_before_they_expire_but_not_long_lived_ones() {
@@ -2287,6 +2953,146 @@ mod tests {
         .unwrap();
         assert_eq!(config["config_name"], "doubao-seed-2.1-turbo");
         assert_eq!(config["use_remote_service"], true);
+    }
+
+    #[test]
+    fn finish_tool_summary_is_emitted_when_no_plan_item_carries_an_answer() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        let reasoning = translator.push(
+            "plan_item",
+            r#"{"id":"pi_1","thought":"","reasoning_content":"The user wants pong"}"#,
+        );
+        assert_eq!(translator_reasoning(&reasoning), "The user wants pong");
+        assert!(translator_text(&reasoning).is_empty());
+
+        let finish = translator.push(
+            "plan_item",
+            r#"{"id":"pi_1","thought":"","reasoning_content":"","tool_call_info":{"name":"finish","params":{"summary":"pong"}}}"#,
+        );
+        assert_eq!(translator_text(&finish), "pong");
+
+        assert!(translator.push("done", "{}").is_empty());
+        let terminal = translator.finish();
+        assert_eq!(terminal.len(), 1);
+        let chunk = terminal[0].as_ref().unwrap();
+        assert_eq!(
+            chunk.choices[0].finish_reason.as_deref(),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn finish_summary_only_turn_is_not_reported_as_empty() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        let chunks = translator.push(
+            "plan_item",
+            r#"{"id":"pi_1","thought":"","tool_call_info":{"name":"finish","params":{"summary":"done"}}}"#,
+        );
+        assert_eq!(translator_text(&chunks), "done");
+
+        translator.push("done", "{}");
+        let terminal = translator.finish();
+        assert_eq!(terminal.len(), 1);
+        assert!(
+            translator_text(&terminal).is_empty(),
+            "finish summary must not be replayed"
+        );
+    }
+
+    #[test]
+    fn finish_summary_does_not_duplicate_streamed_answer() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        assert_eq!(
+            translator_text(&translator.push("plan_item", r#"{"id":"pi_1","thought":"pong"}"#)),
+            "pong"
+        );
+        let finish = translator.push(
+            "plan_item",
+            r#"{"id":"pi_1","thought":"","tool_call_info":{"name":"finish","params":{"summary":"pong"}}}"#,
+        );
+        assert!(finish.is_empty());
+        let extended = translator.push(
+            "plan_item",
+            r#"{"id":"pi_1","thought":"","tool_call_info":{"name":"finish","params":{"summary":"pong!"}}}"#,
+        );
+        assert_eq!(translator_text(&extended), "!");
+    }
+
+    #[test]
+    fn plan_item_prefers_explicit_content_over_thought() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        let chunks = translator.push(
+            "plan_item",
+            r#"{"id":"pi_1","thought":"narrating the answer","reasoning_content":"","content":"the answer"}"#,
+        );
+        assert_eq!(translator_text(&chunks), "the answer");
+        assert!(translator_reasoning(&chunks).is_empty());
+    }
+
+    #[test]
+    fn camel_case_events_and_embedded_payload_types_are_understood() {
+        let mut prefixed = TraeTranslator::new("deepseek-v4.1-flash");
+        assert_eq!(
+            translator_text(
+                &prefixed.push("PlanItem", r#"{"id":"pi_1","thought":"pong"}"#)
+            ),
+            "pong"
+        );
+        assert!(!prefixed.finished);
+        prefixed.push("ResponseDone", "{}");
+        assert!(prefixed.finished);
+
+        let mut embedded = TraeTranslator::new("deepseek-v4.1-flash");
+        assert_eq!(
+            translator_text(&embedded.push(
+                "message",
+                r#"{"type":"plan_item","id":"pi_1","thought":"pong"}"#
+            )),
+            "pong"
+        );
+    }
+
+    #[test]
+    fn empty_upstream_turn_reports_an_error_instead_of_a_completed_empty_response() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        assert!(translator.push("metadata", "{}").is_empty());
+        assert!(translator.push("done", "{}").is_empty());
+        let chunks = translator.finish();
+        assert_eq!(chunks.len(), 1);
+        let error = chunks[0].as_ref().unwrap_err();
+        assert!(error.message().contains("empty response"));
+    }
+
+    #[test]
+    fn reasoning_only_turn_falls_back_to_content() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        let chunks = translator.push(
+            "plan_item",
+            r#"{"id":"pi_1","thought":"","reasoning_content":"only reasoning"}"#,
+        );
+        assert_eq!(translator_reasoning(&chunks), "only reasoning");
+        translator.push("done", "{}");
+        let terminal = translator.finish();
+        assert_eq!(translator_text(&terminal), "only reasoning");
+    }
+
+    #[test]
+    fn multiple_plan_items_are_joined_in_arrival_order() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        assert_eq!(
+            translator_text(
+                &translator.push("plan_item", r#"{"id":"pi_1","thought":"hello "}"#)
+            ),
+            "hello "
+        );
+        assert_eq!(
+            translator_text(
+                &translator.push("plan_item", r#"{"id":"pi_2","thought":"world"}"#)
+            ),
+            "world"
+        );
+        let grown = translator.push("plan_item", r#"{"id":"pi_1","thought":"hello there "}"#);
+        assert_eq!(translator_text(&grown), "there world");
     }
 
     #[test]
@@ -2565,5 +3371,200 @@ mod tests {
         assert_eq!(cn.default_user_region, "CN");
         assert_eq!(cn.ug_host, "https://api.trae.cn");
         assert_eq!(cn.pay_version, "v2");
+    }
+
+    #[test]
+    fn trae_session_body_passes_empty_content_and_agent_id() {
+        let account = serde_json::from_value::<mg_core::Account>(json!({
+            "id": "2578818247695664",
+            "access_token": "token",
+            "region": "cn"
+        }))
+        .unwrap();
+        let surface = trae_surface("cn");
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!("hello")),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let custom_model = json!({
+            "name": "deepseek-v4.1-flash",
+            "config_source": 1,
+            "is_preset": true,
+            "provider": "deepseek"
+        });
+        let body = trae_session_body(
+            &messages,
+            &account,
+            &surface,
+            "code",
+            "manual",
+            "deepseek-v4.1-flash",
+            "solo_agent_remote",
+            Some(custom_model),
+        );
+        let initial = &body["initial_message"];
+        assert_eq!(initial["content"], json!([]));
+        assert_eq!(initial["agent_id"], "solo_agent_remote");
+        assert_eq!(initial["agent_type"], "solo_agent_remote");
+        assert_eq!(initial["model_name"], "deepseek-v4.1-flash");
+        assert_eq!(initial["model_config_source"], 1);
+        assert_eq!(initial["model_is_preset"], true);
+        assert_eq!(initial["model_provider"], "deepseek");
+    }
+
+    #[test]
+    fn bound_trae_messages_keeps_short_history_intact() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("You are an AI assistant.")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("Hello!")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let bounded = bound_trae_messages(&messages);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].role, "system");
+        assert_eq!(bounded[1].role, "user");
+    }
+
+    #[test]
+    fn bound_trae_messages_drops_paired_assistant_tool_call_and_result() {
+        let _env = QUERY_LIMIT_ENV
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        std::env::set_var("TRAE_REMOTE_QUERY_MAX_CHARS", "200");
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("System prompt")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("Run tool A")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(json!("Calling tool")),
+                name: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "fetch".to_string(),
+                        arguments: "{\"url\":\"http://test\"}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some(json!("Very long tool output that exceeds limit by far ...")),
+                name: Some("fetch".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("Final turn question")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let bounded = bound_trae_messages(&messages);
+        std::env::remove_var("TRAE_REMOTE_QUERY_MAX_CHARS");
+
+        // The system prompt and final question must remain
+        assert_eq!(bounded[0].role, "system");
+        let last = bounded.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, Some(json!("Final turn question")));
+        // The assistant call and tool result must not leave an orphaned half
+        let has_call = bounded.iter().any(|m| m.tool_calls.is_some());
+        let has_tool = bounded.iter().any(|m| m.role == "tool");
+        assert_eq!(has_call, has_tool);
+    }
+
+    #[test]
+    fn bound_trae_messages_injects_task_anchor_when_continuation_turn() {
+        let _env = QUERY_LIMIT_ENV
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        std::env::set_var("TRAE_REMOTE_QUERY_MAX_CHARS", "100");
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("System prompt")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("Implement feature XYZ for the project")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(json!("Working on it... very very long intermediate output from the model that definitely takes up space in the context")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("继续")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let bounded = bound_trae_messages(&messages);
+        std::env::remove_var("TRAE_REMOTE_QUERY_MAX_CHARS");
+
+        // The anchor must be present
+        let has_anchor = bounded.iter().any(|m| {
+            if let Some(content) = m.content.as_ref().and_then(|c| c.as_str()) {
+                content.contains("Task Anchor - User Request") && content.contains("Implement feature XYZ")
+            } else {
+                false
+            }
+        });
+        assert!(has_anchor, "Task anchor must be preserved for continuation turn");
+    }
+
+    #[test]
+    fn status_change_to_canceled_or_failed_reports_error() {
+        let mut translator = TraeTranslator::new("deepseek-v4.1-flash");
+        let chunks = translator.push("status_change", r#"{"status":4}"#);
+        assert_eq!(chunks.len(), 1);
+        let error = chunks[0].as_ref().unwrap_err();
+        assert!(error.message().contains("canceled upstream"));
+
+        let mut fail_translator = TraeTranslator::new("deepseek-v4.1-flash");
+        let fail_chunks = fail_translator.push("status_changed", r#"{"new_status":6}"#);
+        assert_eq!(fail_chunks.len(), 1);
+        let fail_err = fail_chunks[0].as_ref().unwrap_err();
+        assert!(fail_err.message().contains("failed upstream"));
     }
 }

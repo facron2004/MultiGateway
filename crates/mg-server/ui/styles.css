@@ -605,6 +605,10 @@ body.sidebar-expanded .sidebar-brand-name {
 .provider.selected .rail-dot {
   border-color: var(--selected-bg);
 }
+/* The expanded list has room for port status; the collapsed rail stays clean. */
+body:not(.sidebar-expanded) .provider .rail-dot {
+  display: none;
+}
 
 body.sidebar-expanded .agent-list {
   align-items: stretch;
@@ -675,7 +679,7 @@ body.sidebar-expanded .provider .rail-dot {
 }
 .rail-tool.selected {
   background: var(--selected-bg);
-  color: var(--ink);
+  color: var(--orange);
 }
 .rail-tool.selected:before {
   content: "";
@@ -970,6 +974,7 @@ main {
 .account-toolbar .icon {
   width: 16px;
   height: 16px;
+  stroke-width: 1.9;
 }
 #operation-scope {
   margin-left: auto;
@@ -1174,44 +1179,55 @@ main {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* Row actions read as one compact control instead of five loose buttons. */
 .account-actions {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 0;
   white-space: nowrap;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--card);
 }
 .action-icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
   padding: 0;
-  border-radius: var(--radius-xs);
-  border: 1px solid var(--line);
-  background: var(--card);
-  color: var(--ink-2);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink-3);
   cursor: pointer;
-  transition: background var(--motion-fast) ease, border-color var(--motion-fast) ease, color var(--motion-fast) ease, transform var(--motion-fast) ease, opacity var(--motion-fast) ease;
+  transition: background var(--motion-fast) ease, color var(--motion-fast) ease, opacity var(--motion-fast) ease;
   flex-shrink: 0;
 }
+.action-icon-btn:first-child {
+  border-radius: calc(var(--radius-md) - 1px) 0 0 calc(var(--radius-md) - 1px);
+}
+.action-icon-btn:last-child {
+  border-radius: 0 calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px) 0;
+}
+.action-icon-btn + .action-icon-btn {
+  border-left: 1px solid var(--line-soft);
+}
 .action-icon-btn .icon {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.9;
 }
 .action-icon-btn:hover:not(:disabled) {
   background: var(--surface-hover);
-  border-color: var(--hover-line);
   color: var(--ink);
 }
 .action-icon-btn:active:not(:disabled) {
-  transform: scale(0.95);
   background: var(--hover-bg);
 }
 .action-icon-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
-  border-color: transparent;
   background: transparent;
   color: var(--ink-5);
 }
@@ -1220,7 +1236,6 @@ main {
 }
 .action-icon-btn.btn-play:hover:not(:disabled) {
   background: var(--success-soft);
-  border-color: var(--success-line);
   color: var(--success-ink);
 }
 .action-icon-btn.btn-pause {
@@ -1228,12 +1243,10 @@ main {
 }
 .action-icon-btn.btn-pause:hover:not(:disabled) {
   background: var(--slate-50);
-  border-color: var(--slate-300);
   color: var(--slate-700);
 }
 .action-icon-btn.btn-delete:hover:not(:disabled) {
   background: var(--danger-soft);
-  border-color: var(--danger-line);
   color: var(--danger-hover);
 }
 .account-footnote {
@@ -2406,7 +2419,6 @@ dialog select {
   }
   .account-actions {
     padding-left: 0;
-    gap: 1px;
   }
   .account-footnote {
     flex-direction: column;
@@ -2500,7 +2512,7 @@ html[data-theme="dark"] .dropdown,
 html[data-theme="dark"] .list-panel,
 html[data-theme="dark"] .search-field,
 html[data-theme="dark"] .table-scroll,
-html[data-theme="dark"] .action-icon-btn:not(:disabled),
+html[data-theme="dark"] .account-actions,
 html[data-theme="dark"] th,
 html[data-theme="dark"] .chip.selected,
 html[data-theme="dark"] .board-select,
@@ -2543,12 +2555,10 @@ html[data-theme="dark"] .board-table tbody tr {
   border-color: var(--line);
 }
 
-/* These provider marks ship as near-black SVGs and are rendered through
-   <img>, so currentColor cannot lighten them. Invert them only on dark
-   surfaces; the colorful marks (WorkBuddy, Trae, Copilot, MiniMax) keep
-   their brand colors. */
+/* These provider marks ship with a near-black fill and are rendered through
+   <img>, so currentColor cannot lighten them. Invert the monochrome marks on
+   dark surfaces; Qoder uses icons/qoder-dark.svg so its brand green survives. */
 html[data-theme="dark"] img[src$="antigravity.svg"],
-html[data-theme="dark"] img[src$="grok.svg"],
-html[data-theme="dark"] img[src$="qoder.svg"] {
+html[data-theme="dark"] img[src$="grok.svg"] {
   filter: invert(1) brightness(1.12);
 }

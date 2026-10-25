@@ -50,7 +50,7 @@ fn local_management_origin(value: &str, port: u16) -> bool {
     allowed.iter().any(|origin| origin.eq_ignore_ascii_case(value))
 }
 
-fn is_local_management_request(headers: &HeaderMap, port: u16) -> bool {
+pub(crate) fn is_local_management_request(headers: &HeaderMap, port: u16) -> bool {
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -354,6 +354,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         // Gateway management APIs
         .route("/gateway/status", get(handlers::gateway_status))
+        .route("/gateway/window/show", get(handlers::reveal_window))
         .route("/gateway/usage/board", get(handlers::usage_board))
         .route("/gateway/tray/summary", get(crate::tray::http_summary))
         .route(
@@ -475,6 +476,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = done_tx.send(());
             }
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let req = format!("GET /gateway/window/show HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                        if stream.write_all(req.as_bytes()).await.is_ok() {
+                            let mut buf = [0u8; 64];
+                            if let Ok(n) = stream.read(&mut buf).await {
+                                if n >= 12 && buf.starts_with(b"HTTP/1.1 200") {
+                                    info!("MultiGateway is already running on http://{}, brought existing window to front.", addr);
+                                    let _ = ready_tx.send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::AlreadyExists,
+                                        "already_running",
+                                    )));
+                                    let _ = done_tx.send(());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
                 error!("Failed to bind server on {}: {}", addr, e);
                 let _ = ready_tx.send(Err(std::io::Error::new(
                     e.kind(),
@@ -486,14 +507,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Do not open a second desktop window if another instance already owns the port.
-    ready_rx
-        .recv()
-        .map_err(|_| {
-            std::io::Error::new(
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && e.to_string().contains("already_running")
+            {
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+        Err(_) => {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "Server startup task stopped",
             )
-        })??;
+            .into());
+        }
+    }
 
     println!("\n=======================================================");
     println!("  MultiGateway Rust (v{}) Desktop Application", env!("CARGO_PKG_VERSION"));

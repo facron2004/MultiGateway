@@ -5,9 +5,10 @@
   "source": "https://github.com/lobehub/lobe-icons",
   "icons": {
     "workbuddy": "Official WorkBuddy icon",
-    "trae": "trae-color.svg",
+    "trae": "trae-color.svg mark on the official black app tile",
     "minimax": "minimax-color.svg",
     "qoder": "qoder-color.svg",
+    "qoder-dark": "qoder.svg with the near-black mark recolored white for dark surfaces; the brand green is kept",
     "antigravity": "antigravity.svg (official Google Antigravity mark)",
     "grok": "grok.svg (official xAI Grok mark)",
     "copilot": "copilot-color.svg (official GitHub Copilot mark)"

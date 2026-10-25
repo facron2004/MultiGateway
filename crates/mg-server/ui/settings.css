@@ -57,6 +57,9 @@ body.settings-open:not(.sidebar-expanded) {
   color: var(--nav-ink);
   background: var(--selected-bg);
 }
+.settings-nav-item.selected .icon {
+  color: var(--orange);
+}
 .settings-home {
   margin-bottom: 13px;
 }
