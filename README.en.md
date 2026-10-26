@@ -27,6 +27,7 @@
   <a href="#api">API</a> ·
   <a href="#layout">Layout</a> ·
   <a href="#tests">Tests</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#license">License</a>
 </p>
 
