@@ -9,10 +9,12 @@ globalThis.window = { __TAURI__: { core: { invoke: async (command, args) => {
 } } } };
 globalThis.fetch = () => { throw new Error("Native UI attempted HTTP"); };
 const { api, providerApi } = await import("../crates/mg-server/ui/api.js");
+const { trayAction } = await import("../crates/mg-server/ui/native-api.js");
 const cases = [
   ["/health", undefined, "gateway_health"],
   ["/gateway/status", undefined, "gateway_status"],
   ["/gateway/usage/board", undefined, "usage_board"],
+  ["/gateway/tray/summary", undefined, "tray_summary"],
   ["/settings", undefined, "settings_view"],
   ["/settings/reveal?id=key%20one", undefined, "settings_reveal", { id: "key one" }],
   ["/gateway/api-keys/list", undefined, "api_key_list"],
@@ -32,6 +34,7 @@ const actions = {
   poll: "provider_poll", enable: "provider_enable_account", delete: "provider_delete_account",
   credits: "provider_credits", credentials: "provider_credentials_action", checkin: "provider_checkin_action",
   batch: "provider_batch", region: "provider_region", import: "provider_import",
+  settings: "provider_settings_save",
 };
 for (const [action, command] of Object.entries(actions)) {
   const payload = ["snapshot", "models"].includes(action) ? undefined : { id: "example" };
@@ -39,6 +42,9 @@ for (const [action, command] of Object.entries(actions)) {
   assert.deepEqual(calls.at(-1), { command, args: { providerName: "minimax",
     ...(payload === undefined ? {} : { payload }), ...(action === "models" ? { region: "global" } : {}) } });
 }
+// The tray panel has no HTTP route, so it calls the native command itself.
+await trayAction("open-window");
+assert.deepEqual(calls.at(-1), { command: "tray_action", args: { action: "open-window" } });
 const mappedCommands = new Set(calls.map(({ command }) => command));
 const permission = await readFile(new URL("../crates/mg-server/permissions/desktop.toml", import.meta.url), "utf8");
 const allowedCommands = new Set([...permission.matchAll(/^\s+"(\w+)",/gm)].map((match) => match[1]));

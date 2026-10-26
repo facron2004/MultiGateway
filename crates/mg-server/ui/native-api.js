@@ -63,3 +63,10 @@ export function nativeApi(path, payload, signal) {
   if (!command) throw new Error("不支持的桌面操作");
   return invoke(command, args, signal);
 }
+
+// The tray panel has no HTTP route of its own, so it talks to the native
+// command directly. It still goes through this module so that every native
+// command the UI uses lives in one place.
+export function trayAction(action, extra = {}) {
+  return invoke("tray_action", { action, ...extra });
+}

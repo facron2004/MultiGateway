@@ -1,4 +1,5 @@
 import { api } from "./api.js";
+import { trayAction } from "./native-api.js";
 import { applyI18n, setLocale, t } from "./i18n.js";
 import { normalizeAppearance, resolveLanguage, resolveTheme } from "./appearance-model.js";
 
@@ -270,7 +271,7 @@ async function runAction(action, extra = {}) {
     return;
   }
   try {
-    await window.__TAURI__.core.invoke("tray_action", { action, ...extra });
+    await trayAction(action, extra);
   } catch (error) {
     showToast(error?.message || String(error), true);
   }
