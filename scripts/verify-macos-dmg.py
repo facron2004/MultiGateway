@@ -11,13 +11,14 @@ UDZO layout written by hdiutil and by libdmg-hfsplus' `dmg`:
 
     data fork (compressed blocks) | plist with resource-fork/blkx | koly trailer
 
-Every blkx chunk points at a byte range of the data fork. A UDZO image stores
-those compressed blocks back to back in the order the reader consumes them, so
-the file offsets of the blocks of one partition have to climb. The container
-that shipped as 0.11.2 shuffled them instead, so macOS read the partition from
-the wrong places and reported the image as not recognized; that is checked
-explicitly, together with the filesystem inside the partition and the bundle
-metadata macOS needs to launch the app.
+Every blkx chunk points at a byte range of the data fork. The blocks of one
+partition may sit in the data fork in any order, because hdiutil writes them
+in the order it produced them, so the check is not about the layout of a
+particular producer. It is about what a reader needs: every block has to
+decode to exactly the sectors it claims, no sector of a partition may be
+missing, every byte of the data fork has to belong to a block, the filesystem
+inside the partition has to be consistent, and the bundle metadata macOS needs
+to launch the app has to be complete.
 """
 import bz2
 import io

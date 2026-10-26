@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Regression tests for scripts/verify-macos-dmg.py and scripts/make-test-dmg.py.
 
-The DMG that shipped as 0.11.2 could not be mounted on any Mac, because the
-container that produced it stored the compressed blocks of the data fork out
-of order, so macOS read the partition from the wrong offsets. These tests pin
-that failure and the healthy layout that replaces it, so the packaging step
-cannot silently regress again.
+The DMG that shipped as 0.11.2 could not be mounted on any Mac, because its
+data fork carried a compressed block that no partition table pointed at, so
+the reader filled that part of the volume with zeros. These tests pin that
+failure and the healthy layout that replaces it, so the packaging step cannot
+silently regress again.
 
 Run with: python scripts/test-macos-dmg-layout.py
 """
