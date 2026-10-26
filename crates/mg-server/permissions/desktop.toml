@@ -20,6 +20,7 @@ commands.allow = [
   "provider_batch",
   "provider_region",
   "provider_import",
+  "provider_settings_save",
   "gateway_configure",
   "settings_view",
   "desktop_settings_save",

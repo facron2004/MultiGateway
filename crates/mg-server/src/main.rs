@@ -3,6 +3,7 @@
 mod appearance;
 mod handlers;
 mod native_commands;
+mod provider_settings;
 mod state;
 mod static_assets;
 mod tray;
@@ -217,6 +218,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     config.ensure_dirs()?;
 
+    // A channel chosen in the desktop panel wins over the environment variable;
+    // without a stored choice the environment variable still decides.
+    if let Some(mode) = provider_settings::load(&config.data_dir).trae_upstream() {
+        mg_providers::trae::set_trae_upstream_mode(Some(mode));
+        info!(mode = mode.as_str(), "Trae 上游通道已从面板设置恢复");
+    }
+
     let activity = Arc::new(Activity::new(&config.data_dir));
     let key_manager = Arc::new(KeyManager::new(&config.data_dir, config.api_key.clone())?);
 
@@ -404,6 +412,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/gateway/providers/:provider/import",
             post(handlers::provider_import),
+        )
+        .route(
+            "/gateway/providers/:provider/settings",
+            post(handlers::provider_settings_save),
         )
         .route("/gateway/configure", post(handlers::gateway_configure))
         // Settings & Keys APIs

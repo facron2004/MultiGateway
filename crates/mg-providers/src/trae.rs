@@ -1,17 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures::StreamExt;
 use mg_core::account::{regions_match, AccountQuota};
 use mg_core::error::{MgError, Result};
 use mg_core::AccountPool;
 use mg_protocols::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatMessage, ChatUsage, ChunkChoice, ChunkDelta,
-    ModelEntry,
+    FunctionCallChunk, ModelEntry, PromptTokensDetails, ToolCallChunk,
 };
 use parking_lot::RwLock;
 use reqwest::Client;
@@ -1465,6 +1465,21 @@ fn trae_usage(data: &serde_json::Value) -> Option<ChatUsage> {
     let prompt = number(&["prompt_tokens", "input_tokens"]);
     let completion = number(&["completion_tokens", "output_tokens"]);
     let total = number(&["total_tokens"]).max(prompt + completion);
+    // Trae reports the prompt-cache split on its `token_usage` event. Dropping
+    // it made every turn look like a cold 24k-token prompt, so the dashboard
+    // showed "input only" and cached tokens were billed as fresh ones.
+    let cache_keys = [
+        "cache_read_input_tokens",
+        "cached_tokens",
+        "cache_read_tokens",
+        "prompt_cache_hit_tokens",
+    ];
+    let cache_creation_keys = ["cache_creation_input_tokens", "cache_creation_tokens"];
+    let cached = number(&cache_keys);
+    let cache_reported = cache_keys
+        .iter()
+        .chain(cache_creation_keys.iter())
+        .any(|key| usage.get(*key).is_some());
     let credits = usage
         .get("credits_consumed")
         .or_else(|| usage.get("credit"))
@@ -1474,7 +1489,9 @@ fn trae_usage(data: &serde_json::Value) -> Option<ChatUsage> {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        prompt_tokens_details: None,
+        prompt_tokens_details: cache_reported.then_some(PromptTokensDetails {
+            cached_tokens: cached.min(prompt),
+        }),
         credits,
     })
 }
@@ -1801,28 +1818,601 @@ impl TraeTranslator {
     }
 }
 
-async fn fetch_trae_custom_model(
-    client: &Client,
-    account: &mg_core::Account,
-    surface: &TraeSurface,
-    model_name: &str,
-) -> Option<serde_json::Value> {
-    let url = format!(
-        "{}/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true",
-        surface.remote_base
+/// Trae upstream transports.
+///
+/// `remote` drives a full solo-agent session
+/// (`/api/remote/v1/chat_sessions`): Trae injects its own ~24k-token agent
+/// prompt, resolves built-in skills and boots a sandbox before the model is
+/// called, so the first token only lands after that bootstrap. `solo` calls
+/// the SOLO gateway directly (`/api/agent/v3/llm_utils_chat`), which invokes
+/// the model without the agent layer and therefore reaches the first token in
+/// roughly half the time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TraeUpstream {
+    Remote,
+    Solo,
+}
+
+impl TraeUpstream {
+    /// Stable name used by the desktop panel and the settings file.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Solo => "solo",
+        }
+    }
+
+    /// Parse a mode name. Returns `None` for anything unknown so callers can
+    /// reject the value instead of silently falling back.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "remote" | "agent" | "session" | "web" => Some(Self::Remote),
+            "solo" | "direct" | "model" => Some(Self::Solo),
+            _ => None,
+        }
+    }
+}
+
+/// SOLO gateway chat path on the model host.
+const TRAE_SOLO_CHAT_PATH: &str = "/api/agent/v3/llm_utils_chat";
+
+/// How many upstream calls one account may run at the same time.
+///
+/// The upstream enforces the same number for agent sessions and answers
+/// `429 solo_agent_parallel_limit` past it.
+const TRAE_WEB_PARALLEL_LIMIT: usize = 2;
+
+/// How long a request waits for a free account slot before it is rejected.
+/// Long enough to ride out one in-flight turn, short enough that a stuck
+/// upstream does not hang the caller forever.
+const TRAE_WEB_SLOT_WAIT_SECS: u64 = 90;
+
+/// How many times a session creation is retried when the upstream reports that
+/// another client holds the account's agent-session slots.
+const TRAE_PARALLEL_LIMIT_RETRIES: usize = 4;
+
+/// Pause between those retries.
+const TRAE_PARALLEL_LIMIT_RETRY_SECS: u64 = 3;
+
+/// Concurrent remote agent sessions allowed per account.
+fn trae_web_parallel_limit() -> usize {
+    env_override("TRAE_WEB_PARALLEL_LIMIT")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(TRAE_WEB_PARALLEL_LIMIT)
+}
+
+/// Whether an upstream error body reports the per-account agent-session
+/// concurrency limit.
+///
+/// This is a traffic condition, not a broken account: benching the account for
+/// it would take the whole pool offline for the length of the cooldown.
+fn trae_is_parallel_limit(body: &str) -> bool {
+    body.contains("solo_agent_parallel_limit")
+}
+
+/// Runtime override for the upstream transport.
+///
+/// The desktop panel writes it so operators can switch channels without
+/// restarting the gateway. `None` means "no override" and lets the
+/// `TRAE_UPSTREAM_MODE` environment variable decide.
+static TRAE_UPSTREAM_OVERRIDE: RwLock<Option<TraeUpstream>> = RwLock::new(None);
+
+/// Set the runtime upstream transport. `None` clears the override so the
+/// environment variable takes over again.
+pub fn set_trae_upstream_mode(mode: Option<TraeUpstream>) {
+    *TRAE_UPSTREAM_OVERRIDE.write() = mode;
+}
+
+/// Upstream transport currently in effect.
+///
+/// The runtime override wins over the environment variable, which in turn wins
+/// over the default (the fast SOLO route).
+pub fn trae_upstream_mode() -> TraeUpstream {
+    if let Some(mode) = *TRAE_UPSTREAM_OVERRIDE.read() {
+        return mode;
+    }
+    match env_override("TRAE_UPSTREAM_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "remote" | "agent" | "session" | "web" => TraeUpstream::Remote,
+        _ => TraeUpstream::Solo,
+    }
+}
+
+/// Headers the SOLO gateway expects from a native Trae client.
+fn trae_solo_headers(account: &mg_core::Account, surface: &TraeSurface) -> Vec<(String, String)> {
+    let device_id = trae_device_id(account);
+    let machine_id = format!("{:x}", Sha256::digest(account.id.as_bytes()));
+    let user_id = trae_account_value(
+        account,
+        &["bizUserId", "user_id", "userId", "userUniqueId"],
+        &account.id,
     );
-    let response = apply_headers(
-        client.get(url).timeout(Duration::from_secs(20)),
-        &trae_web_headers(account, surface),
-    )
-    .send()
-    .await
-    .ok()?;
-    if !response.status().is_success() {
+    let token = account.access_token.clone();
+    let headers = [
+        ("Authorization", format!("Cloud-IDE-JWT {token}")),
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "text/event-stream".to_string()),
+        ("X-Cloudide-Token", token.clone()),
+        ("x-uid", user_id),
+        ("x-app-id", "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8".to_string()),
+        ("x-device-id", device_id),
+        ("x-machine-id", machine_id),
+        ("x-request-id", uuid::Uuid::new_v4().to_string()),
+        ("x-device-cpu", "AMD".to_string()),
+        ("x-device-brand", "83DG".to_string()),
+        ("x-device-type", "windows".to_string()),
+        ("x-device-platform", "windows".to_string()),
+        ("x-ide-token", token),
+        ("x-os-version", "Windows 11 Pro".to_string()),
+        ("x-system-type", "Windows".to_string()),
+        ("x-app-version", "default".to_string()),
+        ("x-app-version-code", "20260811".to_string()),
+        ("x-ide-version", "0.1.52".to_string()),
+        ("x-ide-version-code", "20260811".to_string()),
+        ("x-ide-version-type", "stable".to_string()),
+        ("x-version-code", "20260811".to_string()),
+        ("package-type", surface.package_type.to_string()),
+        ("x-lscbd-aid", "787976".to_string()),
+        ("x-lscbd-platform", "windows".to_string()),
+        ("x-ss-dp", "787976".to_string()),
+        ("x-plugin-channel", "icube-ai".to_string()),
+        ("app-version", "0.1.52".to_string()),
+        ("x-bridge-transport", "aha".to_string()),
+        ("x-ahanet-timeout", "86400".to_string()),
+        ("x-lgw-req-sdk-type", "3".to_string()),
+        ("x-net-sdk-domain-dispatch", "1".to_string()),
+        ("x-ttnet-bypass-decompression", "1".to_string()),
+        ("x-ttnet-bypass-cookie", "0".to_string()),
+        ("request-traffic-type", "prod".to_string()),
+        ("User-Agent", "Trae/0.1.52".to_string()),
+        (
+            "Referer",
+            format!("{}{TRAE_SOLO_CHAT_PATH}", surface.model_host),
+        ),
+    ];
+    headers
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+}
+
+/// Convert chat messages into the SOLO gateway's native content blocks.
+fn trae_solo_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    let mut native = Vec::new();
+    for message in messages {
+        let text = trae_text(&message.content);
+        let (role, content) = match message.role.as_str() {
+            "system" | "developer" => ("system", text),
+            "assistant" => {
+                let mut content = text;
+                if let Some(calls) = &message.tool_calls {
+                    for call in calls {
+                        if !content.is_empty() {
+                            content.push_str("\n\n");
+                        }
+                        content.push_str(&format!(
+                            "[Tool Call: {} {}]\nArguments: {}",
+                            call.id, call.function.name, call.function.arguments
+                        ));
+                    }
+                }
+                ("assistant", content)
+            }
+            "tool" => (
+                "user",
+                format!(
+                    "[Client Tool Result: {} {}]\n{}",
+                    message.tool_call_id.as_deref().unwrap_or("unknown"),
+                    message.name.as_deref().unwrap_or("tool"),
+                    text
+                ),
+            ),
+            _ => ("user", text),
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        native.push(serde_json::json!({
+            "role": role,
+            "content": [{"type": "text", "text": content}]
+        }));
+    }
+    native
+}
+
+/// Convert OpenAI tool definitions to the SOLO gateway's native shape.
+///
+/// The upstream expects `function.parameters` as a JSON *string*; every other
+/// field keeps the caller's schema untouched.
+fn trae_solo_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut result = Vec::new();
+    for tool in tools {
+        let Some(object) = tool.as_object() else {
+            continue;
+        };
+        let mut function = match object.get("function").and_then(serde_json::Value::as_object) {
+            Some(function) => function.clone(),
+            None => {
+                // Accept the compact function shape some adapters send.
+                let mut function = serde_json::Map::new();
+                for key in ["name", "description", "parameters", "strict"] {
+                    if let Some(value) = object.get(key) {
+                        function.insert(key.to_string(), value.clone());
+                    }
+                }
+                function
+            }
+        };
+        if function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            continue;
+        }
+        let parameters = function.get("parameters").cloned().unwrap_or_else(|| {
+            function
+                .get("input_schema")
+                .or_else(|| function.get("inputSchema"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}))
+        });
+        let parameters = match parameters {
+            serde_json::Value::String(text) => text,
+            other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+        };
+        function.insert("parameters".to_string(), serde_json::Value::String(parameters));
+        function.remove("input_schema");
+        function.remove("inputSchema");
+        let mut converted = object.clone();
+        converted.insert("function".to_string(), serde_json::Value::Object(function));
+        converted.insert(
+            "type".to_string(),
+            serde_json::Value::String(
+                object
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("function")
+                    .to_string(),
+            ),
+        );
+        result.push(serde_json::Value::Object(converted));
+    }
+    result
+}
+
+/// Normalize the caller's tool choice into the SOLO gateway's spelling.
+fn trae_solo_tool_choice(choice: &serde_json::Value) -> Option<String> {
+    if let Some(text) = choice.as_str() {
+        let lowered = text.trim().to_ascii_lowercase();
+        return match lowered.as_str() {
+            "none" | "auto" | "required" => Some(lowered),
+            _ => None,
+        };
+    }
+    match choice.get("type").and_then(serde_json::Value::as_str)? {
+        "none" | "auto" | "required" => choice
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        "function" => choice
+            .pointer("/function/name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Build one SOLO gateway chat request.
+fn trae_solo_body(req: &ChatCompletionRequest, model_name: &str) -> serde_json::Value {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut body = serde_json::json!({
+        "messages": trae_solo_messages(&req.messages),
+        "config_name": model_name,
+        "model": model_name,
+        "function": "solo_work_lite",
+        "stream": true,
+        "request_id": session_id,
+        "session_id": session_id,
+    });
+    if let Some(max_tokens) = req.max_completion_tokens.or(req.max_tokens) {
+        let ceiling = crate::model_limits::clamp_output_tokens(max_tokens, model_name);
+        body["max_tokens"] = serde_json::json!(ceiling);
+    }
+    if let Some(tools) = req.tools.as_deref() {
+        let native = trae_solo_tools(tools);
+        if !native.is_empty() {
+            body["tools"] = serde_json::Value::Array(native);
+            if let Some(choice) = req.tool_choice.as_ref().and_then(trae_solo_tool_choice) {
+                if choice != "none" {
+                    body["tool_choice"] = serde_json::Value::String(choice);
+                }
+            }
+            if let Some(parallel) = req.parallel_tool_calls {
+                body["parallel_tool_calls"] = serde_json::Value::Bool(parallel);
+            }
+        }
+    }
+    body
+}
+
+/// Read tool calls carried by a SOLO `output` event.
+///
+/// The upstream uses the native `function_call` envelope and streams one call
+/// in pieces: the first event carries the id and the name, a later event
+/// carries the arguments. Both share the upstream `index`, and empty fields
+/// are dropped so the caller's accumulator keeps what it already has.
+fn trae_solo_tool_calls(payload: &serde_json::Value) -> Option<Vec<ToolCallChunk>> {
+    let calls = payload.get("tool_calls")?.as_array()?;
+    if calls.is_empty() {
         return None;
     }
-    let payload = response.json::<serde_json::Value>().await.ok()?;
-    trae_custom_model(&payload, model_name)
+    Some(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(position, call)| {
+                let index = call
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as u32)
+                    .unwrap_or(position as u32);
+                let name = call
+                    .pointer("/function_call/name")
+                    .or_else(|| call.pointer("/function/name"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let arguments = call
+                    .pointer("/function_call/arguments")
+                    .or_else(|| call.pointer("/function/arguments"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                ToolCallChunk {
+                    index,
+                    id: call
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                    tool_type: call
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                    function: Some(FunctionCallChunk { name, arguments }),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Translates the SOLO gateway's event stream into OpenAI chunks.
+///
+/// Unlike the remote agent stream, SOLO emits plain deltas, so no cumulative
+/// snapshot merging is required.
+struct TraeSoloTranslator {
+    id: String,
+    model: String,
+    started: bool,
+    usage: Option<ChatUsage>,
+    finish_reason: String,
+    finished: bool,
+    completed: bool,
+    text: String,
+    reasoning: String,
+}
+
+impl TraeSoloTranslator {
+    fn new(model: &str) -> Self {
+        Self {
+            id: format!("chatcmpl-trae-{}", uuid::Uuid::new_v4().simple()),
+            model: model.to_string(),
+            started: false,
+            usage: None,
+            finish_reason: "stop".to_string(),
+            finished: false,
+            completed: false,
+            text: String::new(),
+            reasoning: String::new(),
+        }
+    }
+
+    fn chunk(
+        &self,
+        delta: ChunkDelta,
+        finish_reason: Option<String>,
+        usage: Option<ChatUsage>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: self.id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created: mg_core::now_secs() as u64,
+            model: self.model.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta,
+                finish_reason,
+            }],
+            usage,
+        }
+    }
+
+    fn role_chunk(&self) -> ChatCompletionChunk {
+        self.chunk(
+            ChunkDelta {
+                role: Some("assistant".to_string()),
+                ..ChunkDelta::default()
+            },
+            None,
+            None,
+        )
+    }
+
+    fn push(&mut self, event: &str, data: &str) -> Vec<Result<ChatCompletionChunk>> {
+        let mut chunks = Vec::new();
+        let event_name = event.trim().to_ascii_lowercase();
+        if data.trim() == "[DONE]" {
+            self.finished = true;
+            return chunks;
+        }
+        let payload =
+            serde_json::from_str::<serde_json::Value>(data).unwrap_or(serde_json::Value::Null);
+        match event_name.as_str() {
+            "output" => {
+                let text = payload
+                    .get("response")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let reasoning = payload
+                    .get("reasoning_content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let tool_calls = trae_solo_tool_calls(&payload);
+                if text.is_empty() && reasoning.is_empty() && tool_calls.is_none() {
+                    return chunks;
+                }
+                if !self.started {
+                    self.started = true;
+                    chunks.push(Ok(self.role_chunk()));
+                }
+                self.text.push_str(text);
+                self.reasoning.push_str(reasoning);
+                chunks.push(Ok(self.chunk(
+                    ChunkDelta {
+                        content: (!text.is_empty()).then(|| text.to_string()),
+                        reasoning_content: (!reasoning.is_empty()).then(|| reasoning.to_string()),
+                        tool_calls,
+                        ..ChunkDelta::default()
+                    },
+                    None,
+                    None,
+                )));
+            }
+            "token_usage" => {
+                self.usage = trae_usage(&payload).or(self.usage.clone());
+            }
+            "done" => {
+                self.finished = true;
+                if let Some(reason) = payload
+                    .get("finish_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+                {
+                    self.finish_reason = reason.to_string();
+                }
+            }
+            "error" => {
+                self.finished = true;
+                let code = payload
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let message = payload
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("upstream error");
+                chunks.push(Err(MgError::provider(
+                    502,
+                    format!("Trae error ({code}): {message}"),
+                    "upstream_error",
+                )));
+            }
+            _ => {}
+        }
+        chunks
+    }
+
+    fn finish(&mut self) -> Vec<Result<ChatCompletionChunk>> {
+        if self.completed {
+            return Vec::new();
+        }
+        self.completed = true;
+        let mut chunks = Vec::new();
+        if self.text.trim().is_empty() && !self.reasoning.trim().is_empty() {
+            // The turn only produced reasoning; surface it instead of handing
+            // the caller an empty answer.
+            let reasoning = self.reasoning.clone();
+            if !self.started {
+                self.started = true;
+                chunks.push(Ok(self.role_chunk()));
+            }
+            chunks.push(Ok(self.chunk(
+                ChunkDelta {
+                    content: Some(reasoning),
+                    ..ChunkDelta::default()
+                },
+                None,
+                None,
+            )));
+        }
+        chunks.push(Ok(self.chunk(
+            ChunkDelta::default(),
+            Some(self.finish_reason.clone()),
+            self.usage.clone(),
+        )));
+        chunks
+    }
+}
+
+/// How long a fetched remote model config stays usable. The remote catalog
+/// only changes when Trae ships new models, so a short TTL is enough to keep
+/// the per-request upstream round trip off the critical path.
+const TRAE_MODEL_CONFIG_TTL_SECS: f64 = 900.0;
+
+impl TraeProvider {
+    /// Resolve one remote model config, reusing a recent catalog lookup.
+    ///
+    /// The upstream catalog is stable for hours, but every chat request used
+    /// to fetch it again, which added a full upstream round trip (and an extra
+    /// upstream call) before the turn could even start.
+    async fn fetch_trae_custom_model(
+        &self,
+        account: &mg_core::Account,
+        surface: &TraeSurface,
+        model_name: &str,
+    ) -> Option<serde_json::Value> {
+        let key = format!(
+            "{}\u{1f}{}",
+            account.id,
+            model_name.trim().to_ascii_lowercase()
+        );
+        let now = mg_core::now_secs();
+        {
+            let cache = self.model_configs.read();
+            if let Some((config, fetched_at)) = cache.get(&key) {
+                if now - *fetched_at < TRAE_MODEL_CONFIG_TTL_SECS {
+                    return Some(config.clone());
+                }
+            }
+        }
+        let url = format!(
+            "{}/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true",
+            surface.remote_base
+        );
+        let response = apply_headers(
+            self.client.get(url).timeout(Duration::from_secs(20)),
+            &trae_web_headers(account, surface),
+        )
+        .send()
+        .await
+        .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let payload = response.json::<serde_json::Value>().await.ok()?;
+        let config = trae_custom_model(&payload, model_name)?;
+        self.model_configs
+            .write()
+            .insert(key, (config.clone(), now));
+        Some(config)
+    }
 }
 
 async fn stop_trae_session(
@@ -1843,6 +2433,23 @@ async fn stop_trae_session(
         }))
         .send()
         .await;
+}
+
+/// Stop the upstream session in the background.
+///
+/// The stop releases the account's agent-session slot upstream, so it must
+/// happen - but waiting for the round trip would hold back a response the
+/// client is already reading.
+fn stop_trae_session_in_background(
+    client: Client,
+    surface: TraeSurface,
+    headers: Vec<(String, String)>,
+    session_id: String,
+    message_id: String,
+) {
+    tokio::spawn(async move {
+        stop_trae_session(&client, &surface, &headers, &session_id, &message_id).await;
+    });
 }
 
 fn trae_number(value: &serde_json::Value) -> Option<f64> {
@@ -1979,6 +2586,50 @@ fn trae_device_id(account: &mg_core::Account) -> String {
     format!("{numeric_id:016}")
 }
 
+/// Describe a failed upstream stream in terms an operator can act on.
+///
+/// `reqwest` reports every incomplete response body the same way — "error
+/// decoding response body" — no matter whether the body was cut short by a
+/// timeout, a connection reset, or a truncated chunked frame. On its own that
+/// message says nothing about the request: it does not say whether the
+/// upstream ever answered, how much of the answer arrived, or how long the
+/// gateway waited for it.
+///
+/// `chunks` separates "the upstream never sent anything" from "the upstream
+/// stopped mid-answer", and the transport's timeout flag names the actual
+/// cause instead of leaving it to guesswork.
+fn trae_stream_failure(
+    route: &str,
+    error: &EventStreamError<reqwest::Error>,
+    elapsed: Duration,
+    chunks: usize,
+) -> String {
+    let (reason, detail) = match error {
+        EventStreamError::Transport(transport) => {
+            let reason = if transport.is_timeout() {
+                "the upstream stopped sending data"
+            } else if transport.is_connect() {
+                "the upstream connection failed"
+            } else {
+                "the upstream closed the connection before the answer was complete"
+            };
+            (reason, transport.to_string())
+        }
+        EventStreamError::Utf8(_) => (
+            "the upstream sent a response that is not valid UTF-8",
+            error.to_string(),
+        ),
+        EventStreamError::Parser(_) => (
+            "the upstream sent a malformed event stream",
+            error.to_string(),
+        ),
+    };
+    format!(
+        "Trae {route} stream failed after {chunks} chunk(s) in {:.1}s: {reason} ({detail})",
+        elapsed.as_secs_f64()
+    )
+}
+
 pub struct TraeProvider {
     /// Client for short non-streaming calls (model catalog fetches). Keeps a
     /// total timeout so a trickling response cannot hang forever.
@@ -1988,6 +2639,25 @@ pub struct TraeProvider {
     stream_client: Client,
     pool: Arc<AccountPool>,
     model_config_names: RwLock<HashMap<String, String>>,
+    /// Remote model configs keyed by `<account id>\u{1f}<model>`. The catalog
+    /// changes rarely, and re-fetching it for every chat request put a full
+    /// upstream round trip in front of every turn.
+    model_configs: RwLock<HashMap<String, (serde_json::Value, f64)>>,
+    /// Per-account gate for the upstream calls.
+    ///
+    /// The upstream allows only two concurrent agent sessions per account and
+    /// answers `429 solo_agent_parallel_limit` beyond that. Without a local
+    /// gate the gateway pushes every request upstream at once: the extras are
+    /// rejected outright, or they queue inside the upstream, which shows up as
+    /// a 15-55 second first-token delay.
+    ///
+    /// Both routes draw on this one gate. The direct SOLO route needs it too:
+    /// a request that starts while the upstream is still draining agent
+    /// sessions waits there for the better part of a minute.
+    ///
+    /// The permit is held for the whole lifetime of the upstream call, so the
+    /// gateway never exceeds the upstream's own limit.
+    web_slots: RwLock<HashMap<String, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl TraeProvider {
@@ -2009,6 +2679,46 @@ impl TraeProvider {
             stream_client,
             pool,
             model_config_names: RwLock::new(model_config_names),
+            model_configs: RwLock::new(HashMap::new()),
+            web_slots: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Take one of the account's remote agent-session slots.
+    ///
+    /// Waiting is the point: the upstream rejects the extra requests instead of
+    /// serving them, so a caller that arrives too early is better off waiting
+    /// for a slot than failing.
+    async fn acquire_web_slot(
+        &self,
+        account_id: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let semaphore = {
+            let mut slots = self.web_slots.write();
+            slots
+                .entry(account_id.to_string())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(trae_web_parallel_limit()))
+                })
+                .clone()
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(TRAE_WEB_SLOT_WAIT_SECS),
+            semaphore.acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(MgError::provider(
+                503,
+                "Trae 会话槽已关闭".to_string(),
+                "unavailable",
+            )),
+            Err(_) => Err(MgError::provider(
+                429,
+                "Trae 会话并发已达上限，请稍后重试".to_string(),
+                "too_many_requests",
+            )),
         }
     }
 
@@ -2088,6 +2798,350 @@ impl TraeProvider {
             }
         }
     }
+
+    /// Run one turn through the remote solo-agent session.
+    async fn chat_remote(
+        &self,
+        req: &ChatCompletionRequest,
+        account: &mg_core::Account,
+        surface: &TraeSurface,
+        account_id: &str,
+        requested_model: &str,
+        mode: &str,
+        strategy: &str,
+        model_name: &str,
+        agent_type: &str,
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
+        // One upstream agent session per slot. Holding the permit for the whole
+        // session keeps the gateway inside the upstream's own concurrency limit.
+        let web_slot = self.acquire_web_slot(account_id).await?;
+        let headers = trae_web_headers(account, surface);
+        let custom_model = if strategy == "auto" {
+            None
+        } else {
+            self.fetch_trae_custom_model(account, surface, model_name)
+                .await
+        };
+        let bounded_messages = bound_trae_messages(&req.messages);
+        let body = trae_session_body(
+            &bounded_messages,
+            account,
+            surface,
+            mode,
+            strategy,
+            model_name,
+            agent_type,
+            custom_model,
+        );
+
+        info!(
+            provider = "trae",
+            model = %requested_model,
+            account = %account_id,
+            stream = req.stream,
+            "Forwarding chat completion to Trae"
+        );
+
+        let mut attempt = 0usize;
+        let created = loop {
+            attempt += 1;
+            let response = apply_headers(
+                self.stream_client
+                    .post(format!("{}/chat_sessions", surface.remote_base))
+                    .timeout(Duration::from_secs(60)),
+                &headers,
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                MgError::provider(
+                    502,
+                    format!("Trae connection failed: {error}"),
+                    "network_error",
+                )
+            })?;
+            let status = response.status();
+            if status.is_success() {
+                break response;
+            }
+            let err_text = response.text().await.unwrap_or_default();
+            // Someone else - another client of the same account - is holding the
+            // agent-session slots. Wait for them instead of failing the turn.
+            if status.as_u16() == 429
+                && trae_is_parallel_limit(&err_text)
+                && attempt < TRAE_PARALLEL_LIMIT_RETRIES
+            {
+                tokio::time::sleep(Duration::from_secs(TRAE_PARALLEL_LIMIT_RETRY_SECS)).await;
+                continue;
+            }
+            // A concurrency rejection says the account is busy, not broken.
+            // Benching it would take the whole pool offline for the length of
+            // the cooldown while the other sessions finish on their own.
+            if crate::is_account_level_failure(status.as_u16())
+                && !trae_is_parallel_limit(&err_text)
+            {
+                self.pool
+                    .mark_cooldown(account_id, crate::ACCOUNT_COOLDOWN_SECS);
+                self.pool
+                    .set_error(account_id, &format!("upstream HTTP {}", status.as_u16()));
+            }
+            return Err(MgError::provider(
+                status.as_u16(),
+                format!(
+                    "Trae request failed: {}",
+                    crate::upstream_error_body(status.as_u16(), &err_text)
+                ),
+                "upstream_error",
+            ));
+        };
+        let created = created
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| MgError::provider(502, error.to_string(), "invalid_response"))?;
+        if created
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|code| code != 0)
+            && created.get("data").is_none()
+        {
+            return Err(MgError::provider(
+                502,
+                format!("Trae request failed: {created}"),
+                "upstream_error",
+            ));
+        }
+        let payload = created.get("data").unwrap_or(&created);
+        let remote_session = payload
+            .get("chat_session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let message_id = payload
+            .get("message_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if remote_session.is_empty() || message_id.is_empty() {
+            return Err(MgError::provider(
+                502,
+                format!("Trae session response missing ids: {created}"),
+                "invalid_response",
+            ));
+        }
+
+        let events_url = format!(
+            "{}/chat_sessions/{remote_session}/events?reply_to_message_id={message_id}",
+            surface.remote_base
+        );
+        let events = apply_headers(self.stream_client.get(events_url), &headers)
+            .send()
+            .await
+            .map_err(|error| {
+                MgError::provider(
+                    502,
+                    format!("Trae connection failed: {error}"),
+                    "network_error",
+                )
+            })?;
+        let status = events.status();
+        if !status.is_success() {
+            let err_text = events.text().await.unwrap_or_default();
+            return Err(MgError::provider(
+                status.as_u16(),
+                format!(
+                    "Trae request failed: {}",
+                    crate::upstream_error_body(status.as_u16(), &err_text)
+                ),
+                "upstream_error",
+            ));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let client = self.stream_client.clone();
+        let stop_surface = surface.clone();
+        let stop_headers = headers.clone();
+        let public_model = requested_model.to_string();
+        tokio::spawn(async move {
+            // Holding the permit for the whole session keeps the gateway inside
+            // the upstream's per-account agent-session limit.
+            let _web_slot = web_slot;
+            let mut translator = TraeTranslator::new(&public_model);
+            let mut incoming = events.bytes_stream().eventsource();
+            let started = Instant::now();
+            let mut chunks = 0usize;
+            while let Some(item) = incoming.next().await {
+                match item {
+                    Ok(event) => {
+                        for chunk in translator.push(&event.event, &event.data) {
+                            chunks += 1;
+                            if tx.send(chunk).await.is_err() {
+                                // The caller hung up: tell upstream to stop
+                                // generating so the account's agent slot frees.
+                                stop_trae_session(
+                                    &client,
+                                    &stop_surface,
+                                    &stop_headers,
+                                    &remote_session,
+                                    &message_id,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        if translator.finished {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(MgError::provider(
+                                502,
+                                trae_stream_failure("agent session", &error, started.elapsed(), chunks),
+                                "upstream_error",
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+            for chunk in translator.finish() {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+            // Tell the upstream to stop the session. It frees the account's
+            // agent-session slot upstream, so it has to happen - but it must
+            // not hold back the response the client is already reading, hence
+            // the background task. A terminal `done` event means the turn is
+            // over and the upstream answers the stop with 409, which is fine:
+            // the slot is released when the upstream ends the turn.
+            stop_trae_session_in_background(
+                client.clone(),
+                stop_surface.clone(),
+                stop_headers.clone(),
+                remote_session.clone(),
+                message_id.clone(),
+            );
+        });
+
+        Ok((
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            account_id.to_string(),
+            Some("trae:agent-session".to_string()),
+        ))
+    }
+
+    /// Run one turn through the SOLO gateway (`llm_utils_chat`).
+    ///
+    /// This is the direct model route: no solo-agent bootstrap, no injected
+    /// agent prompt, so the first token arrives roughly twice as fast as the
+    /// remote session route.
+    async fn chat_solo(
+        &self,
+        req: &ChatCompletionRequest,
+        account: &mg_core::Account,
+        surface: &TraeSurface,
+        model_name: &str,
+        requested_model: &str,
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
+        // The direct route shares the account's upstream budget with the agent
+        // session route, so it takes a slot from the same gate.
+        let web_slot = self.acquire_web_slot(&account.id).await?;
+        let headers = trae_solo_headers(account, surface);
+        let body = trae_solo_body(req, model_name);
+        let url = format!("{}{TRAE_SOLO_CHAT_PATH}", surface.model_host);
+
+        info!(
+            provider = "trae",
+            model = %requested_model,
+            account = %account.id,
+            upstream = "solo",
+            stream = req.stream,
+            "Forwarding chat completion to the Trae SOLO gateway"
+        );
+
+        // No total timeout on the streaming request: the upstream's turn can
+        // legitimately run for minutes (the same one-line prompt measured
+        // between 2.6s and 48s), and a total timeout aborts the response body
+        // mid-answer. The client's idle `read_timeout` is the bound that
+        // matters here - it only fires when the upstream goes quiet, and the
+        // upstream sends progress pings while it thinks.
+        let response = apply_headers(self.stream_client.post(url), &headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                MgError::provider(
+                    502,
+                    format!("Trae connection failed: {error}"),
+                    "network_error",
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(MgError::provider(
+                status.as_u16(),
+                format!(
+                    "Trae SOLO request failed: {}",
+                    crate::upstream_error_body(status.as_u16(), &err_text)
+                ),
+                "upstream_error",
+            ));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let public_model = requested_model.to_string();
+        tokio::spawn(async move {
+            // The direct route draws on the same account budget as an agent
+            // session: a request that starts while the upstream is still
+            // draining agent sessions waits there for a minute. Holding the
+            // slot here keeps that wait local and bounded.
+            let _web_slot = web_slot;
+            let mut translator = TraeSoloTranslator::new(&public_model);
+            let mut incoming = response.bytes_stream().eventsource();
+            let started = Instant::now();
+            let mut chunks = 0usize;
+            while let Some(item) = incoming.next().await {
+                match item {
+                    Ok(event) => {
+                        for chunk in translator.push(&event.event, &event.data) {
+                            chunks += 1;
+                            if tx.send(chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                        if translator.finished {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(MgError::provider(
+                                502,
+                                trae_stream_failure("SOLO", &error, started.elapsed(), chunks),
+                                "upstream_error",
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+            for chunk in translator.finish() {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok((
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            account.id.clone(),
+            Some("trae:direct-model".to_string()),
+        ))
+    }
+
 }
 
 fn save_trae_checkin(
@@ -2353,7 +3407,7 @@ impl Provider for TraeProvider {
         &self,
         mut req: ChatCompletionRequest,
         session_id: Option<&str>,
-    ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
         let region = self.active_region().unwrap_or_else(|| "cn".to_string());
         let account = self
             .pool
@@ -2366,188 +3420,49 @@ impl Provider for TraeProvider {
         req.model = canonical_trae_model_name(&requested_model, &self.model_config_names.read());
         let account_id = account.id.clone();
         let surface = trae_surface(&account.region);
-        let headers = trae_web_headers(&account, &surface);
         let (mode, strategy, model_name, agent_type) = trae_resolve_mode(&req.model);
-        let custom_model = if strategy == "auto" {
-            None
-        } else {
-            fetch_trae_custom_model(&self.client, &account, &surface, &model_name).await
-        };
-        let bounded_messages = bound_trae_messages(&req.messages);
-        let body = trae_session_body(
-            &bounded_messages,
+
+        if trae_upstream_mode() == TraeUpstream::Solo {
+            // The SOLO gateway takes the exact upstream config name, which the
+            // remote catalog already carries. `auto` has no config to bind, so
+            // fall back to a known preset.
+            let solo_model = if model_name.trim().is_empty() {
+                "glm-5.2".to_string()
+            } else {
+                model_name.clone()
+            };
+            match self
+                .chat_solo(&req, &account, &surface, &solo_model, &requested_model)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    // The fallback is not a cosmetic detail: the agent session
+                    // injects Trae's ~24k-token agent prompt, so a turn that
+                    // silently switches to it reports a completely different
+                    // prompt size and latency than the direct route. Say so.
+                    tracing::warn!(
+                        provider = "trae",
+                        model = %requested_model,
+                        %error,
+                        "Trae SOLO upstream failed, falling back to the remote agent session"
+                    );
+                }
+            }
+        }
+
+        self.chat_remote(
+            &req,
             &account,
             &surface,
+            &account_id,
+            &requested_model,
             mode,
             strategy,
             &model_name,
             agent_type,
-            custom_model,
-        );
-
-        info!(
-            provider = "trae",
-            model = %requested_model,
-            account = %account_id,
-            stream = req.stream,
-            "Forwarding chat completion to Trae"
-        );
-
-        let created = apply_headers(
-            self.stream_client
-                .post(format!("{}/chat_sessions", surface.remote_base))
-                .timeout(Duration::from_secs(60)),
-            &headers,
         )
-        .json(&body)
-        .send()
         .await
-        .map_err(|error| {
-            MgError::provider(
-                502,
-                format!("Trae connection failed: {error}"),
-                "network_error",
-            )
-        })?;
-        let status = created.status();
-        if !status.is_success() {
-            let err_text = created.text().await.unwrap_or_default();
-            if crate::is_account_level_failure(status.as_u16()) {
-                self.pool
-                    .mark_cooldown(&account_id, crate::ACCOUNT_COOLDOWN_SECS);
-                self.pool
-                    .set_error(&account_id, &format!("upstream HTTP {}", status.as_u16()));
-            }
-            return Err(MgError::provider(
-                status.as_u16(),
-                format!(
-                    "Trae request failed: {}",
-                    crate::upstream_error_body(status.as_u16(), &err_text)
-                ),
-                "upstream_error",
-            ));
-        }
-        let created = created
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|error| MgError::provider(502, error.to_string(), "invalid_response"))?;
-        if created
-            .get("code")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|code| code != 0)
-            && created.get("data").is_none()
-        {
-            return Err(MgError::provider(
-                502,
-                format!("Trae request failed: {created}"),
-                "upstream_error",
-            ));
-        }
-        let payload = created.get("data").unwrap_or(&created);
-        let remote_session = payload
-            .get("chat_session_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let message_id = payload
-            .get("message_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if remote_session.is_empty() || message_id.is_empty() {
-            return Err(MgError::provider(
-                502,
-                format!("Trae session response missing ids: {created}"),
-                "invalid_response",
-            ));
-        }
-
-        let events_url = format!(
-            "{}/chat_sessions/{remote_session}/events?reply_to_message_id={message_id}",
-            surface.remote_base
-        );
-        let events = apply_headers(self.stream_client.get(events_url), &headers)
-            .send()
-            .await
-            .map_err(|error| {
-                MgError::provider(
-                    502,
-                    format!("Trae connection failed: {error}"),
-                    "network_error",
-                )
-            })?;
-        let status = events.status();
-        if !status.is_success() {
-            let err_text = events.text().await.unwrap_or_default();
-            return Err(MgError::provider(
-                status.as_u16(),
-                format!(
-                    "Trae request failed: {}",
-                    crate::upstream_error_body(status.as_u16(), &err_text)
-                ),
-                "upstream_error",
-            ));
-        }
-
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let client = self.stream_client.clone();
-        let stop_surface = surface.clone();
-        let stop_headers = headers.clone();
-        let public_model = requested_model.clone();
-        tokio::spawn(async move {
-            let mut translator = TraeTranslator::new(&public_model);
-            let mut incoming = events.bytes_stream().eventsource();
-            while let Some(item) = incoming.next().await {
-                match item {
-                    Ok(event) => {
-                        for chunk in translator.push(&event.event, &event.data) {
-                            if tx.send(chunk).await.is_err() {
-                                stop_trae_session(
-                                    &client,
-                                    &stop_surface,
-                                    &stop_headers,
-                                    &remote_session,
-                                    &message_id,
-                                )
-                                .await;
-                                return;
-                            }
-                        }
-                        if translator.finished {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = tx
-                            .send(Err(MgError::provider(
-                                502,
-                                format!("Stream read error: {error}"),
-                                "upstream_error",
-                            )))
-                            .await;
-                        break;
-                    }
-                }
-            }
-            for chunk in translator.finish() {
-                if tx.send(chunk).await.is_err() {
-                    break;
-                }
-            }
-            stop_trae_session(
-                &client,
-                &stop_surface,
-                &stop_headers,
-                &remote_session,
-                &message_id,
-            )
-            .await;
-        });
-
-        Ok((
-            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
-            account_id,
-        ))
     }
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota> {
@@ -2809,11 +3724,15 @@ impl Provider for TraeProvider {
 mod tests {
     use super::{
         bound_trae_messages, canonical_trae_model_name, parse_trae_catalog, parse_trae_quota,
-        parse_trae_solo_catalog, trae_custom_model, trae_fallback_models, trae_model_config_names,
-        trae_session_body, trae_surface, trae_surface_with, trae_token_needs_refresh,
-        TraeProvider, TraeSurfaceEnv, TraeTranslator,
+        parse_trae_solo_catalog, trae_custom_model, trae_fallback_models, trae_is_parallel_limit,
+        trae_model_config_names, trae_session_body, trae_solo_body, trae_solo_messages,
+        trae_stream_failure, trae_surface, trae_surface_with, trae_token_needs_refresh,
+        trae_upstream_mode, trae_usage, trae_web_parallel_limit, EventStreamError, TraeProvider,
+        TraeSoloTranslator, TraeSurfaceEnv, TraeTranslator, TraeUpstream,
     };
-    use mg_protocols::openai::{ChatMessage, FunctionCall, ToolCall};
+    use mg_protocols::openai::{
+        ChatCompletionRequest, ChatMessage, FunctionCall, ToolCall,
+    };
     use serde_json::json;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2822,6 +3741,12 @@ mod tests {
     /// `TRAE_REMOTE_QUERY_MAX_CHARS` is process-global, so tests that mutate it
     /// must not overlap; otherwise one test observes the other's limit.
     static QUERY_LIMIT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `TRAE_UPSTREAM_MODE` is process-global for the same reason.
+    static UPSTREAM_MODE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `TRAE_WEB_PARALLEL_LIMIT` is process-global too.
+    static PARALLEL_LIMIT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn translator_text(
         chunks: &[mg_core::Result<mg_protocols::openai::ChatCompletionChunk>],
@@ -3566,5 +4491,359 @@ mod tests {
         assert_eq!(fail_chunks.len(), 1);
         let fail_err = fail_chunks[0].as_ref().unwrap_err();
         assert!(fail_err.message().contains("failed upstream"));
+    }
+
+    #[test]
+    fn trae_usage_reports_the_upstream_prompt_cache() {
+        // Shape Trae's `token_usage` event sends on both transports.
+        let usage = trae_usage(&json!({
+            "name": "",
+            "prompt_tokens": 24045,
+            "completion_tokens": 43,
+            "total_tokens": 24088,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 23936,
+            "reasoning_tokens": 27
+        }))
+        .expect("usage must be reported");
+        assert_eq!(usage.prompt_tokens, 24045);
+        assert_eq!(usage.completion_tokens, 43);
+        let details = usage
+            .prompt_tokens_details
+            .expect("cache split must reach the client");
+        assert_eq!(details.cached_tokens, 23936);
+    }
+
+    #[test]
+    fn trae_usage_without_cache_fields_keeps_details_absent() {
+        let usage = trae_usage(&json!({
+            "prompt_tokens": 16,
+            "completion_tokens": 7,
+            "total_tokens": 23
+        }))
+        .expect("usage must be reported");
+        assert!(usage.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn trae_usage_never_reports_more_cached_than_prompt_tokens() {
+        let usage = trae_usage(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 1,
+            "cache_read_input_tokens": 999
+        }))
+        .expect("usage must be reported");
+        let details = usage.prompt_tokens_details.expect("cache split present");
+        assert_eq!(details.cached_tokens, 10);
+    }
+
+    #[test]
+    fn trae_solo_body_uses_native_content_blocks() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("system prompt")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("hello")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let native = trae_solo_messages(&messages);
+        assert_eq!(native.len(), 2);
+        assert_eq!(native[0]["role"], "system");
+        assert_eq!(native[0]["content"][0]["type"], "text");
+        assert_eq!(native[0]["content"][0]["text"], "system prompt");
+        assert_eq!(native[1]["role"], "user");
+
+        let request = ChatCompletionRequest {
+            model: "deepseek-v4.1-flash".to_string(),
+            messages,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: Some(true),
+            stop: None,
+            max_tokens: Some(512),
+            max_completion_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            extra: Default::default(),
+        };
+        let body = trae_solo_body(&request, "deepseek-v4.1-flash");
+        assert_eq!(body["config_name"], "deepseek-v4.1-flash");
+        assert_eq!(body["model"], "deepseek-v4.1-flash");
+        assert_eq!(body["function"], "solo_work_lite");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["request_id"], body["session_id"]);
+        assert!(!body["request_id"].as_str().unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn trae_solo_body_forwards_native_tool_definitions() {
+        let request = ChatCompletionRequest {
+            model: "deepseek-v4.1-flash".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("list files")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: Some(true),
+            stop: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            tools: Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                }
+            })]),
+            tool_choice: Some(json!({"type": "function", "function": {"name": "read_file"}})),
+            parallel_tool_calls: Some(false),
+            extra: Default::default(),
+        };
+        let body = trae_solo_body(&request, "deepseek-v4.1-flash");
+        let tools = body["tools"].as_array().expect("tools forwarded");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "read_file");
+        // The upstream wants the schema as a JSON string, not an object.
+        assert!(tools[0]["function"]["parameters"].is_string());
+        let schema: serde_json::Value =
+            serde_json::from_str(tools[0]["function"]["parameters"].as_str().unwrap())
+                .expect("schema stays valid json");
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(body["tool_choice"], "read_file");
+        assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn trae_solo_translator_streams_plain_deltas() {
+        let mut translator = TraeSoloTranslator::new("deepseek-v4.1-flash");
+        let chunks = translator.push("output", r#"{"response":"","reasoning_content":"think"}"#);
+        assert_eq!(chunks.len(), 2, "role chunk plus the delta");
+        let delta = &chunks[1].as_ref().unwrap().choices[0].delta;
+        assert_eq!(delta.reasoning_content.as_deref(), Some("think"));
+        assert!(delta.content.is_none());
+
+        let chunks = translator.push("output", r#"{"response":"hello"}"#);
+        let delta = &chunks[0].as_ref().unwrap().choices[0].delta;
+        assert_eq!(delta.content.as_deref(), Some("hello"));
+
+        translator.push(
+            "token_usage",
+            r#"{"prompt_tokens":24045,"completion_tokens":7,"cache_read_input_tokens":23936}"#,
+        );
+        translator.push("done", r#"{"finish_reason":"stop"}"#);
+        let chunks = translator.finish();
+        let last = chunks.last().unwrap().as_ref().unwrap();
+        assert_eq!(last.choices[0].finish_reason.as_deref(), Some("stop"));
+        let usage = last.usage.as_ref().expect("usage must be attached");
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .expect("cache split present")
+                .cached_tokens,
+            23936
+        );
+    }
+
+    #[test]
+    fn trae_solo_translator_merges_split_tool_calls() {
+        // The upstream streams one call in two events: id+name first, then the
+        // arguments, both under the same index.
+        let mut translator = TraeSoloTranslator::new("deepseek-v4.1-flash");
+        translator.push(
+            "output",
+            r#"{"response":"","reasoning_content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function_call":{"name":"get_weather","arguments":""}}]}"#,
+        );
+        let chunks = translator.push(
+            "output",
+            r#"{"response":"","reasoning_content":null,"tool_calls":[{"index":0,"id":"","type":"","function_call":{"name":"","arguments":"{\"city\":\"beijing\"}"}}]}"#,
+        );
+        assert_eq!(chunks.len(), 1);
+        let call = &chunks[0].as_ref().unwrap().choices[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.index, 0, "both fragments belong to the same call");
+        assert_eq!(call.id.as_deref(), None, "an empty id must not overwrite the real one");
+        let function = call.function.as_ref().unwrap();
+        assert_eq!(function.name.as_deref(), None, "an empty name must not be resent");
+        assert_eq!(function.arguments.as_deref(), Some("{\"city\":\"beijing\"}"));
+    }
+
+    #[test]
+    fn trae_upstream_mode_follows_the_environment() {
+        let _env = UPSTREAM_MODE_ENV
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // The fast SOLO route is the default.
+        std::env::remove_var("TRAE_UPSTREAM_MODE");
+        super::set_trae_upstream_mode(None);
+        assert_eq!(trae_upstream_mode(), TraeUpstream::Solo);
+
+        std::env::set_var("TRAE_UPSTREAM_MODE", "remote");
+        assert_eq!(trae_upstream_mode(), TraeUpstream::Remote);
+
+        std::env::set_var("TRAE_UPSTREAM_MODE", "AGENT");
+        assert_eq!(trae_upstream_mode(), TraeUpstream::Remote);
+
+        std::env::set_var("TRAE_UPSTREAM_MODE", "solo");
+        assert_eq!(trae_upstream_mode(), TraeUpstream::Solo);
+
+        std::env::remove_var("TRAE_UPSTREAM_MODE");
+        super::set_trae_upstream_mode(None);
+    }
+
+    #[test]
+    fn trae_upstream_mode_prefers_the_runtime_override() {
+        let _env = UPSTREAM_MODE_ENV
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        std::env::remove_var("TRAE_UPSTREAM_MODE");
+        super::set_trae_upstream_mode(None);
+
+        // Without a panel choice the environment variable decides.
+        std::env::set_var("TRAE_UPSTREAM_MODE", "remote");
+        assert_eq!(trae_upstream_mode(), TraeUpstream::Remote);
+
+        // A panel choice wins over the environment variable.
+        super::set_trae_upstream_mode(Some(TraeUpstream::Solo));
+        assert_eq!(trae_upstream_mode(), TraeUpstream::Solo);
+
+        // Clearing it hands control back to the environment variable.
+        super::set_trae_upstream_mode(None);
+        assert_eq!(trae_upstream_mode(), TraeUpstream::Remote);
+
+        std::env::remove_var("TRAE_UPSTREAM_MODE");
+        super::set_trae_upstream_mode(None);
+    }
+
+    #[test]
+    fn trae_upstream_names_round_trip_and_unknown_values_are_rejected() {
+        assert_eq!(TraeUpstream::parse("solo"), Some(TraeUpstream::Solo));
+        assert_eq!(TraeUpstream::parse(" REMOTE "), Some(TraeUpstream::Remote));
+        assert_eq!(TraeUpstream::parse("agent"), Some(TraeUpstream::Remote));
+        assert_eq!(TraeUpstream::parse("direct"), Some(TraeUpstream::Solo));
+        assert_eq!(TraeUpstream::parse("turbo"), None);
+        assert_eq!(TraeUpstream::parse(""), None);
+        assert_eq!(TraeUpstream::Solo.as_str(), "solo");
+        assert_eq!(TraeUpstream::Remote.as_str(), "remote");
+    }
+
+    #[test]
+    fn the_web_parallel_limit_defaults_to_two_and_follows_the_environment() {
+        let _env = PARALLEL_LIMIT_ENV
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        std::env::remove_var("TRAE_WEB_PARALLEL_LIMIT");
+        assert_eq!(trae_web_parallel_limit(), 2);
+
+        std::env::set_var("TRAE_WEB_PARALLEL_LIMIT", "4");
+        assert_eq!(trae_web_parallel_limit(), 4);
+
+        // A nonsensical value falls back to the upstream's own limit.
+        std::env::set_var("TRAE_WEB_PARALLEL_LIMIT", "0");
+        assert_eq!(trae_web_parallel_limit(), 2);
+        std::env::set_var("TRAE_WEB_PARALLEL_LIMIT", "many");
+        assert_eq!(trae_web_parallel_limit(), 2);
+
+        std::env::remove_var("TRAE_WEB_PARALLEL_LIMIT");
+    }
+
+    #[test]
+    fn the_parallel_limit_is_recognized_as_a_traffic_condition() {
+        let body = r#"{"code":991502,"error":{"reason":"solo_agent_parallel_limit","limit":2,"running":2}}"#;
+        assert!(trae_is_parallel_limit(body));
+        // Other 429 reasons - a real quota limit - stay account level.
+        assert!(!trae_is_parallel_limit(
+            r#"{"code":6004,"msg":"您的使用量已超出频率限制"}"#
+        ));
+    }
+
+    #[test]
+    fn a_failed_stream_says_what_happened_and_not_just_that_the_body_broke() {
+        // reqwest reports every incomplete body the same way, so the gateway
+        // has to add the context itself: which route died, how much of the
+        // answer made it through, and how long the gateway waited.
+        let broken = EventStreamError::<reqwest::Error>::Utf8(
+            String::from_utf8(vec![0xff, 0xfe]).expect_err("invalid utf-8"),
+        );
+        let message = trae_stream_failure(
+            "SOLO",
+            &broken,
+            std::time::Duration::from_millis(3_400),
+            12,
+        );
+        assert!(message.contains("SOLO"), "{}", message);
+        assert!(message.contains("12 chunk(s)"), "{}", message);
+        assert!(message.contains("3.4s"), "{}", message);
+        assert!(
+            message.contains("not valid UTF-8"),
+            "the reason must name the actual fault: {}",
+            message
+        );
+        assert!(
+            !message.contains("error decoding response body"),
+            "the old message said nothing about the cause: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn the_web_slot_gate_keeps_an_account_inside_the_upstream_limit() {
+        let dir = std::env::temp_dir().join(format!("mg-trae-slots-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = TraeProvider::new(std::sync::Arc::new(mg_core::AccountPool::new(dir)));
+
+        let first = provider
+            .acquire_web_slot("account-1")
+            .await
+            .expect("first slot");
+        let second = provider
+            .acquire_web_slot("account-1")
+            .await
+            .expect("second slot");
+
+        // The third caller has to wait: handing it a slot would push the
+        // account past the upstream's own limit.
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            provider.acquire_web_slot("account-1"),
+        )
+        .await;
+        assert!(
+            waiting.is_err(),
+            "the third caller must wait for a free slot instead of taking one"
+        );
+
+        // Another account is not affected by this account's slots.
+        let other = provider
+            .acquire_web_slot("account-2")
+            .await
+            .expect("other account has its own slots");
+        drop(other);
+
+        drop(first);
+        let third = provider
+            .acquire_web_slot("account-1")
+            .await
+            .expect("a released slot is reusable");
+        drop(second);
+        drop(third);
     }
 }

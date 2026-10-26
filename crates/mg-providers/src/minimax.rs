@@ -396,7 +396,7 @@ impl Provider for MiniMaxProvider {
         &self,
         req: ChatCompletionRequest,
         session_id: Option<&str>,
-    ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
         let region = self.active_region().unwrap_or_else(|| "cn".to_string());
         let mut account = self
             .pool
@@ -614,7 +614,7 @@ impl Provider for MiniMaxProvider {
                 }
             });
 
-        Ok((Box::pin(stream), account.id))
+        Ok((Box::pin(stream), account.id, None))
     }
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota> {

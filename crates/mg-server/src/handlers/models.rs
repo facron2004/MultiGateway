@@ -286,8 +286,8 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _session_id: Option<&str>,
-        ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
-            Ok((Box::pin(stream::empty()), String::new()))
+        ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
+            Ok((Box::pin(stream::empty()), String::new(), None))
         }
 
         async fn refresh_quota(&self, _account_id: &str) -> Result<AccountQuota> {

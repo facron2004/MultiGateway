@@ -245,6 +245,23 @@ pub async fn provider_region(
 }
 
 #[tauri::command]
+pub async fn provider_settings_save(
+    state: tauri::State<'_, AppState>,
+    provider_name: String,
+    payload: service::ProviderSettingsPayload,
+) -> CommandResult {
+    result(
+        service::provider_settings_save(
+            Path(provider_name),
+            State(state.inner().clone()),
+            Json(payload),
+        )
+        .await,
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn provider_import(
     state: tauri::State<'_, AppState>,
     provider_name: String,

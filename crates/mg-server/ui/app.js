@@ -8,6 +8,7 @@ import {
   snapshot,
   accountRows,
   regionButtons,
+  traeModeButtons,
   scope,
   models,
   operationResults,
@@ -121,6 +122,7 @@ function showView() {
   );
   $("models-panel").hidden = !isAccounts;
   $("region-switch").hidden = !isAccounts;
+  $("trae-mode-switch").hidden = !isAccounts;
   const moreMenuContainer = $("more-toggle")?.closest(".menu-container");
   if (moreMenuContainer) moreMenuContainer.hidden = !isAccounts;
   $("provider-name").textContent =
@@ -137,6 +139,7 @@ function showView() {
 function renderAccounts() {
   if (!state.current) return;
   regionButtons(state.current, state.pending.has(state.provider));
+  traeModeButtons(state.current, state.pending.has(state.provider));
   scope(state.current, state.selected, state.pending.has(state.provider));
   accountRows(
     state.current,
@@ -165,6 +168,9 @@ function resetProvider() {
   );
   document
     .querySelectorAll("#region-switch button")
+    .forEach((button) => (button.disabled = true));
+  document
+    .querySelectorAll("#trae-mode-switch button")
     .forEach((button) => (button.disabled = true));
   placeholder(
     "model-rows",
@@ -472,6 +478,28 @@ $("region-switch").onclick = (event) => {
     return;
   state.selected.clear();
   mutate("region", { region: button.dataset.region }, button);
+};
+$("trae-mode-switch").onclick = async (event) => {
+  const button = event.target.closest("[data-trae-mode]");
+  if (!button || button.disabled || !state.current) return;
+  const mode = button.dataset.traeMode;
+  if (state.current.trae_upstream_mode === mode) return;
+  button.disabled = true;
+  notice("正在切换 Trae 上游通道…");
+  try {
+    const result = await providerApi("trae", "settings", {
+      trae_upstream_mode: mode,
+    });
+    await refresh();
+    notice(
+      result.trae_upstream_mode === "remote"
+        ? "已切换到 Agent 会话：带 Trae 技能与沙箱，首字较慢。"
+        : "已切换到直连 Solo：首字更快，不带 Trae 技能与沙箱。",
+    );
+  } catch (error) {
+    notice(`切换失败：${error.message}`, true);
+    await refresh();
+  }
 };
 $("model-rows").onclick = async (event) => {
   const button = event.target.closest("[data-copy-model]");

@@ -183,7 +183,7 @@ pub async fn provider_snapshot(
         }
     }
 
-    let snapshot = serde_json::json!({
+    let mut snapshot = serde_json::json!({
         "provider": provider_name,
         "label": provider.name(),
         "region": current_region,
@@ -204,6 +204,13 @@ pub async fn provider_snapshot(
         "error": "",
         "activity": state.activity.view(&provider_name)
     });
+    if provider_name == "trae" {
+        // The transport in effect right now, so the panel can show the switch in
+        // the position it is actually running.
+        snapshot["trae_upstream_mode"] = serde_json::Value::String(
+            mg_providers::trae::trae_upstream_mode().as_str().to_string(),
+        );
+    }
 
     Json(snapshot).into_response()
 }
@@ -746,6 +753,70 @@ pub async fn provider_region(
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderSettingsPayload {
+    pub trae_upstream_mode: String,
+}
+
+/// Switch a provider-level runtime setting.
+///
+/// Today the only switch is the Trae upstream transport: `solo` calls the model
+/// directly, `remote` drives a full Trae agent session. The choice is stored in
+/// the data directory and applied to the running gateway, so no restart is
+/// needed.
+pub async fn provider_settings_save(
+    Path(provider_name): Path<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<ProviderSettingsPayload>,
+) -> Response {
+    if provider_name != "trae" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(MgError::not_found(format!("Provider '{}' not found", provider_name)).to_openai_json()),
+        )
+            .into_response();
+    }
+
+    let mode = match mg_providers::trae::TraeUpstream::parse(&payload.trae_upstream_mode) {
+        Some(mode) => mode,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    MgError::bad_request("上游通道只能是 solo 或 remote".to_string())
+                        .to_openai_json(),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let saved = match crate::provider_settings::save(
+        &state.config.data_dir,
+        &crate::provider_settings::ProviderSettings {
+            trae_upstream_mode: mode.as_str().to_string(),
+        },
+    ) {
+        Ok(saved) => saved,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MgError::provider(500, error.to_string(), "settings_error").to_openai_json()),
+            )
+                .into_response();
+        }
+    };
+
+    mg_providers::trae::set_trae_upstream_mode(Some(mode));
+    tracing::info!(mode = saved.trae_upstream_mode, "Trae 上游通道已切换");
+
+    Json(serde_json::json!({
+        "ok": true,
+        "trae_upstream_mode": saved.trae_upstream_mode,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]

@@ -263,6 +263,20 @@ pub fn calibrate_model_limits(model: &mut ModelEntry) {
     }
 }
 
+/// Clamp a requested output ceiling to the model's known output limit.
+///
+/// Upstream rejects a `max_tokens` above the model's ceiling, so a caller
+/// asking for more has to be capped instead of failing the whole request.
+pub fn clamp_output_tokens(requested: u32, model: &str) -> u32 {
+    let Some((_, output)) = known_limits(model) else {
+        return requested;
+    };
+    if output == 0 {
+        return requested;
+    }
+    requested.min(output as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{apply_known_limits, calibrate_model_limits, known_limits, read_limit_cache};

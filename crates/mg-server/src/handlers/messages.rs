@@ -137,7 +137,7 @@ pub async fn messages(
     );
     let record_id = record.id.clone();
 
-    let (mut stream, account_id) = match provider.chat(final_chat_req, session_id).await {
+    let (mut stream, account_id, upstream) = match provider.chat(final_chat_req, session_id).await {
         Ok(s) => s,
         Err(err) => {
             state.activity.finish(
@@ -153,6 +153,8 @@ pub async fn messages(
                 .into_response();
         }
     };
+    let mut record = record;
+    record.upstream = upstream;
 
     let activity = state.activity.clone();
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
@@ -643,7 +645,7 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _session_id: Option<&str>,
-        ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+        ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
             let mut items: Vec<Result<ChatCompletionChunk>> =
                 self.chunks.clone().into_iter().map(Ok).collect();
             if let Some(code) = self.error {
@@ -653,7 +655,7 @@ mod tests {
                     "upstream_error",
                 )));
             }
-            Ok((Box::pin(stream::iter(items)), "account-1".to_string()))
+            Ok((Box::pin(stream::iter(items)), "account-1".to_string(), None))
         }
 
         async fn refresh_quota(&self, _account_id: &str) -> Result<AccountQuota> {

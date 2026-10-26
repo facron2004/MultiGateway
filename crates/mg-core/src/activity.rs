@@ -69,6 +69,15 @@ pub struct RequestRecord {
     pub credits: Option<f64>,
     pub account: String,
     pub error: String,
+    /// Which upstream route served the turn, when the provider has more than
+    /// one. `None` means the provider's only route.
+    ///
+    /// The Trae provider can serve a turn from a direct model call or from a
+    /// full agent session, and the two differ by an order of magnitude in
+    /// prompt size and latency. Without this the request log cannot explain
+    /// why one turn carried 30 tokens and the next one carried 24 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
     pub session_id: String,
     pub session_source: String,
     #[serde(skip)]
@@ -246,6 +255,7 @@ impl Activity {
             credits: None,
             account: String::new(),
             error: String::new(),
+            upstream: None,
             session_id,
             session_source: if session.is_some() { "client".to_string() } else { "request".to_string() },
             start_instant: Some(Instant::now()),

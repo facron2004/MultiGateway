@@ -862,6 +862,8 @@ body.sidebar-expanded .rail-bottom small {
 .toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 7px;
 }
 .toolbar > .primary {
@@ -1919,6 +1921,12 @@ td .empty {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* The route is a label, not a number: keep it out of the right-aligned
+   numeric columns. */
+.board-table .route-cell {
+  text-align: center;
+  font-variant-numeric: normal;
 }
 .board-table td[colspan] {
   text-align: center;

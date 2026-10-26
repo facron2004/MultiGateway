@@ -1,5 +1,6 @@
 import { $, names, escape, date, statuses, usageUnit, patchRows, debounce } from "./render.js";
 import { logo, icon } from "./icons.js";
+import { t } from "./i18n.js";
 
 const PROVIDERS = [...Object.keys(names)];
 let notify = () => {};
@@ -532,6 +533,21 @@ function statusCell(row) {
   }>${row.status === "success" ? "成功" : row.status === "processing" ? "处理中" : row.status === "cancelled" ? "已取消" : "失败"}</span></td>`;
 }
 
+// Which upstream route served the turn, when the provider has more than one.
+//
+// The Trae provider can answer from a direct model call or from a full agent
+// session. The two carry very different prompts and latencies, so the board
+// has to name the one that actually ran.
+function routeCell(upstream) {
+  if (!upstream) return "—";
+  const label = upstream === "trae:direct-model"
+    ? t("routeDirect")
+    : upstream === "trae:agent-session"
+      ? t("routeAgent")
+      : upstream;
+  return `<span class="badge route-badge" title="${escape(upstream)}">${escape(label)}</span>`;
+}
+
 function boardRowHtml(row) {
   const key = escape(
     `${row.timestamp}|${row.provider}|${row.session_id}|${row.model}|${row.account}`,
@@ -546,6 +562,7 @@ function boardRowHtml(row) {
         row.account_name || (row.account || "").slice(0, 10) || "—",
       )}</td>
       ${statusCell(row)}
+      <td class="route-cell">${routeCell(row.upstream)}</td>
       <td>${compact(row.new_input_tokens)}</td>
       <td>${compact(row.cached_tokens)}</td>
       <td>${compact(row.output_tokens)}</td>

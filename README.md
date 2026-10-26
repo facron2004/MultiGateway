@@ -62,6 +62,33 @@ MultiGateway 是一个用 Rust 编写的多账号反向代理网关。它把 **W
 
 模型请求使用带服务前缀的 ID，例如 `trae/glm-5.3`、`qoder/Qwen3.8-Max`、`copilot/gpt-4.1`。分组端点 `/trae/v1/models` 保留上游原始模型 ID。
 
+### Trae 上游通道
+
+Trae 有两条上游通道，面板里可以直接切换（Trae 页顶部工具栏的「直连 Solo / Agent 会话」），切换后立即生效，不需要重启网关：
+
+| 取值 | 上游接口 | 特点 |
+| --- | --- | --- |
+| `solo`（默认） | `/api/agent/v3/llm_utils_chat` | 直连模型，不走 Agent 层，首字通常 1–1.5 秒，输入 Token 只包含真实对话量 |
+| `remote` | `/api/remote/v1/chat_sessions` | 完整 Trae Agent：自带约 2.4 万 Token 的 Agent 提示、内置技能和沙箱，首字通常 3–8 秒 |
+
+`remote` 也接受 `agent`、`session`、`web` 别名。直连通道建流失败时会自动回退到 `remote`，请求不会直接失败。
+需要 Trae 的技能和沙箱能力时再切回 `remote`。
+
+回退是静默的，但记录不是：每条请求都会带上这一轮实际走的通道（`trae:direct-model` 或 `trae:agent-session`），
+在 `requests.jsonl` 的 `upstream` 字段和用量看板的「通道」列里都能看到。两条通道的输入 Token 差一个数量级
+（直连只有真实对话量，Agent 会话自带约 2.4 万 Token 的 Agent 提示），对不上时先看这一列。
+
+通道选择的优先级是：**面板里选的 > 环境变量 `TRAE_UPSTREAM_MODE` > 默认 `solo`**。
+面板的选择保存在数据目录的 `provider_settings.json`，重启后仍然生效；删掉这个文件就回到环境变量或默认值。
+
+上游对每个账号只允许 **2 个并发 Agent 会话**（`solo_agent_parallel_limit`）。直连通道和 Agent 会话通道
+共用这份预算，所以网关按账号本地限流：超出的请求在本地排队等待，而不是被上游拒绝或在上游深处排队
+（实测会被拖到 50 秒以上）。并发上限可用 `TRAE_WEB_PARALLEL_LIMIT` 调整（默认 `2`）。
+这类并发冲突属于流量问题，不会被当成账号故障而冷却账号。
+
+两条通道都会把上游的提示词缓存命中（`cache_read_input_tokens`）透传给客户端，调用方可以在响应的
+`usage.prompt_tokens_details.cached_tokens` 以及面板的用量看板里看到缓存命中情况。
+
 ---
 
 ## 环境要求

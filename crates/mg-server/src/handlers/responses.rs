@@ -158,7 +158,7 @@ pub async fn responses(
     let record_id = record.id.clone();
 
     // 7. Invoke provider through the same chat path
-    let (mut stream, account_id) = match provider.chat(chat_req, session_id).await {
+    let (mut stream, account_id, upstream) = match provider.chat(chat_req, session_id).await {
         Ok(s) => s,
         Err(err) => {
             state.activity.finish(
@@ -174,6 +174,8 @@ pub async fn responses(
                 .into_response();
         }
     };
+    let mut record = record;
+    record.upstream = upstream;
 
     let activity = state.activity.clone();
     let resp_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
@@ -648,7 +650,7 @@ mod tests {
             &self,
             req: ChatCompletionRequest,
             _session_id: Option<&str>,
-        ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+        ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
             self.requests.lock().unwrap().push(req);
             let mut items: Vec<Result<ChatCompletionChunk>> =
                 self.chunks.clone().into_iter().map(Ok).collect();
@@ -659,7 +661,7 @@ mod tests {
                     "upstream_error",
                 )));
             }
-            Ok((Box::pin(stream::iter(items)), "account-1".to_string()))
+            Ok((Box::pin(stream::iter(items)), "account-1".to_string(), None))
         }
 
         async fn refresh_quota(&self, _account_id: &str) -> Result<AccountQuota> {

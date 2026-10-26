@@ -224,6 +224,21 @@
               国际版
             </button>
           </div>
+          <div
+            id="trae-mode-switch"
+            class="region-switch"
+            role="group"
+            aria-label="切换 Trae 上游通道"
+            data-i18n-aria="traeModeSwitch"
+            hidden
+          >
+            <button data-trae-mode="solo" aria-pressed="true" disabled>
+              <span data-i18n="traeModeSolo">直连 Solo</span>
+            </button>
+            <button data-trae-mode="remote" aria-pressed="false" disabled>
+              <span data-i18n="traeModeRemote">Agent 会话</span>
+            </button>
+          </div>
           <button id="add-account" class="primary">
             <span data-icon="plus"></span>添加账号
           </button>
@@ -463,6 +478,7 @@
                   <th>模型</th>
                   <th>账号</th>
                   <th>状态</th>
+                  <th>通道</th>
                   <th>新增输入</th>
                   <th>缓存命中</th>
                   <th>输出</th>
@@ -474,7 +490,7 @@
               </thead>
               <tbody id="board-rows">
                 <tr>
-                  <td colspan="12" class="empty">正在读取用量…</td>
+                  <td colspan="13" class="empty">正在读取用量…</td>
                 </tr>
               </tbody>
             </table>

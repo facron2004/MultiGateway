@@ -28,6 +28,7 @@ const providers = {
   batch: "provider_batch",
   region: "provider_region",
   import: "provider_import",
+  settings: "provider_settings_save",
 };
 
 async function invoke(command, args, signal) {

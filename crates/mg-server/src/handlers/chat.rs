@@ -134,7 +134,7 @@ pub async fn chat_completions(
     // OpenAI's `stream` defaults to false; defaulting to true here made clients that
     // omit it receive SSE when they expected a single JSON completion.
     let is_stream = req.stream.unwrap_or(false);
-    let (mut stream, account_id) = match provider.chat(req, session_id).await {
+    let (mut stream, account_id, upstream) = match provider.chat(req, session_id).await {
         Ok(s) => s,
         Err(err) => {
             state.activity.finish(
@@ -150,6 +150,8 @@ pub async fn chat_completions(
                 .into_response();
         }
     };
+    let mut record = record;
+    record.upstream = upstream;
 
     let activity = state.activity.clone();
 
@@ -450,7 +452,7 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _session_id: Option<&str>,
-        ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+        ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
             let chunk = ChatCompletionChunk {
                 id: "chunk-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
@@ -472,7 +474,7 @@ mod tests {
                     credits: Some(0.15),
                 }),
             };
-            Ok((Box::pin(stream::iter(vec![Ok(chunk)])), "account-1".to_string()))
+            Ok((Box::pin(stream::iter(vec![Ok(chunk)])), "account-1".to_string(), None))
         }
 
         async fn refresh_quota(&self, _account_id: &str) -> Result<AccountQuota> {
@@ -662,7 +664,7 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _session_id: Option<&str>,
-        ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+        ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
             use mg_protocols::openai::{FunctionCallChunk, ToolCallChunk};
             let chunk = ChatCompletionChunk {
                 id: "chunk-tool".to_string(),
@@ -689,7 +691,7 @@ mod tests {
                 }],
                 usage: None,
             };
-            Ok((Box::pin(stream::iter(vec![Ok(chunk)])), "acc-tool".to_string()))
+            Ok((Box::pin(stream::iter(vec![Ok(chunk)])), "acc-tool".to_string(), None))
         }
         async fn refresh_quota(&self, _account_id: &str) -> Result<AccountQuota> {
             Ok(AccountQuota {
@@ -779,10 +781,10 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _session_id: Option<&str>,
-        ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+        ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
             use mg_core::error::MgError;
             let err = Err(MgError::provider(429, "rate limited by upstream", "rate_limit"));
-            Ok((Box::pin(stream::iter(vec![err])), "acc-err".to_string()))
+            Ok((Box::pin(stream::iter(vec![err])), "acc-err".to_string(), None))
         }
         async fn refresh_quota(&self, _account_id: &str) -> Result<AccountQuota> {
             Ok(AccountQuota {

@@ -172,6 +172,27 @@ export function regionButtons(data, busy = false) {
         index === 1 && singleRegion ? "当前 Agent 暂不支持国际版" : "";
     });
 }
+
+/// Trae's upstream transport switch. `solo` calls the model directly, `remote`
+/// drives a full Trae agent session. Only shown for Trae.
+export function traeModeButtons(data, busy = false) {
+  const switcher = $("trae-mode-switch");
+  if (!switcher) return;
+  const supported = data?.provider === "trae";
+  switcher.hidden = !supported || $("accounts-panel").hidden;
+  if (!supported) return;
+  const mode = data.trae_upstream_mode === "remote" ? "remote" : "solo";
+  switcher.querySelectorAll("button").forEach((button) => {
+    const selected = button.dataset.traeMode === mode;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    button.disabled = busy;
+    button.title =
+      button.dataset.traeMode === "solo"
+        ? "直连模型，首字快，不带 Trae 技能与沙箱"
+        : "走 Trae Agent 会话，带技能与沙箱，首字较慢";
+  });
+}
 function quotaAmount(value, unit) {
   if (value === "unlimited") return "无限制";
   if (value == null) return "—";

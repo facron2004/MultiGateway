@@ -1434,7 +1434,7 @@ impl Provider for WorkBuddyProvider {
         &self,
         req: ChatCompletionRequest,
         session_id: Option<&str>,
-    ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
         let mut req = req;
         normalize_workbuddy_request(&mut req);
 
@@ -1639,7 +1639,7 @@ impl Provider for WorkBuddyProvider {
                 }
             });
 
-        Ok((Box::pin(s), account_id))
+        Ok((Box::pin(s), account_id, None))
     }
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota> {

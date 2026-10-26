@@ -23,11 +23,18 @@ pub trait Provider: Send + Sync {
         self.models().await
     }
 
+    /// Run one chat turn.
+    ///
+    /// The third element names the upstream route when the provider has more
+    /// than one. The Trae provider serves a turn either from a direct model
+    /// call or from a full agent session, and the two differ so much in prompt
+    /// size and latency that the request log has to say which one ran - a
+    /// silent switch between them is indistinguishable from a broken gateway.
     async fn chat(
         &self,
         req: ChatCompletionRequest,
         session_id: Option<&str>,
-    ) -> Result<(BoxStream<ChatCompletionChunk>, String)>;
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)>;
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota>;
 

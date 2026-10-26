@@ -104,6 +104,7 @@ pub fn run_desktop_window(
             native::provider_batch,
             native::provider_region,
             native::provider_import,
+            native::provider_settings_save,
             native::gateway_configure,
             native::settings_view,
             native::desktop_settings_save,

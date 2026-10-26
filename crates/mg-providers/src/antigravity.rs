@@ -957,7 +957,7 @@ impl Provider for AntigravityProvider {
         &self,
         req: ChatCompletionRequest,
         session_id: Option<&str>,
-    ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
         let mut account = self.pool.choose(session_id, None)?;
         let mut token = self.ensure_fresh_token(&mut account).await?;
         let project_id = self
@@ -1147,7 +1147,7 @@ impl Provider for AntigravityProvider {
                 }
             });
 
-        Ok((Box::pin(stream), account.id))
+        Ok((Box::pin(stream), account.id, None))
     }
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota> {

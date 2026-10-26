@@ -385,7 +385,7 @@ impl Provider for CopilotProvider {
         &self,
         mut req: ChatCompletionRequest,
         session_id: Option<&str>,
-    ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
         let account = self.pool.choose(session_id, None)?;
         let (jwt, api_base) = self.get_copilot_token(&account).await?;
 
@@ -454,7 +454,7 @@ impl Provider for CopilotProvider {
                 }
             });
 
-        Ok((Box::pin(stream), account.id))
+        Ok((Box::pin(stream), account.id, None))
     }
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota> {

@@ -1801,7 +1801,7 @@ impl Provider for QoderProvider {
         &self,
         req: ChatCompletionRequest,
         session_id: Option<&str>,
-    ) -> Result<(BoxStream<ChatCompletionChunk>, String)> {
+    ) -> Result<(BoxStream<ChatCompletionChunk>, String, Option<String>)> {
         let region = self.active_region().unwrap_or_else(|| "cn".to_string());
         let mut account = self
             .pool
@@ -1956,7 +1956,7 @@ impl Provider for QoderProvider {
                 }
             });
 
-        Ok((Box::pin(s), account_id))
+        Ok((Box::pin(s), account_id, None))
     }
 
     async fn refresh_quota(&self, account_id: &str) -> Result<AccountQuota> {
