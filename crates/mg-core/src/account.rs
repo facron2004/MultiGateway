@@ -536,6 +536,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn account_files_and_directory_are_owner_only() {
+        use super::AccountPool;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_pool_dir("permissions");
@@ -554,7 +555,8 @@ mod tests {
     }
 
     #[test]
-    fn a_concurrent_delete_is_never_undone_on_disk_by_an_update() {        use super::AccountPool;
+    fn a_concurrent_delete_is_never_undone_on_disk_by_an_update() {
+        use super::AccountPool;
 
         for attempt in 0..40 {
             let dir = temp_pool_dir(&format!("delete-race-{attempt}"));
