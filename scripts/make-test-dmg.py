@@ -24,8 +24,8 @@ Kinds:
                   plist, which is what hdiutil writes (must pass)
     packed-tables a container that keeps its blkx tables in a table area but
                   packs them back to back, so a table starts mid-sector
-    shuffled-blocks the blocks of one partition stored out of order inside the
-                  data fork, the defect that shipped as 0.11.2
+    unclaimed-bytes the data fork carries a block that no table points at, the
+                  defect that shipped as 0.11.2
     short-datafork every zlib payload cut in half (blocks fail to inflate)
     missing-koly  the koly trailer stripped; the plist is still parseable
     no-app        HFS+ image lacking MultiGateway.app
@@ -40,7 +40,7 @@ import sys
 import zlib
 
 KINDS = ("good", "good-apfs", "hdiutil-layout", "packed-tables",
-         "shuffled-blocks", "short-datafork", "missing-koly", "no-app",
+         "unclaimed-bytes", "short-datafork", "missing-koly", "no-app",
          "bad-plist")
 
 SECTOR = 512
@@ -518,18 +518,14 @@ def build_dmg(kind, arch="arm64"):
         Block("GPT Partition Data (Primary GPT Table : 2)", 1, 2, ENTRY_ARRAY_SECTORS,
               zlib.compress(boot[2 * SECTOR:]), 0, ENTRY_ARRAY_SECTORS),
     ]
-    if kind == "shuffled-blocks":
-        # Split the payload partition into two blocks, so the fixture can hold
-        # them in the data fork in the wrong order.
-        half = partition_sectors // 2
-        blocks.append(Block(image_label, 4, 40, partition_sectors,
-                            zlib.compress(volume[:half * SECTOR]), 0, half))
-        blocks.append(Block(image_label, 4, 40, partition_sectors,
-                            zlib.compress(volume[half * SECTOR:]), half,
-                            partition_sectors - half))
+    if kind == "unclaimed-bytes":
+        # A compressed block that no table points at: the reader has no way to
+        # know what was supposed to be there.
+        spare = zlib.compress(b"unclaimed payload" * 64)
     else:
-        blocks.append(Block(image_label, 4, 40, partition_sectors,
-                            zlib.compress(volume), 0, partition_sectors))
+        spare = b""
+    blocks.append(Block(image_label, 4, 40, partition_sectors,
+                        zlib.compress(volume), 0, partition_sectors))
     if kind == "short-datafork":
         # Halving every payload leaves the table geometry alone but makes each
         # zlib stream stop early, so the partition cannot be rebuilt.
@@ -542,7 +538,7 @@ def build_dmg(kind, arch="arm64"):
 
     return assemble(blocks, packed=(kind == "packed-tables"),
                     inline_tables=(kind == "hdiutil-layout"),
-                    shuffled=(kind == "shuffled-blocks"),
+                    spare=spare,
                     keep_koly=(kind != "missing-koly"))
 
 
@@ -572,7 +568,7 @@ def _pad_blocks(blocks):
     return padded
 
 
-def assemble(blocks, packed=False, inline_tables=False, shuffled=False,
+def assemble(blocks, packed=False, inline_tables=False, spare=b"",
              keep_koly=True):
     """Concatenate payloads, then place the mish tables inside the plist.
 
@@ -585,23 +581,17 @@ def assemble(blocks, packed=False, inline_tables=False, shuffled=False,
     `inline_tables` models hdiutil, which keeps every table inside the XML
     plist and records no table area at all, so each DataOffset stays zero.
 
-    `shuffled` writes the blocks of one partition into the data fork in the
-    wrong order.  The reader then has to look for the block of a sector behind
-    the blocks that follow it, which is the defect that shipped as 0.11.2.
+    `spare` is payload that goes into the data fork without any table
+    pointing at it, which is the defect that shipped as 0.11.2.
     """
     data_fork = bytearray()
     order = list(range(len(blocks)))
-    if shuffled:
-        # Swap the blocks of the payload partition inside the data fork.
-        image_blocks = [index for index, item in enumerate(blocks)
-                        if item.label.startswith("disk image")]
-        for first, second in zip(image_blocks, image_blocks[1:]):
-            order[first], order[second] = order[second], order[first]
     placement = {}
     for index in order:
         item = blocks[index]
         placement[index] = (len(data_fork), len(item.payload))
         data_fork += item.payload
+    data_fork += spare
     chunk_records = []
     for index, item in enumerate(blocks):
         offset, length = placement[index]

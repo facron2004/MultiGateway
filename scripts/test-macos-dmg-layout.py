@@ -29,7 +29,7 @@ CASES = {
     "good-apfs": (0, []),
     "hdiutil-layout": (0, []),
     "packed-tables": (1, ["out of alignment"]),
-    "shuffled-blocks": (1, ["out of order"]),
+    "unclaimed-bytes": (1, ["no partition block points at"]),
     "short-datafork": (1, ["decompress"]),
     "missing-koly": (1, ["koly"]),
     "no-app": (1, ["MultiGateway.app"]),
@@ -94,11 +94,11 @@ class DMGLayoutTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("out of alignment", result.stderr)
 
-    def test_shuffled_blocks_are_rejected(self):
-        """Blocks stored out of order are the defect that shipped as 0.11.2."""
-        result = run(VERIFY, self.fixture("shuffled-blocks"))
+    def test_unclaimed_data_fork_bytes_are_rejected(self):
+        """A block that no table points at is the defect that shipped as 0.11.2."""
+        result = run(VERIFY, self.fixture("unclaimed-bytes"))
         self.assertEqual(result.returncode, 1)
-        self.assertIn("out of order", result.stderr)
+        self.assertIn("no partition block points at", result.stderr)
 
     def test_packed_tables_offset_is_not_a_sector_multiple(self):
         result = run(MAKE, "--kind", "packed-tables", "--output",

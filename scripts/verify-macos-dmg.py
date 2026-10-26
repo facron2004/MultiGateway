@@ -218,31 +218,25 @@ def align_up(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
 
-def check_chunk_offsets(tables, data_end, report):
+def check_chunk_offsets(tables, blob, data_end, report):
     """Chunk payloads live in the data fork and must not overlap.
 
-    A UDZO image stores the compressed blocks back to back in the order the
-    reader consumes them, so the file offsets of the blocks of one partition
-    have to climb. The 0.11.2 container shuffled them instead, which is why
-    macOS read the partition from the wrong places and reported the image as
-    not recognized. Free space between partitions may legitimately be left
-    out of the data fork, so the fork does not have to be tiled exactly.
+    The blocks of a partition may be stored in any order inside the data
+    fork: hdiutil itself writes them in the order it produced them, which is
+    not the order of the sectors they describe.  What has to hold is that the
+    bytes exist, that they do not overlap and that every byte of the data fork
+    belongs to a block, because a reader that finds unclaimed bytes has no way
+    to tell what was supposed to be there.
     """
     spans = []
     for table in tables:
-        previous_end = None
         for chunk in table["chunks"]:
             if chunk["kind"] not in COMPRESSED or not chunk["length"]:
                 continue
             if chunk["offset"] + chunk["length"] > data_end:
-                report.problem(f"partition '{table['name']}' block at {chunk['offset']} "
-                               f"(+{chunk['length']}) overruns the data fork ({data_end} bytes)")
-            if previous_end is not None and chunk["offset"] < previous_end:
-                report.problem(f"partition '{table['name']}' stores its blocks out of order: "
-                               f"the block at {chunk['offset']} comes before the block ending "
-                               f"at {previous_end}, so the image cannot be read as one "
-                               "sequential stream")
-            previous_end = chunk["offset"] + chunk["length"]
+                report.problem(
+                    f"partition '{table['name']}' block at {chunk['offset']} "
+                    f"(+{chunk['length']}) overruns the data fork ({data_end} bytes)")
             spans.append((chunk["offset"], chunk["length"], table["name"]))
     if not spans:
         return
@@ -252,7 +246,29 @@ def check_chunk_offsets(tables, data_end, report):
         if offset < cursor:
             report.problem(f"partition '{label}' block at {offset} overlaps the previous "
                            f"block ending at {cursor}")
+        elif offset > cursor:
+            unclaimed(blob, cursor, offset, report)
         cursor = max(cursor, offset + length)
+    if cursor < data_end:
+        unclaimed(blob, cursor, data_end, report)
+
+
+def unclaimed(blob, start, end, report):
+    """Report data fork bytes that no partition block points at.
+
+    Zero padding between the blocks is harmless, but anything else is data the
+    image cannot explain: the container that shipped as 0.11.2 carried a whole
+    compressed block that no table referred to, so the reader silently filled
+    that part of the partition with zeros.
+    """
+    length = end - start
+    if length <= 0:
+        return
+    if blob[start:end].strip(b"\0"):
+        report.problem(f"the data fork holds {length} bytes at {start}..{end} that no "
+                       "partition block points at; the image cannot be read as it stands")
+    else:
+        report.note(f"the data fork has {length} zero bytes of padding at {start}..{end}")
 
 
 def decode(blob, chunk, label, report):
@@ -292,6 +308,7 @@ def assemble(blob, table, report):
     """Rebuild the partition image described by one blkx table."""
     image = bytearray(table["count"] * SECTOR)
     readable = True
+    covered = []
     for chunk in table["chunks"]:
         if chunk["kind"] == CHUNK_END:
             break
@@ -318,6 +335,19 @@ def assemble(blob, table, report):
             readable = False
             continue
         image[start:end] = payload
+        covered.append((start, end))
+    # Every sector of the partition has to come from a block; a hole means the
+    # reader fills it with zeros and the filesystem inside is damaged.
+    covered.sort()
+    cursor = 0
+    for start, end in covered:
+        if start > cursor:
+            report.problem(f"partition '{table['name']}' has no block for the sectors "
+                           f"{cursor // SECTOR}..{start // SECTOR}; the image is incomplete")
+        cursor = max(cursor, end)
+    if cursor < len(image):
+        report.problem(f"partition '{table['name']}' has no block for the sectors "
+                       f"{cursor // SECTOR}..{table['count']}; the image is incomplete")
     return image, readable
 
 
@@ -486,7 +516,7 @@ def main(argv):
         report.problem("DMG has no koly trailer; macOS reports the image as not recognized")
     tables, data_end = read_tables(blob, koly, report)
     check_tables(tables, blob, data_end, report)
-    check_chunk_offsets(tables, data_end, report)
+    check_chunk_offsets(tables, blob, data_end, report)
 
     volumes = []
     partitions = []
