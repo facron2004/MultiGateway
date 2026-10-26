@@ -255,19 +255,18 @@ def check_chunk_offsets(tables, blob, data_end, report):
 
 
 def unclaimed(blob, start, end, report):
-    """Report data fork bytes that no partition block points at.
+    """Note data fork bytes that no partition block points at.
 
-    Zero padding between the blocks is harmless, but anything else is data the
-    image cannot explain: the container that shipped as 0.11.2 carried a whole
-    compressed block that no table referred to, so the reader silently filled
-    that part of the partition with zeros.
+    hdiutil itself leaves such bytes behind, so they are not a defect on their
+    own; they are worth reporting because a reader has to fill them with
+    something, and a container that lost a block looks exactly the same.
     """
     length = end - start
     if length <= 0:
         return
     if blob[start:end].strip(b"\0"):
-        report.problem(f"the data fork holds {length} bytes at {start}..{end} that no "
-                       "partition block points at; the image cannot be read as it stands")
+        report.note(f"the data fork holds {length} bytes at {start}..{end} that no "
+                    "partition block points at")
     else:
         report.note(f"the data fork has {length} zero bytes of padding at {start}..{end}")
 

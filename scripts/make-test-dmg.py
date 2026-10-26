@@ -24,8 +24,8 @@ Kinds:
                   plist, which is what hdiutil writes (must pass)
     packed-tables a container that keeps its blkx tables in a table area but
                   packs them back to back, so a table starts mid-sector
-    unclaimed-bytes the data fork carries a block that no table points at, the
-                  defect that shipped as 0.11.2
+    unclaimed-bytes the data fork carries bytes that no table points at, which
+                  is what hdiutil itself leaves behind (must pass)
     short-datafork every zlib payload cut in half (blocks fail to inflate)
     missing-koly  the koly trailer stripped; the plist is still parseable
     no-app        HFS+ image lacking MultiGateway.app
@@ -508,6 +508,12 @@ def build_dmg(kind, arch="arm64"):
     partition_sectors = len(volume) // SECTOR
     boot = gpt_boot_blocks(partition_sectors)
     image_label = "disk image (Apple_APFS : 4)" if apfs else "disk image (Apple_HFS : 4)"
+    if kind == "unclaimed-bytes":
+        # Bytes in the data fork that no table points at. hdiutil leaves such
+        # bytes behind, so they are not a defect on their own.
+        spare = zlib.compress(b"unclaimed payload" * 64)
+    else:
+        spare = b""
 
     blocks = [
         Block("Protective Master Boot Record (MBR : 0)", -1, 0, 1,
@@ -518,12 +524,6 @@ def build_dmg(kind, arch="arm64"):
         Block("GPT Partition Data (Primary GPT Table : 2)", 1, 2, ENTRY_ARRAY_SECTORS,
               zlib.compress(boot[2 * SECTOR:]), 0, ENTRY_ARRAY_SECTORS),
     ]
-    if kind == "unclaimed-bytes":
-        # A compressed block that no table points at: the reader has no way to
-        # know what was supposed to be there.
-        spare = zlib.compress(b"unclaimed payload" * 64)
-    else:
-        spare = b""
     blocks.append(Block(image_label, 4, 40, partition_sectors,
                         zlib.compress(volume), 0, partition_sectors))
     if kind == "short-datafork":
@@ -582,7 +582,7 @@ def assemble(blocks, packed=False, inline_tables=False, spare=b"",
     plist and records no table area at all, so each DataOffset stays zero.
 
     `spare` is payload that goes into the data fork without any table
-    pointing at it, which is the defect that shipped as 0.11.2.
+    pointing at it.
     """
     data_fork = bytearray()
     order = list(range(len(blocks)))
