@@ -11,11 +11,13 @@ UDZO layout written by hdiutil and by libdmg-hfsplus' `dmg`:
 
     data fork (compressed blocks) | plist with resource-fork/blkx | koly trailer
 
-Every blkx chunk points at a byte range of the data fork. macOS reads the
-tables in file order, so a table that does not start on a physical sector
-boundary makes the reader consume the next table as part of the previous
-table's bytes, and every partition afterwards is read from the wrong offsets,
-so the image is reported as not recognized. That is checked explicitly.
+Every blkx chunk points at a byte range of the data fork. A UDZO image stores
+those compressed blocks back to back in the order the reader consumes them, so
+the file offsets of the blocks of one partition have to climb. The container
+that shipped as 0.11.2 shuffled them instead, so macOS read the partition from
+the wrong places and reported the image as not recognized; that is checked
+explicitly, together with the filesystem inside the partition and the bundle
+metadata macOS needs to launch the app.
 """
 import bz2
 import io
@@ -27,10 +29,10 @@ import zlib
 
 SECTOR = 512
 KOLY_SIZE = 512
-HFS_BLOCK = 2048
 
 CHUNK_END = 0xFFFFFFFF
 CHUNK_ZERO = 0x00000002
+CHUNK_ZERO_FILL = 0x00000000
 CHUNK_ADC = 0x00000001
 CHUNK_RAW = 0x80000004
 CHUNK_ZLIB = 0x80000005
@@ -39,7 +41,8 @@ CHUNK_LZFSE = 0x80000007
 CHUNK_LZMA = 0x80000008
 
 COMPRESSED = {CHUNK_ADC, CHUNK_ZLIB, CHUNK_BZIP2, CHUNK_LZFSE, CHUNK_LZMA}
-DECODABLE = {CHUNK_ZERO, CHUNK_ADC, CHUNK_RAW, CHUNK_ZLIB, CHUNK_BZIP2, CHUNK_LZMA}
+DECODABLE = {CHUNK_ZERO, CHUNK_ZERO_FILL, CHUNK_ADC, CHUNK_RAW, CHUNK_ZLIB,
+             CHUNK_BZIP2, CHUNK_LZFSE, CHUNK_LZMA}
 
 # Type signature: "H+" (HFS Plus) or "HX" (case sensitive HFS Plus).
 HFS_SIGNATURES = (b"H+", b"HX")
@@ -92,7 +95,7 @@ def read_chunk_list(raw, label, report):
                 break
     elif count > 0:
         kinds = {struct.unpack_from(">I", raw, 204 + index * 40)[0] for index in range(count)}
-        if kinds <= {CHUNK_ADC, CHUNK_ZERO, CHUNK_END} and count < available:
+        if kinds <= {CHUNK_ADC, CHUNK_ZERO, CHUNK_ZERO_FILL, CHUNK_END} and count < available:
             while count < available:
                 kind = struct.unpack_from(">I", raw, 204 + count * 40)[0]
                 count += 1
@@ -158,13 +161,14 @@ def read_tables(blob, koly, report):
         data_offset = struct.unpack_from(">Q", raw, 24)[0]
         chunks, buffers = read_chunk_list(raw, label, report)
         tables.append({"id": str(entry.get("ID")), "name": label, "raw": raw,
-                       "position": start + data_offset, "first": first,
-                       "count": count, "chunks": chunks, "count_field": buffers})
+                       "position": start + data_offset, "declared_offset": data_offset,
+                       "first": first, "count": count, "chunks": chunks,
+                       "count_field": buffers})
     return tables, data_end
 
 
 def check_tables(tables, blob, data_end, report):
-    """Tables are read in file order, so each must start at its own sector.
+    """A container that keeps a table area must lay the tables out in order.
 
     hdiutil and libdmg-hfsplus both lay the tables out consecutively starting
     at the first sector after the compressed blocks. Offsets are reported
@@ -173,6 +177,13 @@ def check_tables(tables, blob, data_end, report):
     whoever has to fix the builder.
     """
     if not tables:
+        return
+    # hdiutil keeps every blkx table inside the XML plist, so the field that
+    # would point into a separate table area is zero for all of them and
+    # there is nothing to align. A container that does keep a table area
+    # records each table's offset there, and those offsets have to land on
+    # their own sector.
+    if not any(table["declared_offset"] for table in tables):
         return
     ordered = sorted(tables, key=lambda item: item["position"])
     origin = ordered[0]["position"]
@@ -186,7 +197,7 @@ def check_tables(tables, blob, data_end, report):
                 f"must each begin at their own {SECTOR}-byte sector, so this one is read "
                 f"{relative % SECTOR} bytes out of alignment")
             expected = align_up(relative, SECTOR)
-        needed = 8 + table["count_field"]
+        needed = len(table["raw"])
         expected = align_up(relative + needed, SECTOR)
         # read_tables already rejects a plist whose DataOffset lies outside the
         # file, so only a table that spills into the trailer is a defect here.
@@ -208,49 +219,55 @@ def align_up(value, alignment):
 
 
 def check_chunk_offsets(tables, data_end, report):
-    """Block payloads live in the data fork and must not overlap.
+    """Chunk payloads live in the data fork and must not overlap.
 
-    Several tables share one data fork (one per GPT/MBR entry), so the check
-    runs over all of them together and the payloads must cover it exactly.
+    A UDZO image stores the compressed blocks back to back in the order the
+    reader consumes them, so the file offsets of the blocks of one partition
+    have to climb. The 0.11.2 container shuffled them instead, which is why
+    macOS read the partition from the wrong places and reported the image as
+    not recognized. Free space between partitions may legitimately be left
+    out of the data fork, so the fork does not have to be tiled exactly.
     """
-    total = 0
+    spans = []
     for table in tables:
-        compressed = [chunk for chunk in table["chunks"]
-                      if chunk["kind"] in COMPRESSED and chunk["length"]]
-        for chunk in compressed:
-            total += chunk["length"]
+        previous_end = None
+        for chunk in table["chunks"]:
+            if chunk["kind"] not in COMPRESSED or not chunk["length"]:
+                continue
             if chunk["offset"] + chunk["length"] > data_end:
                 report.problem(f"partition '{table['name']}' block at {chunk['offset']} "
                                f"(+{chunk['length']}) overruns the data fork ({data_end} bytes)")
-    if not total:
+            if previous_end is not None and chunk["offset"] < previous_end:
+                report.problem(f"partition '{table['name']}' stores its blocks out of order: "
+                               f"the block at {chunk['offset']} comes before the block ending "
+                               f"at {previous_end}, so the image cannot be read as one "
+                               "sequential stream")
+            previous_end = chunk["offset"] + chunk["length"]
+            spans.append((chunk["offset"], chunk["length"], table["name"]))
+    if not spans:
         return
-    spans = []
-    for table in tables:
-        for chunk in table["chunks"]:
-            if chunk["kind"] in COMPRESSED and chunk["length"]:
-                spans.append((chunk["offset"], chunk["length"], table["name"]))
     spans.sort()
     cursor = 0
     for offset, length, label in spans:
         if offset < cursor:
             report.problem(f"partition '{label}' block at {offset} overlaps the previous "
                            f"block ending at {cursor}")
-        elif offset > cursor:
-            report.problem(f"data fork bytes {cursor}..{offset} belong to no partition block")
         cursor = max(cursor, offset + length)
-    if cursor != data_end:
-        report.problem(f"partition blocks cover {cursor} bytes but the data fork holds {data_end}")
 
 
 def decode(blob, chunk, label, report):
     kind, sectors = chunk["kind"], chunk["sectors"]
-    if kind == CHUNK_ZERO:
+    if kind in (CHUNK_ZERO, CHUNK_ZERO_FILL):
         return b"\0" * (sectors * SECTOR)
     if kind not in DECODABLE:
         report.problem(f"partition '{label}' uses unsupported block type {kind:#x}; "
                        "macOS cannot read this image with stock tools")
         return None
     offset, length = chunk["offset"], chunk["length"]
+    if not length:
+        # A block that declares no payload still covers its sectors; they are
+        # simply empty.
+        return b"\0" * (sectors * SECTOR)
     raw = blob[offset:offset + length]
     if len(raw) != length:
         report.problem(f"partition '{label}' block at offset {offset} runs past the end of the file")
@@ -312,59 +329,79 @@ def check_apfs(image, report):
     if block_size not in (4096, 8192, 16384, 32768, 65536):
         report.problem(f"APFS container reports an impossible block size {block_size}")
         return block_size
-    if block_size * block_count != len(image):
+    span = block_size * block_count
+    if span > len(image):
         report.problem(
-            f"APFS container spans {block_size * block_count} bytes but the partition image "
+            f"APFS container spans {span} bytes but the partition image "
             f"holds {len(image)}; the filesystem was cut short during packaging")
+    elif span < len(image):
+        report.note(f"APFS container {span / 1048576:.1f} MB inside a "
+                    f"{len(image) / 1048576:.1f} MB partition, {block_size}-byte blocks")
     else:
         report.note(f"APFS container {len(image) / 1048576:.1f} MB, {block_size}-byte blocks")
     return block_size
 
 
-def hfs_fork(blob, data, block_size, fragmented):
+def hfs_fork(blob, record, block_size, fragmented):
+    """The bytes a HFSPlusForkData record points at.
+
+    A fork record starts with its logical size and lists its extents from
+    offset 16 on, so the first extent's start block says where the bytes live.
+    """
     if fragmented:
         return None
-    start = struct.unpack_from(">I", data, 16)[0] * block_size
-    length = struct.unpack_from(">Q", data, 24)[0]
+    length = struct.unpack_from(">Q", record, 0)[0]
+    start = struct.unpack_from(">I", record, 16)[0] * block_size
     if start + length > len(blob):
         return None
     return blob[start:start + length]
+
+
+def btree_node_size(fork):
+    """The node size the b-tree header records, or the usual 8192 bytes."""
+    if len(fork) >= 42 and fork[8] == 1:          # kind 1 == header node
+        size = struct.unpack_from(">I", fork, 14 + 14)[0]
+        if 512 <= size <= 65536 and size % 512 == 0:
+            return size
+    return 8192
 
 
 def hfs_catalog_names(image, report):
     """Walk the HFS+ catalog and return every record name and mode it finds."""
     if image[1024:1026] not in HFS_SIGNATURES:
         return None
-    block_size = struct.unpack_from(">I", image, 1040)[0]
+    # HFSPlusVolumeHeader: blockSize at header offset 40, catalog fork at 372.
+    block_size = struct.unpack_from(">I", image, 1024 + 40)[0]
     if block_size not in (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536):
         report.problem(f"HFS+ volume header reports an impossible block size {block_size}")
         return None
-    fork = hfs_fork(image, image, block_size, False)
+    fork = hfs_fork(image, image[1024 + 372:1024 + 452], block_size, False)
     if fork is None:
         report.problem("HFS+ catalog file extends past the volume; the image is corrupt")
         return None
+    node_size = btree_node_size(fork)
     names = set()
-    nodes = len(fork) // 8192
-    for index in range(nodes):
-        node = fork[index * 8192:(index + 1) * 8192]
-        if len(node) < 16 or struct.unpack_from(">H", node, 0)[0] != 14:
-            continue  # 14 == kBTHeaderNode
+    for index in range(len(fork) // node_size):
+        node = fork[index * node_size:(index + 1) * node_size]
+        if node[8] != 0:                  # 0 == kBTLeafNode
+            continue
         num_records = struct.unpack_from(">H", node, 10)[0]
-        for record in range(1, num_records + 1):
-            offset_at = 14 - record * 2
-            if offset_at < 0:
-                break
-            offset = struct.unpack_from(">H", node, offset_at)[0]
+        for record in range(num_records):
+            # Record offsets live in the last two bytes per record of the
+            # node, last record first.
+            offset = struct.unpack_from(">H", node, node_size - 2 * (record + 1))[0]
             if offset + 2 > len(node):
                 continue
             key_length = struct.unpack_from(">H", node, offset)[0]
-            key = node[offset + 2:offset + 2 + key_length]
-            if len(key) < 6:
+            # The key starts with its own length, then the parent id, then the
+            # node name length and the UTF-16 name itself.
+            key = node[offset:offset + 2 + key_length]
+            if len(key) < 8:
                 continue
             parent = struct.unpack_from(">I", key, 2)[0]
             if parent == 0:
                 continue
-            name_length = struct.unpack_from(">H", key, 6)[0] if len(key) >= 8 else 0
+            name_length = struct.unpack_from(">H", key, 6)[0]
             name = key[8:8 + name_length * 2].decode("utf-16-be", "replace")
             names.add(name)
     return names
@@ -385,22 +422,28 @@ def check_volume(image, report):
     return apfs, names
 
 
-def check_bundle(blob, report):
-    """Validate Info.plist and the executable inside the app bundle, when present."""
-    index = blob.find(b"<plist")
+def check_bundle(blobs, report):
+    """Validate Info.plist and the executable inside the app bundle, when present.
+
+    The bundle lives inside the filesystem, so the search runs over the
+    partition images that were rebuilt from the blkx tables rather than over
+    the compressed data fork.
+    """
     plists = 0
-    while index >= 0:
-        end = blob.find(b"</plist>", index)
-        if end < 0:
-            break
-        try:
-            plist = plistlib.loads(blob[index:end + len(b"</plist>")])
-        except Exception:  # noqa: BLE001 - not every plist blob is an Info.plist
-            plist = None
-        if isinstance(plist, dict) and plist.get("CFBundlePackageType") == "APPL":
-            plists += 1
-            validate_info_plist(plist, report)
-        index = blob.find(b"<plist", end)
+    for blob in blobs:
+        index = blob.find(b"<plist")
+        while index >= 0:
+            end = blob.find(b"</plist>", index)
+            if end < 0:
+                break
+            try:
+                plist = plistlib.loads(blob[index:end + len(b"</plist>")])
+            except Exception:  # noqa: BLE001 - not every plist blob is an Info.plist
+                plist = None
+            if isinstance(plist, dict) and plist.get("CFBundlePackageType") == "APPL":
+                plists += 1
+                validate_info_plist(plist, report)
+            index = blob.find(b"<plist", end)
     if not plists:
         report.note("no application bundle was found inside the image; "
                     "Info.plist checks were skipped")
@@ -446,17 +489,19 @@ def main(argv):
     check_chunk_offsets(tables, data_end, report)
 
     volumes = []
+    partitions = []
     for table in tables:
         if not table["count"]:
             continue
         image, readable = assemble(blob, table, report)
         if not readable:
             continue
+        partitions.append(image)
         _, names = check_volume(image, report)
         if names is not None:
             volumes.append(names)
 
-    check_bundle(blob[:data_end] if data_end else blob, report)
+    check_bundle(partitions if partitions else [blob], report)
 
     for message in report.notes:
         print(f"note: {message}")

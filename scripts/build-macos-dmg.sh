@@ -4,9 +4,9 @@
 # The disk image is an ordinary APFS volume created by hdiutil, because the
 # layout is what determines whether macOS can mount it and copy the app out.
 # Packing the .app into an ISO and re-wrapping it with libdmg-hfsplus produces
-# a UDZO image whose blkx tables start at a non-sector-aligned offset; macOS
-# then reads every partition table out of alignment, reports the DMG as not
-# recognized, and the app can never be installed. That path is gone.
+# a UDZO image whose compressed blocks end up shuffled inside the data fork;
+# macOS then reads every partition from the wrong offsets, reports the DMG as
+# not recognized, and the app can never be installed. That path is gone.
 #
 #   macOS        builds and packages with the system toolchain (hdiutil, codesign)
 #   Linux/WSL    cross-compiles with cargo-zigbuild and takes the finished DMG
@@ -176,8 +176,8 @@ create_dmg() {
     return
   fi
   echo "Refusing to fabricate a DMG off macOS." >&2
-  echo "A container written by libdmg-hfsplus from an ISO produces blkx tables that are" >&2
-  echo "not sector aligned, and macOS cannot mount or install the result." >&2
+  echo "A container written by libdmg-hfsplus from an ISO stores its compressed blocks" >&2
+  echo "out of order, and macOS cannot mount or install the result." >&2
   echo "Build the DMG on a Mac (or download the macOS artifact from GitHub Actions):" >&2
   echo "    bash scripts/build-macos-dmg.sh $( [[ "$(cat "$stage/.arch" 2>/dev/null)" == Intel* ]] && echo x86_64-apple-darwin || echo aarch64-apple-darwin )" >&2
   echo "or set MG_ALLOW_UNVERIFIED_CONTAINER=1 to produce one anyway for inspection." >&2

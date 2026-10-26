@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Regression tests for scripts/verify-macos-dmg.py and scripts/make-test-dmg.py.
 
-The DMG that shipped as 0.11.2 could not be mounted on any Mac, because its
-partition tables were appended straight after the compressed blocks instead of
-starting at their own sector. These tests pin that failure and the healthy
-layout that replaces it, so the packaging step cannot silently regress again.
+The DMG that shipped as 0.11.2 could not be mounted on any Mac, because the
+container that produced it stored the compressed blocks of the data fork out
+of order, so macOS read the partition from the wrong offsets. These tests pin
+that failure and the healthy layout that replaces it, so the packaging step
+cannot silently regress again.
 
 Run with: python scripts/test-macos-dmg-layout.py
 """
@@ -26,7 +27,9 @@ SHIPPED_BROKEN = [
 CASES = {
     "good": (0, []),
     "good-apfs": (0, []),
+    "hdiutil-layout": (0, []),
     "packed-tables": (1, ["out of alignment"]),
+    "shuffled-blocks": (1, ["out of order"]),
     "short-datafork": (1, ["decompress"]),
     "missing-koly": (1, ["koly"]),
     "no-app": (1, ["MultiGateway.app"]),
@@ -84,6 +87,18 @@ class DMGLayoutTests(unittest.TestCase):
         result = run(VERIFY, self.fixture("packed-tables"))
         self.assertEqual(result.returncode, 1)
         self.assertRegex(result.stderr, r"starts at byte \d+ of the table area")
+
+    def test_hdiutil_layout_is_accepted(self):
+        """hdiutil keeps its tables inline, which is not an alignment defect."""
+        result = run(VERIFY, self.fixture("hdiutil-layout"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("out of alignment", result.stderr)
+
+    def test_shuffled_blocks_are_rejected(self):
+        """Blocks stored out of order are the defect that shipped as 0.11.2."""
+        result = run(VERIFY, self.fixture("shuffled-blocks"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("out of order", result.stderr)
 
     def test_packed_tables_offset_is_not_a_sector_multiple(self):
         result = run(MAKE, "--kind", "packed-tables", "--output",

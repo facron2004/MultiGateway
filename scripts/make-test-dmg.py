@@ -20,8 +20,12 @@ MultiGateway.app, its Contents/MacOS folders, Info.plist and the executable.
 Kinds:
     good          valid HFS+ image, the 0.11.1 layout (must pass)
     good-apfs     valid APFS container (must pass; no HFS+ catalog to walk)
-    packed-tables the 0.11.2 defect: mish tables are packed back to back, so a
-                  table starts mid-sector
+    hdiutil-layout the same image with the blkx tables kept inline in the XML
+                  plist, which is what hdiutil writes (must pass)
+    packed-tables a container that keeps its blkx tables in a table area but
+                  packs them back to back, so a table starts mid-sector
+    shuffled-blocks the blocks of one partition stored out of order inside the
+                  data fork, the defect that shipped as 0.11.2
     short-datafork every zlib payload cut in half (blocks fail to inflate)
     missing-koly  the koly trailer stripped; the plist is still parseable
     no-app        HFS+ image lacking MultiGateway.app
@@ -35,8 +39,9 @@ import struct
 import sys
 import zlib
 
-KINDS = ("good", "good-apfs", "packed-tables", "short-datafork",
-         "missing-koly", "no-app", "bad-plist")
+KINDS = ("good", "good-apfs", "hdiutil-layout", "packed-tables",
+         "shuffled-blocks", "short-datafork", "missing-koly", "no-app",
+         "bad-plist")
 
 SECTOR = 512
 ENTRY_ARRAY_SECTORS = 32   # GPT keeps its 128-entry array in LBA 2..33
@@ -121,32 +126,32 @@ def catalog_folder(name, parent, cnid, mode):
     """HFSPlusCatalogFolder: recordType 1, folders get mode and a valence."""
     payload = struct.pack(">H", 1)                    # recordType
     payload += struct.pack(">H", 0)                   # flags
-    payload += struct.pack(">H", 0)                   # valence
+    payload += struct.pack(">I", 0)                   # valence
     payload += struct.pack(">I", cnid)                # folderID
-    payload += struct.pack(">IIII", 0, 0, 0, 0)       # create/modify/attr/backup dates
-    payload += struct.pack(">II", 0, 0)               # owner, group
+    payload += struct.pack(">IIIII", 0, 0, 0, 0, 0)   # create/modify/attr/access/backup
+    payload += struct.pack(">II", 0, 0)               # ownerID, groupID
     payload += struct.pack(">H", 0)                   # adminFlags
     payload += struct.pack(">H", 0)                   # ownerFlags
     payload += struct.pack(">H", mode)                # fileMode (POSIX bits)
     payload += struct.pack(">I", 0)                   # special
     payload += struct.pack(">I", 0)                   # textEncoding
     payload += struct.pack(">I", 0)                   # reserved
-    payload += struct.pack(">I", 0)                   # folderCount / writeGenCount
-    payload += struct.pack(">I", 0)                   # reserved2
+    payload += struct.pack(">I", 0)                   # folderCount
+    payload += struct.pack(">I", 0)                   # writeGenCount
     return catalog_key(parent, name) + payload
 
 
 def catalog_file(name, parent, cnid, mode, size):
-    """HFSPlusCatalogFile: recordType 2 with mode and an empty data fork."""
+    """HFSPlusCatalogFile: recordType 2 with mode and a data fork."""
     payload = struct.pack(">H", 2)                    # recordType
     payload += struct.pack(">H", 0)                   # flags
-    payload += struct.pack(">I", cnid)                # reserved1
-    payload += struct.pack(">IIII", 0, 0, 0, 0)       # create/modify/attr/backup dates
-    payload += struct.pack(">II", 0, 0)               # owner, group
+    payload += struct.pack(">I", 0)                   # reserved1
+    payload += struct.pack(">IIIII", 0, 0, 0, 0, 0)   # create/modify/attr/access/backup
+    payload += struct.pack(">II", 0, 0)               # ownerID, groupID
     payload += struct.pack(">H", 0)                   # adminFlags
     payload += struct.pack(">H", 0)                   # ownerFlags
     payload += struct.pack(">H", mode)                # fileMode (POSIX bits)
-    payload += struct.pack(">I", 0)                   # special / permission
+    payload += struct.pack(">I", 0)                   # special
     payload += hfs_fork(size, 0, 0, [])               # data fork
     payload += hfs_fork(0, 0, 0, [])                  # resource fork
     return catalog_key(parent, name) + payload
@@ -155,15 +160,16 @@ def catalog_file(name, parent, cnid, mode, size):
 def make_btree(records):
     """Serialise catalog-style leaf records into a two-node b-tree.
 
-    Node 0 is the header node (fLink/fBlk 0, bTreeInfo = nodeSize/nodeCount/
-    maxKeyLength/nodeCount, leaf node pointers, BTHeaderRec); node 1 is the leaf
-    node holding `records`, each already key+data for its fork.  Record offsets
-    grow downward from the end of the node and point at the start of key+data,
-    which is where a catalog reader (and the verifier) expects the key.
+    Node 0 is the header node, node 1 is the leaf node holding `records`.
+    A BTNodeDescriptor is fLink, bLink, kind, height, numRecords and one
+    reserved field, so the descriptor is 14 bytes long and the record offsets
+    start right behind it.  The offsets themselves live in the last two bytes
+    per record of the node, last record first, which is where Apple's readers
+    look for them.
     """
     leaf = bytearray(HFS_NODE)
-    # Flink, Blink, Kind (0 = leaf node), Height, NumRecords, Reserved.
-    struct.pack_into(">IIHHHH", leaf, 0, 0, 0, 0, 1, len(records), 0)
+    # fLink, bLink, kind (0 = leaf node), height, numRecords, reserved.
+    struct.pack_into(">IIBBHH", leaf, 0, 0, 0, 0, 1, len(records), 0)
     cursor = 14
     offsets = []
     for record in records:
@@ -172,31 +178,32 @@ def make_btree(records):
         offsets.append(cursor)
         leaf[cursor:cursor + len(record)] = record
         cursor += len(record)
-    for index, offset in enumerate(offsets + [cursor]):
+    for index, offset in enumerate(offsets):
         struct.pack_into(">H", leaf, HFS_NODE - 2 * (index + 1), offset)
 
     header = bytearray(HFS_NODE)
-    # fLink, fBlk, Kind (1 = header node), Height, NumRecords (1 record), reserved.
-    struct.pack_into(">IIHHHH", header, 0, 0, 0, 1, 0, 1, 0)
-    # bTreeInfo: nodeSize u16, nodeCount u16, maxKeyLength u16, nodeCount u16.
-    struct.pack_into(">HHHH", header, 8, HFS_NODE, 2, 40, 2)
-    struct.pack_into(">II", header, 16, 0, 0)              # attributes, reserved3
-    struct.pack_into(">II", header, 24, 1, 1)              # firstLeafNode, lastLeafNode
-    struct.pack_into(">II", header, 32, 0, 0)              # firstFreeNode, lastFreeNode
-    struct.pack_into(">I", header, 40, 0)                  # shadowed node size
-    struct.pack_into(">Q", header, 44, 0)                  # unavailable byte count
-    # The single record of the header node is the BTHeaderRec at offset 248.
-    struct.pack_into(">H", header, 14, 248)
-    struct.pack_into(">H", header, HFS_NODE - 2, 248)
-    struct.pack_into(">HHHH", header, 248, HFS_NODE, 2, 40, 2)
-    struct.pack_into(">I", header, 256, 0)                 # clumpSize
-    header[260] = 0                                        # btreeType (catalog = 0)
-    header[261] = 1                                        # keyCompareType (case folded)
-    struct.pack_into(">I", header, 262, 0)                 # attributes
-    struct.pack_into(">II", header, 266, 1, 1)             # leaf node list
-    struct.pack_into(">II", header, 274, 0, 0)             # free node list
-    struct.pack_into(">II", header, 282, 0, 0)             # reserved
-    struct.pack_into(">Q", header, 250, 0)                 # firstLeafNode / lastLeafNode
+    # fLink, bLink, kind (1 = header node), height (0), numRecords (1), reserved.
+    struct.pack_into(">IIBBHH", header, 0, 0, 0, 1, 0, 1, 0)
+    # The header node's single record is the BTHeaderRec that follows the node
+    # descriptor, and the record offset at the end of the node points at it.
+    record_at = 14
+    struct.pack_into(">H", header, HFS_NODE - 2, record_at)
+    struct.pack_into(">IIBBHH", header, record_at, 0, 0, 1, 0, 1, 0)
+    info = record_at + 14                             # BTreeInfo inside the record
+    struct.pack_into(">I", header, info, HFS_NODE)    # nodeSize
+    struct.pack_into(">I", header, info + 4, 40)      # maxKeyLength
+    struct.pack_into(">I", header, info + 8, 2)       # totalNodes
+    struct.pack_into(">I", header, info + 12, 0)      # freeNodes
+    struct.pack_into(">H", header, info + 16, 1)      # firstLeafNode
+    struct.pack_into(">H", header, info + 18, 1)      # lastLeafNode
+    struct.pack_into(">H", header, info + 20, HFS_NODE)   # nodeSize (deprecated)
+    struct.pack_into(">H", header, info + 22, 40)         # maxKeyLength (deprecated)
+    struct.pack_into(">I", header, info + 24, 0)      # dataLength
+    struct.pack_into(">I", header, info + 28, 0)      # freeLength
+    struct.pack_into(">Q", header, info + 32, 0)      # clumpSize
+    header[info + 40] = 0                            # btreeType (catalog = 0)
+    header[info + 41] = 1                            # keyCompareType (case folded)
+    struct.pack_into(">I", header, info + 42, 0)      # attributes
     return bytes(header) + bytes(leaf)
 
 
@@ -236,31 +243,37 @@ def _record_sort_key(record):
 
 def build_volume_header(file_count, folder_count, catalog, extents, attributes,
                         next_catalog_id, total_blocks):
-    """The 512-byte HFSPlusVolumeHeader placed at volume offset 1024."""
-    header = bytearray(512)
+    """The HFSPlusVolumeHeader that HFS+ places at volume offset 1024.
+
+    The field offsets are Apple's: blockSize sits at header offset 40, the
+    catalog fork at 372, and a fork record starts with its logical size and
+    lists its extents from offset 16 on.
+    """
+    header = bytearray(620)
     struct.pack_into(">H", header, 0, 0x482B)              # signature "H+"
     struct.pack_into(">H", header, 2, 4)                   # version
     struct.pack_into(">I", header, 4, 0)                   # attributes
     header[8:12] = b"HFSJ"                                 # lastMountedVersion
-    struct.pack_into(">I", header, 16, 0)                  # journalInfoBlock
-    struct.pack_into(">III", header, 20, 0, file_count, folder_count)
-    struct.pack_into(">I", header, 32, HFS_BLOCK)          # blockSize
-    struct.pack_into(">I", header, 36, total_blocks)       # totalBlocks
-    struct.pack_into(">I", header, 40, 4)                  # freeBlocks
-    struct.pack_into(">I", header, 44, 8)                  # nextAllocation
-    struct.pack_into(">I", header, 48, 0)                  # rsrcClumpSize
-    struct.pack_into(">I", header, 52, next_catalog_id)    # nextCatalogID
-    struct.pack_into(">I", header, 56, 0)                  # writeCount
-    struct.pack_into(">Q", header, 60, 0)                  # encodingsBitmap
-    struct.pack_into(">IIII", header, 68, 0, 0, 0, 0)      # finderInfo[0..3]
-    struct.pack_into(">IIII", header, 84, 0, 0, 0, 0)      # finderInfo[4..7]
+    struct.pack_into(">I", header, 12, 0)                  # journalInfoBlock
+    struct.pack_into(">IIIII", header, 16, 0, 0, 0, 0, 0)  # the five timestamps
+    struct.pack_into(">I", header, 32, file_count)         # fileCount
+    struct.pack_into(">I", header, 36, folder_count)       # folderCount
+    struct.pack_into(">I", header, 40, HFS_BLOCK)          # blockSize
+    struct.pack_into(">I", header, 44, total_blocks)       # totalBlocks
+    struct.pack_into(">I", header, 48, 4)                  # freeBlocks
+    struct.pack_into(">I", header, 52, 8)                  # nextAllocation
+    struct.pack_into(">I", header, 56, 0)                  # rsrcClumpSize
+    struct.pack_into(">I", header, 60, next_catalog_id)    # nextCatalogID
+    struct.pack_into(">I", header, 64, 0)                  # writeCount
+    struct.pack_into(">Q", header, 68, 0)                  # encodingsBitmap
+    # finderInfo[8] (76..204) stays zero.
     # Forks, 80 bytes each: allocation file, extents, catalog, attributes, startup.
-    header[112:192] = hfs_fork(HFS_VOLUME_BYTES, 0, total_blocks - 4,
+    header[204:284] = hfs_fork(HFS_VOLUME_BYTES, 0, total_blocks - 4,
                                [(0, total_blocks - 4)])
-    header[192:272] = hfs_fork(*extents)
-    header[272:352] = hfs_fork(*catalog)      # verifier reads +16 -> block, +24 -> size
-    header[352:432] = hfs_fork(*attributes)
-    header[432:512] = hfs_fork(0, 0, 0, [])
+    header[288:368] = hfs_fork(*extents)
+    header[372:452] = hfs_fork(*catalog)
+    header[456:536] = hfs_fork(*attributes)
+    header[540:620] = hfs_fork(0, 0, 0, [])
     return bytes(header)
 
 
@@ -306,12 +319,15 @@ def build_hfs_image(kind):
     return bytes(image)
 
 
-def build_apfs_image(total_bytes=APFS_VOLUME_BYTES + APFS_BLOCK):
+def build_apfs_image(payload=b"", total_bytes=None):
     """A self-consistent APFS container: nx_superblock in block 0.
 
     The container must span the whole partition, so `total_bytes` is the size
-    the blkx table declares: block_size * nxs_block_count == len(image).
+    the blkx table declares: block_size * nxs_block_count == len(image).  The
+    bundle payload sits behind the superblock, inside that same span.
     """
+    if total_bytes is None:
+        total_bytes = APFS_VOLUME_BYTES
     total_bytes = align_up(total_bytes, APFS_BLOCK)
     block = bytearray(APFS_BLOCK)
     # obj_header_t (32 bytes): checksum, oid, xid, type, subtype.
@@ -330,6 +346,8 @@ def build_apfs_image(total_bytes=APFS_VOLUME_BYTES + APFS_BLOCK):
     struct.pack_into("<I", block, 96, 1)                   # xp_data_blocks
     image = bytearray(total_bytes)
     image[0:APFS_BLOCK] = block
+    if payload:
+        image[APFS_VOLUME_BYTES:APFS_VOLUME_BYTES + len(payload)] = payload
     return bytes(image)
 
 
@@ -436,6 +454,10 @@ def mish_table(first_sector, sector_count, chunks, data_offset, pad_to_sector=Fa
     `pad_to_sector` grows the table with trailing zeros until its length is a
     whole number of 512-byte sectors, which is how hdiutil packs the tables:
     the next table then starts on its own sector.  `packed` tables skip it.
+
+    `data_offset` is where the table sits in the table area.  hdiutil keeps its
+    tables inline in the XML plist and records zero there, so a container that
+    has no table area at all passes 0.
     """
     body = bytearray()
     body += b"mish"
@@ -477,15 +499,15 @@ def build_dmg(kind, arch="arm64"):
     apfs = kind in ("good-apfs", "packed-tables")
     payload = bundle_bytes(kind, arch)
     if apfs:
-        # The container describes the whole partition, so its size includes the
+        # The container describes the whole partition, so its size covers the
         # bundle payload that follows the superblock.
-        volume = build_apfs_image(APFS_VOLUME_BYTES + len(payload))
-        volume += payload
+        volume = build_apfs_image(payload, APFS_VOLUME_BYTES + len(payload))
     else:
         volume = build_hfs_image(kind) + payload
         volume += b"\0" * (align_up(len(volume), SECTOR) - len(volume))
     partition_sectors = len(volume) // SECTOR
     boot = gpt_boot_blocks(partition_sectors)
+    image_label = "disk image (Apple_APFS : 4)" if apfs else "disk image (Apple_HFS : 4)"
 
     blocks = [
         Block("Protective Master Boot Record (MBR : 0)", -1, 0, 1,
@@ -495,10 +517,19 @@ def build_dmg(kind, arch="arm64"):
         # LBA 2..33: the first GPT entry array, zero padded to its 32 sectors.
         Block("GPT Partition Data (Primary GPT Table : 2)", 1, 2, ENTRY_ARRAY_SECTORS,
               zlib.compress(boot[2 * SECTOR:]), 0, ENTRY_ARRAY_SECTORS),
-        Block("disk image (Apple_APFS : 4)" if apfs else "disk image (Apple_HFS : 4)",
-              4, 40, len(volume) // SECTOR, zlib.compress(volume), 0,
-              len(volume) // SECTOR),
     ]
+    if kind == "shuffled-blocks":
+        # Split the payload partition into two blocks, so the fixture can hold
+        # them in the data fork in the wrong order.
+        half = partition_sectors // 2
+        blocks.append(Block(image_label, 4, 40, partition_sectors,
+                            zlib.compress(volume[:half * SECTOR]), 0, half))
+        blocks.append(Block(image_label, 4, 40, partition_sectors,
+                            zlib.compress(volume[half * SECTOR:]), half,
+                            partition_sectors - half))
+    else:
+        blocks.append(Block(image_label, 4, 40, partition_sectors,
+                            zlib.compress(volume), 0, partition_sectors))
     if kind == "short-datafork":
         # Halving every payload leaves the table geometry alone but makes each
         # zlib stream stop early, so the partition cannot be rebuilt.
@@ -510,6 +541,8 @@ def build_dmg(kind, arch="arm64"):
         blocks = _pad_blocks(blocks)
 
     return assemble(blocks, packed=(kind == "packed-tables"),
+                    inline_tables=(kind == "hdiutil-layout"),
+                    shuffled=(kind == "shuffled-blocks"),
                     keep_koly=(kind != "missing-koly"))
 
 
@@ -539,22 +572,41 @@ def _pad_blocks(blocks):
     return padded
 
 
-def assemble(blocks, packed=False, keep_koly=True):
+def assemble(blocks, packed=False, inline_tables=False, shuffled=False,
+             keep_koly=True):
     """Concatenate payloads, then place the mish tables inside the plist.
 
     Each table's DataOffset is its position relative to the start of the plist,
     which is how hdiutil labels them (its first table carries 0).  Tables are
     padded to whole sectors so each one begins where the previous ended plus a
     sector, matching what a reader walking the tables expects.  `packed` skips
-    that padding, so later tables land mid-sector: the 0.11.2 defect.
+    that padding, so later tables land mid-sector.
+
+    `inline_tables` models hdiutil, which keeps every table inside the XML
+    plist and records no table area at all, so each DataOffset stays zero.
+
+    `shuffled` writes the blocks of one partition into the data fork in the
+    wrong order.  The reader then has to look for the block of a sector behind
+    the blocks that follow it, which is the defect that shipped as 0.11.2.
     """
     data_fork = bytearray()
-    chunk_records = []
-    for item in blocks:
-        offset = len(data_fork)
+    order = list(range(len(blocks)))
+    if shuffled:
+        # Swap the blocks of the payload partition inside the data fork.
+        image_blocks = [index for index, item in enumerate(blocks)
+                        if item.label.startswith("disk image")]
+        for first, second in zip(image_blocks, image_blocks[1:]):
+            order[first], order[second] = order[second], order[first]
+    placement = {}
+    for index in order:
+        item = blocks[index]
+        placement[index] = (len(data_fork), len(item.payload))
         data_fork += item.payload
+    chunk_records = []
+    for index, item in enumerate(blocks):
+        offset, length = placement[index]
         chunk_records.append((item, (CHUNK_ZLIB, item.chunk_sector,
-                                     item.chunk_sectors, offset, len(item.payload))))
+                                     item.chunk_sectors, offset, length)))
     # hdiutil rounds the data fork up to a sector before the tables start.
     data_fork += b"\0" * (align_up(len(data_fork), SECTOR) - len(data_fork))
 
@@ -577,12 +629,13 @@ def assemble(blocks, packed=False, keep_koly=True):
         entries = []
         for (label, chunks), position in zip(groups.items(), positions):
             item = chunks[0][0]
+            data_offset = 0 if inline_tables else position - offset_of
             entries.append({
                 "Attributes": "0x0050",
                 "CFName": label,
                 "Data": mish_table(item.first_sector, item.sector_count,
                                    [record for _, record in chunks],
-                                   position - offset_of, pad_to_sector=not packed),
+                                   data_offset, pad_to_sector=not packed),
                 "ID": str(item.table_id),
                 "Name": label,
             })
@@ -676,7 +729,7 @@ def payload_image(blob, tables):
         return None
     raw = bytes(entry["Data"])
     image = bytearray(biggest["count"] * SECTOR)
-    cursor = MISH_HEADER + 4
+    cursor = MISH_HEADER
     while cursor + CHUNK_SIZE <= len(raw):
         kind, _, sector, sectors, offset, length = struct.unpack_from(">IIQQQQ", raw, cursor)
         cursor += CHUNK_SIZE
@@ -707,26 +760,26 @@ def hfs_catalog_names(image):
     """Walk the catalog the way verify-macos-dmg.py does; return the names seen."""
     if image[1024:1026] != b"H+":
         return None
-    block_size = struct.unpack_from(">I", image, 1040)[0]
-    data = image[272:352]
-    start = struct.unpack_from(">I", data, 16)[0] * block_size
-    length = struct.unpack_from(">Q", data, 24)[0]
+    block_size = struct.unpack_from(">I", image, 1024 + 40)[0]
+    record = image[1024 + 372:1024 + 452]
+    length = struct.unpack_from(">Q", record, 0)[0]
+    start = struct.unpack_from(">I", record, 16)[0] * block_size
     fork = image[start:start + length]
+    node_size = HFS_NODE
+    if len(fork) >= 42 and fork[8] == 1:
+        node_size = struct.unpack_from(">I", fork, 28)[0] or HFS_NODE
     names = set()
-    for index in range(len(fork) // HFS_NODE):
-        node = fork[index * HFS_NODE:(index + 1) * HFS_NODE]
-        if len(node) < 16 or struct.unpack_from(">H", node, 0)[0] != 14:
+    for index in range(len(fork) // node_size):
+        node = fork[index * node_size:(index + 1) * node_size]
+        if node[8] != 0:                      # 0 == kBTLeafNode
             continue
         num_records = struct.unpack_from(">H", node, 10)[0]
-        for record in range(1, num_records + 1):
-            offset_at = 14 - record * 2
-            if offset_at < 0:
-                break
-            offset = struct.unpack_from(">H", node, offset_at)[0]
+        for record_index in range(num_records):
+            offset = struct.unpack_from(">H", node, node_size - 2 * (record_index + 1))[0]
             if offset + 2 > len(node):
                 continue
             key_length = struct.unpack_from(">H", node, offset)[0]
-            key = node[offset + 2:offset + 2 + key_length]
+            key = node[offset:offset + 2 + key_length]
             if len(key) < 8:
                 continue
             name_length = struct.unpack_from(">H", key, 6)[0]
