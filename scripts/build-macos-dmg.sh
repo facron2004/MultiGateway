@@ -116,6 +116,9 @@ stage_app() {
   sed "s/__VERSION__/${version}/g" "$plist_template" > "$app/Contents/Info.plist"
   cp "$work/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
   printf 'APPL????' > "$app/Contents/PkgInfo"
+  # The drag-to-install target has to be on the volume itself; without this
+  # link the user has nowhere to drop the bundle.
+  ln -sfn /Applications "$stage/Applications"
   printf '%s' "$label" > "$stage/.arch"
   cat > "$stage/使用说明.txt" <<EOF
 MultiGateway ${version}（macOS ${label} 版）
