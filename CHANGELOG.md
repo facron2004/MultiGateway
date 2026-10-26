@@ -2,7 +2,12 @@
 
 本文件记录 MultiGateway 的版本变更。
 
-## 未发布（v0.11.2 之后）
+v0.11.2 及更早的版本没有逐条记录，见 [Releases](https://github.com/facron2004/MultiGateway/releases)
+与 [Tags](https://github.com/facron2004/MultiGateway/tags)。
+
+## v0.11.3
+
+2026-10-26
 
 共 29 个提交，从 `a19274f` 到 `3156bc3`。
 

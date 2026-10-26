@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#requirements"><img src="https://img.shields.io/badge/Rust-1.90%2B-000000?logo=rust&amp;logoColor=white" alt="Rust 1.90+" /></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.2-2563EB" alt="Version 0.11.2" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.3-2563EB" alt="Version 0.11.3" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT License" /></a>
   <a href="#build-and-run"><img src="https://img.shields.io/badge/Desktop-Windows%20%7C%20macOS-0078D4" alt="Windows and macOS desktop" /></a>
 </p>
@@ -33,7 +33,7 @@
 
 MultiGateway is a Rust reverse proxy for several AI account pools. WorkBuddy, Trae, MiniMax, Qoder, Antigravity, Grok, and GitHub Copilot share one desktop app and one set of OpenAI, Anthropic, and Responses endpoints.
 
-Version **0.11.2** is the Rust gateway. The Tauri 2 desktop window, tray, and web dashboard are compiled into the Windows executable or macOS app.
+Version **0.11.3** is the Rust gateway. The Tauri 2 desktop window, tray, and web dashboard are compiled into the Windows executable or macOS app.
 
 ---
 
@@ -104,7 +104,7 @@ The dashboard is `http://127.0.0.1:8791/`. API keys are stored in `api_keys.json
 Exit the app before replacing the executable, and keep the existing `gateway-data/` directory.
 Desktop browser data is stored in `webview2/` inside the selected data directory.
 
-On macOS, build both `dist/MultiGateway-0.11.2-macos-arm64.dmg` and `dist/MultiGateway-0.11.2-macos-x64.dmg` with:
+On macOS, build both `dist/MultiGateway-0.11.3-macos-arm64.dmg` and `dist/MultiGateway-0.11.3-macos-x64.dmg` with:
 
 ```bash
 bash scripts/build-macos-dmg.sh

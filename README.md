@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#环境要求"><img src="https://img.shields.io/badge/Rust-1.90%2B-000000?logo=rust&amp;logoColor=white" alt="Rust 1.90+" /></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.2-2563EB" alt="版本 0.11.2" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Version-0.11.3-2563EB" alt="版本 0.11.3" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22C55E" alt="MIT 协议" /></a>
   <a href="#构建与运行"><img src="https://img.shields.io/badge/Desktop-Windows%20%7C%20macOS-0078D4" alt="Windows 和 macOS 桌面版" /></a>
 </p>
@@ -33,7 +33,7 @@
 
 MultiGateway 是一个用 Rust 编写的多账号反向代理网关。它把 **WorkBuddy**、**Trae**、**MiniMax**、**Qoder**、**Antigravity**、**Grok** 和 **GitHub Copilot** 收进同一个桌面面板，并用 OpenAI、Anthropic 和 Responses 兼容接口对外提供模型。
 
-当前版本 **0.11.2**。账号池、协议转换和各厂商适配都在本仓库的 Rust 代码里，Tauri 2 桌面窗口、托盘和 Web 面板一起编进 Windows EXE 或 macOS 应用。
+当前版本 **0.11.3**。账号池、协议转换和各厂商适配都在本仓库的 Rust 代码里，Tauri 2 桌面窗口、托盘和 Web 面板一起编进 Windows EXE 或 macOS 应用。
 
 ---
 
@@ -131,7 +131,7 @@ MultiGateway.exe --host 127.0.0.1 --port 8791 --data-dir "D:\MultiGateway-data"
 升级时先退出程序，再替换 exe，并保留原来的 `gateway-data/`。
 桌面浏览器数据保存在所选数据目录的 `webview2/` 中。
 
-macOS 上运行以下命令，分别生成 `dist/MultiGateway-0.11.2-macos-arm64.dmg` 和 `dist/MultiGateway-0.11.2-macos-x64.dmg`：
+macOS 上运行以下命令，分别生成 `dist/MultiGateway-0.11.3-macos-arm64.dmg` 和 `dist/MultiGateway-0.11.3-macos-x64.dmg`：
 
 ```bash
 bash scripts/build-macos-dmg.sh
